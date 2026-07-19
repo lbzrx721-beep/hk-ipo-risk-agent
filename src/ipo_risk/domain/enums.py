@@ -30,6 +30,14 @@ class VerificationStatus(StrEnum):
     REJECTED = "rejected"
 
 
+class ReviewDecision(StrEnum):
+    """A human review action applied to one RiskFinding."""
+
+    CONFIRMED = "confirmed"
+    REJECTED = "rejected"
+    EDITED = "edited"
+
+
 class AgentRole(StrEnum):
     """可出现在 AgentTrace 和 Evidence 中的标准角色名。"""
 

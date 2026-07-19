@@ -15,6 +15,9 @@ PDF -> 页面与坐标 -> OCR兜底 -> 段落切片 -> BM25召回
 印刷页码、原文、坐标、证据截图和置信度。当前风险结论由确定性规则与BM25生成，
 尚未接入向量检索、真实大模型、多Agent裁决和上市后预测模型。
 
+候选风险现可通过命令行执行确定性核验、人工确认/驳回/编辑和最终报告导出。
+核验与人工决定均写入SQLite审计记录；任何失败核验都不能被标记为 `verified`。
+
 ## 2026-07-19 首次交付里程碑
 
 本次完成了项目底座和单公司证据闭环基线：
@@ -28,6 +31,21 @@ PDF -> 页面与坐标 -> OCR兜底 -> 段落切片 -> BM25召回
 
 当前交付边界：全部风险仍为 `pending_verification`；语义向量检索、真实LLM多Agent、
 人工复核界面、批量特征与标签、上市后风险预测、API和演示界面尚未完成。
+
+## 2026-07-19 风险核验与人工复核闭环
+
+本次新增了可审计的复核状态机：
+
+- 对 Evidence 复核源文件存在性、SHA-256、PDF物理页、坐标、原文和证据截图。
+- 对 RiskFinding 复核证据引用、公司归属及数值公式；公式仅允许安全算术表达式。
+- 支持 `confirmed`、`rejected`、`edited` 三种人工决定，并原子更新风险状态与复核记录。
+- 已完成SQLite `1.0 -> 1.1` 幂等迁移，旧数据库会自动补充完整复核载荷和最终报告路径。
+- 只有全部风险进入 `verified` 或 `rejected` 后才能导出 `verified_risk_analysis.json`；
+  最终报告只包含 `verified` 风险及其引用证据。
+- 新增 `list`、`verify`、`review`、`export` 四个命令行操作，全量53项测试、Ruff和mypy通过。
+
+对现有英矽智能8条候选风险执行只读核验后，7条通过；`F-03696-0007` 因含
+`39.29%` 数值结论但缺少可复算 `Calculation` 被拦截。系统不会代替投研人员自动确认风险。
 
 ## 核心原则
 
@@ -93,6 +111,44 @@ data/app.db
 `risk_analysis.json` 中的风险状态统一为 `pending_verification`，不能未经人工确认
 直接作为正式投研结论。同一份报告中的 Evidence、RiskFinding 和 AgentTrace
 也会同步写入SQLite。
+
+## 核验、人工复核与最终报告
+
+列出一个分析任务的全部候选风险：
+
+```powershell
+python scripts/review_findings.py list `
+  --run-id "RUN-03696-..." `
+  --project-root "D:\东吴证券"
+```
+
+先执行不改变状态的确定性核验，再由投研人员作出决定：
+
+```powershell
+python scripts/review_findings.py verify `
+  --run-id "RUN-03696-..." `
+  --finding-id "F-03696-0001" `
+  --project-root "D:\东吴证券"
+
+python scripts/review_findings.py review `
+  --run-id "RUN-03696-..." `
+  --finding-id "F-03696-0001" `
+  --decision confirmed `
+  --reviewer "投研复核人" `
+  --comment "原文、期间和风险表述一致" `
+  --project-root "D:\东吴证券"
+```
+
+`rejected` 和 `edited` 必须填写复核意见；`edited` 还必须通过
+`--edited-finding` 提供完整的 RiskFinding JSON。全部风险完成复核后导出最终报告：
+
+```powershell
+python scripts/review_findings.py export `
+  --run-id "RUN-03696-..." `
+  --project-root "D:\东吴证券"
+```
+
+仍有 `proposed` 或 `pending_verification` 风险时，最终报告导出会被拒绝。
 
 ## 模型供应商固定分工
 

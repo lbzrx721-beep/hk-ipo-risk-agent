@@ -20,6 +20,7 @@ from .enums import (
     EvidenceType,
     PredictionHorizon,
     PredictionTarget,
+    ReviewDecision,
     RiskLevel,
     RiskSeverity,
     ToolCallStatus,
@@ -154,6 +155,58 @@ class Evidence(ContractModel):
         return self
 
 
+class VerificationCheck(StrictModel):
+    """One deterministic check performed while reproducing evidence."""
+
+    name: NonEmptyStr
+    passed: bool
+    detail: NonEmptyStr
+
+
+class EvidenceVerification(ContractModel):
+    """Auditable result of locating one Evidence object in its source PDF."""
+
+    evidence_id: NonEmptyStr
+    passed: bool
+    checks: tuple[VerificationCheck, ...] = Field(min_length=1)
+    checked_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("checked_at")
+    @classmethod
+    def checked_at_must_be_aware(cls, value: datetime) -> datetime:
+        return ensure_timezone_aware(value, "checked_at")
+
+    @model_validator(mode="after")
+    def outcome_must_match_checks(self) -> EvidenceVerification:
+        if self.passed != all(check.passed for check in self.checks):
+            raise ValueError("passed must match the combined check results")
+        return self
+
+
+class FindingVerification(ContractModel):
+    """Combined evidence and calculation checks for one RiskFinding."""
+
+    finding_id: NonEmptyStr
+    passed: bool
+    checks: tuple[VerificationCheck, ...] = Field(min_length=1)
+    evidence_verifications: tuple[EvidenceVerification, ...] = ()
+    checked_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("checked_at")
+    @classmethod
+    def checked_at_must_be_aware(cls, value: datetime) -> datetime:
+        return ensure_timezone_aware(value, "checked_at")
+
+    @model_validator(mode="after")
+    def outcome_must_match_checks(self) -> FindingVerification:
+        combined = all(check.passed for check in self.checks) and all(
+            result.passed for result in self.evidence_verifications
+        )
+        if self.passed != combined:
+            raise ValueError("passed must match evidence and finding checks")
+        return self
+
+
 class RiskFinding(ContractModel):
     """A risk claim that references one or more Evidence objects by ID."""
 
@@ -180,6 +233,42 @@ class RiskFinding(ContractModel):
     def evidence_ids_must_be_unique(self) -> RiskFinding:
         if len(set(self.evidence_ids)) != len(self.evidence_ids):
             raise ValueError("evidence_ids must not contain duplicates")
+        return self
+
+
+class FindingReview(ContractModel):
+    """Immutable human decision plus the exact verification snapshot it used."""
+
+    review_id: NonEmptyStr
+    run_id: NonEmptyStr
+    finding_id: NonEmptyStr
+    decision: ReviewDecision
+    reviewer: NonEmptyStr
+    comment: NonEmptyStr | None = None
+    verification: FindingVerification
+    resulting_finding: RiskFinding
+    created_at: datetime = Field(default_factory=utc_now)
+
+    @field_validator("created_at")
+    @classmethod
+    def created_at_must_be_aware(cls, value: datetime) -> datetime:
+        return ensure_timezone_aware(value, "created_at")
+
+    @model_validator(mode="after")
+    def validate_review_transition(self) -> FindingReview:
+        if self.resulting_finding.finding_id != self.finding_id:
+            raise ValueError("resulting finding must keep the reviewed finding_id")
+        expected_status = (
+            VerificationStatus.REJECTED
+            if self.decision is ReviewDecision.REJECTED
+            else VerificationStatus.VERIFIED
+        )
+        if self.resulting_finding.status is not expected_status:
+            raise ValueError("resulting finding status does not match review decision")
+        if self.decision is not ReviewDecision.CONFIRMED and self.comment is None:
+            raise ValueError("rejected and edited reviews require a comment")
+        if self.decision is not ReviewDecision.REJECTED and not self.verification.passed:
+            raise ValueError("a finding cannot be verified when deterministic checks fail")
         return self
 
 
@@ -256,8 +345,12 @@ __all__ = [
     "BoundingBox",
     "Calculation",
     "Evidence",
+    "EvidenceVerification",
     "FeatureValue",
+    "FindingReview",
+    "FindingVerification",
     "Prediction",
     "RiskFinding",
     "ToolCall",
+    "VerificationCheck",
 ]

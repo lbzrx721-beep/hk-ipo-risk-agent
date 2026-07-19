@@ -102,6 +102,7 @@ CREATE TABLE IF NOT EXISTS analysis_runs (
     started_at TEXT NOT NULL,
     ended_at TEXT,
     report_path TEXT,
+    verified_report_path TEXT,
     error TEXT,
     created_at TEXT NOT NULL,
     FOREIGN KEY (company_id) REFERENCES companies(company_id) ON DELETE RESTRICT
@@ -185,6 +186,7 @@ CREATE TABLE IF NOT EXISTS reviews (
     reviewer TEXT NOT NULL,
     comment TEXT,
     edited_payload_json TEXT,
+    payload_json TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL,
     FOREIGN KEY (run_id, finding_id)
         REFERENCES risk_findings(run_id, finding_id) ON DELETE RESTRICT

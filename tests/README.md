@@ -1,6 +1,7 @@
 # 测试结构
 
 - `unit/parser`：页码、坐标、OCR触发和截图。
+- `unit/reviewing`：证据复现、公式复算、人工复核状态机、审计记录和报告门禁。
 - `unit/skills`：财务与市场计算。
 - `unit/modeling`：标签、时间切分和泄漏检查。
 - `integration`：从PDF到风险JSON的完整链路。
