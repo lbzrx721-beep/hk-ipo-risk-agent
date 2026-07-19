@@ -8,7 +8,7 @@
 
 ```text
 PDF -> 页面与坐标 -> OCR兜底 -> 段落切片 -> BM25召回
-    -> Evidence -> RiskFinding -> 高亮截图 -> AgentTrace -> 风险JSON
+    -> Evidence -> RiskFinding/Calculation -> 高亮截图 -> AgentTrace -> 风险JSON
 ```
 
 现有英矽智能样本可稳定输出8条待人工复核风险，每条均包含PDF物理页码、
@@ -38,14 +38,17 @@ PDF -> 页面与坐标 -> OCR兜底 -> 段落切片 -> BM25召回
 
 - 对 Evidence 复核源文件存在性、SHA-256、PDF物理页、坐标、原文和证据截图。
 - 对 RiskFinding 复核证据引用、公司归属及数值公式；公式仅允许安全算术表达式。
+- 数值风险通过规则声明字段路径，从公司资料自动取值并记录输入来源；生成与复核共用同一
+  安全算术执行器。
 - 支持 `confirmed`、`rejected`、`edited` 三种人工决定，并原子更新风险状态与复核记录。
 - 已完成SQLite `1.0 -> 1.1` 幂等迁移，旧数据库会自动补充完整复核载荷和最终报告路径。
 - 只有全部风险进入 `verified` 或 `rejected` 后才能导出 `verified_risk_analysis.json`；
   最终报告只包含 `verified` 风险及其引用证据。
-- 新增 `list`、`verify`、`review`、`export` 四个命令行操作，全量53项测试、Ruff和mypy通过。
+- 新增 `list`、`verify`、`review`、`export` 四个命令行操作，全量54项测试、Ruff和mypy通过。
 
-对现有英矽智能8条候选风险执行只读核验后，7条通过；`F-03696-0007` 因含
-`39.29%` 数值结论但缺少可复算 `Calculation` 被拦截。系统不会代替投研人员自动确认风险。
+现有英矽智能样本的基石配售比例已按
+`37,204,500 / 94,690,500 * 100 = 39.290636%` 自动生成 `Calculation`；重新分析后的
+8条候选风险已全部通过只读确定性核验。系统不会代替投研人员自动确认风险。
 
 ## 核心原则
 

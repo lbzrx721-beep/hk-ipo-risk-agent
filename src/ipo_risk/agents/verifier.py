@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import math
 import re
 import unicodedata
@@ -11,6 +10,7 @@ from pathlib import Path
 
 import fitz
 
+from ipo_risk.calculations import reproduce_calculation
 from ipo_risk.domain import (
     Evidence,
     EvidenceVerification,
@@ -128,53 +128,6 @@ def verify_evidence(evidence: Evidence, *, project_root: Path) -> EvidenceVerifi
     return _result(evidence.evidence_id, checks)
 
 
-_BINARY_OPERATORS = {
-    ast.Add: lambda left, right: left + right,
-    ast.Sub: lambda left, right: left - right,
-    ast.Mult: lambda left, right: left * right,
-    ast.Div: lambda left, right: left / right,
-}
-_UNARY_OPERATORS = {
-    ast.UAdd: lambda value: value,
-    ast.USub: lambda value: -value,
-}
-
-
-def _numeric(value: object, name: str) -> float:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        raise ValueError(f"{name} must be numeric")
-    result = float(value)
-    if not math.isfinite(result):
-        raise ValueError(f"{name} must be finite")
-    return result
-
-
-def _evaluate_formula(formula: str, inputs: dict[str, object]) -> float:
-    tree = ast.parse(formula, mode="eval")
-
-    def evaluate(node: ast.AST) -> float:
-        if isinstance(node, ast.Expression):
-            return evaluate(node.body)
-        if isinstance(node, ast.Constant):
-            return _numeric(node.value, "formula constant")
-        if isinstance(node, ast.Name):
-            if node.id not in inputs:
-                raise ValueError(f"formula input is missing: {node.id}")
-            return _numeric(inputs[node.id], node.id)
-        if isinstance(node, ast.BinOp) and type(node.op) in _BINARY_OPERATORS:
-            binary_operator = _BINARY_OPERATORS[type(node.op)]
-            return binary_operator(evaluate(node.left), evaluate(node.right))
-        if isinstance(node, ast.UnaryOp) and type(node.op) in _UNARY_OPERATORS:
-            unary_operator = _UNARY_OPERATORS[type(node.op)]
-            return unary_operator(evaluate(node.operand))
-        raise ValueError(f"unsupported formula element: {type(node).__name__}")
-
-    result = evaluate(tree)
-    if not math.isfinite(result):
-        raise ValueError("formula result must be finite")
-    return result
-
-
 def _verify_calculation(finding: RiskFinding) -> VerificationCheck:
     has_numeric_claim = re.search(r"\d", finding.claim) is not None
     calculation = finding.calculation
@@ -189,8 +142,7 @@ def _verify_calculation(finding: RiskFinding) -> VerificationCheck:
             ),
         )
     try:
-        reproduced = _evaluate_formula(calculation.formula, dict(calculation.inputs))
-        expected = _numeric(calculation.result, "calculation result")
+        expected, reproduced = reproduce_calculation(calculation)
     except (SyntaxError, ValueError, ZeroDivisionError) as exc:
         return VerificationCheck(name="calculation", passed=False, detail=str(exc))
     matches = math.isclose(reproduced, expected, rel_tol=1e-9, abs_tol=1e-9)

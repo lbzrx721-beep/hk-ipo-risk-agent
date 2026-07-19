@@ -62,6 +62,18 @@ risks:
     query: 基石投资者 认购 发售股份 39.29% 全球发售
     required_keywords: ["基石投資者", "37,204,500", "39.29%"]
     claim: 基石投资者认购股份约占全球发售股份的39.29%，上市初期的投资者及可流通筹码结构需要关注。
+    calculation:
+      tool: calculate_percentage
+      formula: cornerstone_shares / offer_shares * 100
+      inputs:
+        cornerstone_shares:
+          path: offering.cornerstone_shares
+          source_ref: company_info:offering.cornerstone_shares
+        offer_shares:
+          path: offering.offer_shares
+          source_ref: company_info:offering.offer_shares
+      unit: percent
+      period_path: as_of_date
 
   - id: data_privacy_compliance
     name: 数据隐私与个人资料合规
@@ -95,4 +107,3 @@ risks:
     owner: business
     enabled: false
     evidence_fields: [product, revenue_ratio]
-

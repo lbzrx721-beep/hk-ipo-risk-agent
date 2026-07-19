@@ -77,6 +77,13 @@ class Calculation(StrictModel):
     result: JsonValue
     unit: NonEmptyStr
     period: NonEmptyStr
+    source_refs: dict[str, NonEmptyStr] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def source_refs_must_describe_inputs(self) -> Calculation:
+        if self.source_refs and set(self.source_refs) != set(self.inputs):
+            raise ValueError("source_refs must describe every calculation input")
+        return self
 
 
 class ToolCall(StrictModel):

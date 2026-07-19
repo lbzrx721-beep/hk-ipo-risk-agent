@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from uuid import uuid4
 
 from opencc import OpenCC
 
+from ipo_risk.calculations import build_calculation
 from ipo_risk.config import load_config
 from ipo_risk.domain import (
     AgentRole,
@@ -38,7 +40,7 @@ from ipo_risk.retrieval import (
     load_risk_rules,
     select_rule_candidates,
 )
-from ipo_risk.storage.files import sha256_file, write_jsonl
+from ipo_risk.storage.files import read_json, sha256_file, write_jsonl
 from ipo_risk.storage.ingestion import register_company_sources
 from ipo_risk.storage.paths import DocumentPaths
 from ipo_risk.storage.repositories import CatalogRepository
@@ -104,6 +106,7 @@ def analyze_prospectus(
     min_text_chars_before_ocr: int = 80,
     render_dpi: int = 150,
     expected_source_hash: str | None = None,
+    company_info: Mapping[str, object] | None = None,
 ) -> AnalysisArtifacts:
     """解析一份 PDF，召回证据并输出带截图的结构化风险报告。"""
     if not pdf_path.is_file():
@@ -279,6 +282,13 @@ def analyze_prospectus(
             ranks.append(hit.rank)
 
         finding_confidence = max(0.72, 0.92 - 0.01 * (max(ranks) - 1))
+        calculation = None
+        if rule.calculation is not None:
+            if company_info is None:
+                raise ValueError(
+                    f"company_info is required by calculation rule: {rule.id}"
+                )
+            calculation = build_calculation(rule.calculation, company_info)
         findings.append(
             RiskFinding(
                 finding_id=f"F-{company_id}-{len(findings) + 1:04d}",
@@ -291,6 +301,7 @@ def analyze_prospectus(
                 status=VerificationStatus.PENDING_VERIFICATION,
                 confidence=round(finding_confidence, 2),
                 created_by=rule.owner,
+                calculation=calculation,
                 uncertainty="规则与BM25生成的候选结论，需由投研人员复核确认。",
             )
         )
@@ -383,6 +394,7 @@ def analyze_company(
         key=lambda item: (item.available_at, item.document_date, item.document_id),
     )
     pdf_path = root / document.local_file
+    company_info = read_json(root / ingestion.company.metadata_file)
 
     artifacts = analyze_prospectus(
         pdf_path=pdf_path,
@@ -399,6 +411,7 @@ def analyze_company(
         min_text_chars_before_ocr=config.parser.min_text_chars_before_ocr,
         render_dpi=config.parser.render_dpi,
         expected_source_hash=document.source_hash,
+        company_info=company_info,
     )
     repository.save_analysis_report(
         artifacts.report,

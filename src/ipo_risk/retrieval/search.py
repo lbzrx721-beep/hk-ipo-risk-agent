@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ipo_risk.calculations import CalculationSpec
 from ipo_risk.domain import AgentRole, RiskSeverity
 from ipo_risk.retrieval.lexical import BM25Retriever, SearchHit
 
@@ -26,6 +27,7 @@ class RiskRule(BaseModel):
     required_keywords: tuple[str, ...] = ()
     claim: str = ""
     max_evidence: int = Field(default=1, ge=1, le=3)
+    calculation: CalculationSpec | None = None
 
     @model_validator(mode="after")
     def enabled_rules_must_be_executable(self) -> RiskRule:
