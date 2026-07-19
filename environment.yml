@@ -1,0 +1,13 @@
+name: hk-ipo-risk
+channels:
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - setuptools>=68
+  - wheel
+  - pip:
+      - -e .[dev,pdf,ocr,retrieval,data,modeling,api,ui,reporting]
+variables:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: utf-8

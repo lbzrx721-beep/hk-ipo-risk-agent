@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+
+# Secrets and local settings
+.env
+configs/providers.local.yaml
+*.key
+*.pem
+
+# Raw/private competition data
+data/raw/**
+!data/raw/**/
+!data/raw/**/README.md
+data/annotations/**
+!data/annotations/README.md
+data/interim/**
+!data/interim/README.md
+data/processed/**
+!data/processed/README.md
+
+# Generated artifacts
+artifacts/**
+!artifacts/README.md
+
+# Models and local databases
+*.db
+*.sqlite
+*.sqlite3
+*.parquet
+*.joblib
+*.pkl
+
+# Logs and reports
+*.log
+
+# IDE / OS
+.idea/
+.vscode/
+.ai/
+.agents/
+.DS_Store
+Thumbs.db
+
+# Local scratch space
+tmp/
+
+# Internal document review output
+.docx_review/

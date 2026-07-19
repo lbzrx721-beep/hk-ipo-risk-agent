@@ -1,0 +1,51 @@
+project:
+  name: hk-ipo-risk-agent
+  timezone: Asia/Shanghai
+
+paths:
+  prospectus_dir: data/raw/prospectus
+  company_info_dir: data/raw/company_info
+  market_dir: data/raw/market
+  annotations_dir: data/annotations
+  interim_dir: data/interim
+  processed_dir: data/processed
+  artifacts_dir: artifacts
+  database: data/app.db
+
+parser:
+  render_dpi: 150
+  min_text_chars_before_ocr: 80
+  preserve_bbox: true
+  preserve_page_image: true
+
+retrieval:
+  lexical_top_k: 20
+  semantic_top_k: 20
+  rerank_top_k: 8
+
+# 固定职责：阿里百炼只负责向量化，真实密钥在 providers.local.yaml。
+embedding:
+  provider: dashscope
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+  model_name: qwen3.7-text-embedding
+  dimensions: 1024
+  batch_size: 20
+
+# 固定职责：DeepSeek 负责所有 Agent 的 LLM 推理。
+llm:
+  provider: deepseek
+  base_url: https://api.deepseek.com
+  model_name: deepseek-v4-flash
+  temperature: 0.1
+  max_output_tokens: 8192
+
+agents:
+  max_retries: 2
+  require_evidence: true
+  require_verification: true
+
+prediction:
+  horizons: [1, 5, 20, 60]
+  primary_horizon: 5
+  split_strategy: time_ordered
+  forbid_post_listing_features: true
