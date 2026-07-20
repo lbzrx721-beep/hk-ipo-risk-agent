@@ -8,9 +8,10 @@ from .ingestion import (
     register_company_sources,
 )
 from .paths import DocumentPaths, safe_path_segment
-from .repositories import CatalogCounts, CatalogRepository
+from .repositories import AnalysisRunRecord, CatalogCounts, CatalogRepository
 
 __all__ = [
+    "AnalysisRunRecord",
     "CatalogCounts",
     "CatalogRepository",
     "CompanyIngestionResult",

@@ -62,7 +62,7 @@ class ParserConfig(BaseModel):
 class RetrievalConfig(BaseModel):
     """检索参数：词法 / 语义 / 重排序各取多少候选。"""
 
-    lexical_top_k: int = 20
+    lexical_top_k: int = 80
     semantic_top_k: int = 20
     rerank_top_k: int = 8
 
@@ -119,7 +119,10 @@ class AgentsConfig(BaseModel):
     模型供应商和密钥由顶层 llm 配置统一管理；这里仅保存编排约束。
     """
 
-    max_retries: int = 2
+    max_retries: int = Field(default=2, ge=0, le=10)
+    retry_initial_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
+    retry_backoff_factor: float = Field(default=2.0, ge=1.0, le=10.0)
+    retry_max_seconds: float = Field(default=8.0, ge=0.0, le=300.0)
     require_evidence: bool = True
     require_verification: bool = True
 

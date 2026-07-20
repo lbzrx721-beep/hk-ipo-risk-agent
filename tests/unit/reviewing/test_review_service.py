@@ -29,7 +29,7 @@ from ipo_risk.reporting import (
     write_risk_report,
 )
 from ipo_risk.reviewing import IncompleteReviewError, ReviewBlockedError, ReviewService
-from ipo_risk.storage.files import sha256_file
+from ipo_risk.storage.files import read_json, sha256_file
 from ipo_risk.storage.repositories import CatalogRepository
 from scripts.review_findings import app as review_app
 
@@ -136,6 +136,26 @@ def _prepared_run(tmp_path: Path) -> tuple[ReviewService, CatalogRepository, Ris
     write_risk_report(report, report_path)
     repository.save_analysis_report(report, report_path.relative_to(tmp_path).as_posix())
     return ReviewService(repository=repository, project_root=tmp_path), repository, finding
+
+
+def _review_app(project_root: Path):
+    from streamlit.testing.v1 import AppTest
+
+    root_literal = repr(str(project_root))
+    return AppTest.from_string(
+        f"""
+from pathlib import Path
+from ipo_risk.reviewing import ReviewService
+from ipo_risk.storage.repositories import CatalogRepository
+from ipo_risk.ui.review_app import render_review_app
+
+root = Path({root_literal})
+repository = CatalogRepository(root / "data" / "app.db")
+service = ReviewService(repository=repository, project_root=root)
+render_review_app(service)
+""",
+        default_timeout=5,
+    ).run()
 
 
 def test_confirmed_finding_is_verified_and_review_is_retrievable(tmp_path: Path) -> None:
@@ -321,3 +341,130 @@ def test_saved_candidate_report_cannot_reset_a_completed_review(tmp_path: Path) 
     assert stored is not None
     assert stored.status is VerificationStatus.VERIFIED
     assert len(repository.list_reviews("RUN-TEST-001")) == 1
+
+
+def test_review_workbench_lists_run_progress_and_finding_details(tmp_path: Path) -> None:
+    service, _, finding = _prepared_run(tmp_path)
+
+    runs = service.list_runs()
+    detail = service.get_finding_detail("RUN-TEST-001", finding.finding_id)
+
+    assert len(runs) == 1
+    assert runs[0].run_id == "RUN-TEST-001"
+    assert runs[0].company_name == "测试公司"
+    assert runs[0].total_findings == 1
+    assert runs[0].pending_findings == 1
+    assert runs[0].reviewed_findings == 0
+    assert runs[0].complete is False
+    assert detail.finding == finding
+    assert detail.evidences[0].evidence_id == "E-TEST-0001"
+    assert detail.verification.passed is True
+    assert detail.reviews == ()
+    assert detail.agent_traces[0].agent is AgentRole.ORCHESTRATOR
+
+
+def test_streamlit_workbench_renders_progress_evidence_and_actions(tmp_path: Path) -> None:
+    _, _, finding = _prepared_run(tmp_path)
+    app = _review_app(tmp_path)
+
+    assert not app.exception
+    assert app.title[0].value == "人工复核工作台"
+    assert app.selectbox[0].value == "RUN-TEST-001"
+    assert {metric.label: metric.value for metric in app.metric}["复核进度"] == "0 / 1"
+    assert any(finding.claim in item.value for item in app.markdown)
+    assert any("Customer concentration remains material" in item.value for item in app.markdown)
+    assert any(item.value == "Agent推理轨迹" for item in app.subheader)
+    assert any("生成候选风险" in item.value for item in app.markdown)
+    assert {button.label for button in app.button} >= {"确认", "驳回", "编辑"}
+
+
+def test_streamlit_workbench_confirm_button_writes_audited_review(tmp_path: Path) -> None:
+    _, repository, finding = _prepared_run(tmp_path)
+    app = _review_app(tmp_path)
+
+    app.text_input[0].input("analyst@example.com")
+    app.text_area[0].input("原文、期间和风险表述一致。")
+    next(button for button in app.button if button.label == "确认").click()
+    app = app.run()
+
+    stored = repository.get_finding("RUN-TEST-001", finding.finding_id)
+    reviews = repository.list_reviews("RUN-TEST-001", finding_id=finding.finding_id)
+    assert not app.exception
+    assert stored is not None
+    assert stored.status is VerificationStatus.VERIFIED
+    assert len(reviews) == 1
+    assert reviews[0].reviewer == "analyst@example.com"
+    assert any("已确认" in message.value for message in app.success)
+
+
+def test_review_annotations_export_as_distinct_versioned_snapshots(tmp_path: Path) -> None:
+    service, _, finding = _prepared_run(tmp_path)
+    service.review_finding(
+        run_id="RUN-TEST-001",
+        finding_id=finding.finding_id,
+        decision=ReviewDecision.CONFIRMED,
+        reviewer="analyst@example.com",
+        comment="原文、期间和风险表述一致。",
+    )
+
+    first_path = service.export_review_annotations("RUN-TEST-001")
+    second_path = service.export_review_annotations("RUN-TEST-001")
+    payload = read_json(first_path)
+
+    assert first_path != second_path
+    assert first_path.parent == (
+        tmp_path / "data" / "annotations" / "TEST" / "RUN-TEST-001"
+    )
+    assert payload["schema_version"] == "1.0"
+    assert payload["run_id"] == "RUN-TEST-001"
+    assert payload["complete"] is True
+    assert payload["findings"][0]["status"] == "verified"
+    assert payload["evidences"][0]["evidence_id"] == "E-TEST-0001"
+    assert payload["reviews"][0]["decision"] == "confirmed"
+
+
+def test_streamlit_workbench_exports_annotations_and_completed_report(tmp_path: Path) -> None:
+    service, _, finding = _prepared_run(tmp_path)
+    service.review_finding(
+        run_id="RUN-TEST-001",
+        finding_id=finding.finding_id,
+        decision=ReviewDecision.CONFIRMED,
+        reviewer="analyst@example.com",
+    )
+    app = _review_app(tmp_path)
+
+    annotation_button = next(
+        button for button in app.button if button.label == "导出版本化标注"
+    )
+    report_button = next(
+        button for button in app.button if button.label == "导出正式报告"
+    )
+    assert annotation_button.disabled is False
+    assert report_button.disabled is False
+
+    annotation_button.click()
+    app = app.run()
+    assert list(
+        (tmp_path / "data" / "annotations" / "TEST" / "RUN-TEST-001").glob(
+            "review_annotations_*.json"
+        )
+    )
+    assert any("标注快照" in message.value for message in app.success)
+
+    next(button for button in app.button if button.label == "导出正式报告").click()
+    app = app.run()
+    assert (tmp_path / "artifacts" / "verified_risk_analysis.json").is_file()
+    assert any("正式报告" in message.value for message in app.success)
+
+
+def test_streamlit_entrypoint_builds_review_service_from_project_root(
+    tmp_path: Path,
+) -> None:
+    from ipo_risk.ui.app import create_review_service
+
+    service = create_review_service(tmp_path)
+
+    assert service.project_root == tmp_path.resolve()
+    assert service.repository.database_path == (tmp_path / "data" / "app.db").resolve()
+    assert service.annotations_root == (tmp_path / "data" / "annotations").resolve()
+    assert service.repository.database_path.is_file()

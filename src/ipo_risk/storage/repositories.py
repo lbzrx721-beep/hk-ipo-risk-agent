@@ -43,6 +43,22 @@ class CatalogCounts:
     risk_findings: int
 
 
+@dataclass(frozen=True)
+class AnalysisRunRecord:
+    """一条可供复核界面选择的分析运行记录。"""
+
+    run_id: str
+    company_id: str
+    as_of_date: date
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    report_path: str | None
+    verified_report_path: str | None
+    error: str | None
+    created_at: datetime
+
+
 def _json_dumps(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
 
@@ -502,6 +518,29 @@ class CatalogRepository:
                     ),
                 )
 
+    def get_analysis_run(self, run_id: str) -> AnalysisRunRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._analysis_run_from_row(row) if row else None
+
+    def list_analysis_runs(
+        self,
+        *,
+        status: str | None = None,
+    ) -> tuple[AnalysisRunRecord, ...]:
+        query = "SELECT * FROM analysis_runs"
+        parameters: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            parameters.append(status)
+        query += " ORDER BY created_at DESC, run_id DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(self._analysis_run_from_row(row) for row in rows)
+
     def get_finding(self, run_id: str, finding_id: str) -> RiskFinding | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -725,5 +764,28 @@ class CatalogRepository:
     def _vector_index_from_row(row: sqlite3.Row) -> VectorIndexRecord:
         return VectorIndexRecord.model_validate(dict(row))
 
+    @staticmethod
+    def _analysis_run_from_row(row: sqlite3.Row) -> AnalysisRunRecord:
+        return AnalysisRunRecord(
+            run_id=str(row["run_id"]),
+            company_id=str(row["company_id"]),
+            as_of_date=date.fromisoformat(str(row["as_of_date"])),
+            status=str(row["status"]),
+            started_at=datetime.fromisoformat(str(row["started_at"])),
+            ended_at=(
+                datetime.fromisoformat(str(row["ended_at"]))
+                if row["ended_at"]
+                else None
+            ),
+            report_path=str(row["report_path"]) if row["report_path"] else None,
+            verified_report_path=(
+                str(row["verified_report_path"])
+                if row["verified_report_path"]
+                else None
+            ),
+            error=str(row["error"]) if row["error"] else None,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
 
-__all__ = ["CatalogCounts", "CatalogRepository"]
+
+__all__ = ["AnalysisRunRecord", "CatalogCounts", "CatalogRepository"]

@@ -19,7 +19,7 @@ parser:
   preserve_page_image: true
 
 retrieval:
-  lexical_top_k: 20
+  lexical_top_k: 80
   semantic_top_k: 20
   rerank_top_k: 8
 
@@ -41,6 +41,9 @@ llm:
 
 agents:
   max_retries: 2
+  retry_initial_seconds: 1.0
+  retry_backoff_factor: 2.0
+  retry_max_seconds: 8.0
   require_evidence: true
   require_verification: true
 

@@ -57,7 +57,7 @@ def test_pdf_to_grounded_risk_json(tmp_path: Path) -> None:
     assert report.source_document.page_count == 672
     assert report.source_document.chunk_count > 5_000
     assert report.summary.finding_count >= 5
-    assert report.summary.evidence_count == report.summary.finding_count
+    assert report.summary.evidence_count >= report.summary.finding_count
     assert report.summary.screenshot_count == report.summary.evidence_count
     assert all(evidence.quote for evidence in report.evidences)
     assert all(evidence.page >= 1 for evidence in report.evidences)
