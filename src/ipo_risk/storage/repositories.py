@@ -11,13 +11,23 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from ipo_risk.domain import CompanyRecord, DatasetRecord, DocumentRecord, VectorIndexRecord
+from ipo_risk.domain import (
+    CompanyRecord,
+    DatasetRecord,
+    DocumentRecord,
+    Evidence,
+    FindingReview,
+    ReviewDecision,
+    RiskFinding,
+    VectorIndexRecord,
+    VerificationStatus,
+)
 
 if TYPE_CHECKING:
     from ipo_risk.reporting import RiskAnalysisReport
 
 
-_SCHEMA_VERSION = "1.0"
+_SCHEMA_VERSION = "1.1"
 
 
 @dataclass(frozen=True)
@@ -31,6 +41,22 @@ class CatalogCounts:
     analysis_runs: int
     evidence: int
     risk_findings: int
+
+
+@dataclass(frozen=True)
+class AnalysisRunRecord:
+    """一条可供复核界面选择的分析运行记录。"""
+
+    run_id: str
+    company_id: str
+    as_of_date: date
+    status: str
+    started_at: datetime
+    ended_at: datetime | None
+    report_path: str | None
+    verified_report_path: str | None
+    error: str | None
+    created_at: datetime
 
 
 def _json_dumps(value: Any) -> str:
@@ -70,6 +96,23 @@ class CatalogRepository:
         applied_at = datetime.now(timezone.utc).isoformat()
         with self._connection() as connection:
             connection.executescript(schema)
+            review_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(reviews)").fetchall()
+            }
+            if "payload_json" not in review_columns:
+                connection.execute(
+                    "ALTER TABLE reviews "
+                    "ADD COLUMN payload_json TEXT NOT NULL DEFAULT '{}'"
+                )
+            run_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(analysis_runs)").fetchall()
+            }
+            if "verified_report_path" not in run_columns:
+                connection.execute(
+                    "ALTER TABLE analysis_runs ADD COLUMN verified_report_path TEXT"
+                )
             connection.execute(
                 """
                 INSERT INTO schema_metadata(schema_name, schema_version, applied_at)
@@ -406,9 +449,15 @@ class CatalogRepository:
                         confidence, payload_json, created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(run_id, finding_id) DO UPDATE SET
-                        status = excluded.status,
-                        confidence = excluded.confidence,
-                        payload_json = excluded.payload_json
+                        status = CASE
+                            WHEN risk_findings.status IN ('verified', 'rejected')
+                            THEN risk_findings.status ELSE excluded.status END,
+                        confidence = CASE
+                            WHEN risk_findings.status IN ('verified', 'rejected')
+                            THEN risk_findings.confidence ELSE excluded.confidence END,
+                        payload_json = CASE
+                            WHEN risk_findings.status IN ('verified', 'rejected')
+                            THEN risk_findings.payload_json ELSE excluded.payload_json END
                     """,
                     (
                         report.run_id,
@@ -421,6 +470,22 @@ class CatalogRepository:
                         finding.created_at.isoformat(),
                     ),
                 )
+                stored_status = connection.execute(
+                    """
+                    SELECT status FROM risk_findings
+                    WHERE run_id = ? AND finding_id = ?
+                    """,
+                    (report.run_id, finding.finding_id),
+                ).fetchone()["status"]
+                if (
+                    stored_status in {"verified", "rejected"}
+                    and finding.status
+                    in {
+                        VerificationStatus.PROPOSED,
+                        VerificationStatus.PENDING_VERIFICATION,
+                    }
+                ):
+                    continue
                 for evidence_id in finding.evidence_ids:
                     connection.execute(
                         """
@@ -452,6 +517,214 @@ class CatalogRepository:
                         trace.ended_at.isoformat(),
                     ),
                 )
+
+    def get_analysis_run(self, run_id: str) -> AnalysisRunRecord | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return self._analysis_run_from_row(row) if row else None
+
+    def list_analysis_runs(
+        self,
+        *,
+        status: str | None = None,
+    ) -> tuple[AnalysisRunRecord, ...]:
+        query = "SELECT * FROM analysis_runs"
+        parameters: list[Any] = []
+        if status is not None:
+            query += " WHERE status = ?"
+            parameters.append(status)
+        query += " ORDER BY created_at DESC, run_id DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(self._analysis_run_from_row(row) for row in rows)
+
+    def get_finding(self, run_id: str, finding_id: str) -> RiskFinding | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT payload_json FROM risk_findings
+                WHERE run_id = ? AND finding_id = ?
+                """,
+                (run_id, finding_id),
+            ).fetchone()
+        return RiskFinding.model_validate(_json_loads(row["payload_json"])) if row else None
+
+    def get_analysis_report_path(self, run_id: str) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT report_path FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return str(row["report_path"]) if row and row["report_path"] else None
+
+    def set_verified_report_path(self, run_id: str, report_path: str) -> None:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE analysis_runs SET verified_report_path = ? WHERE run_id = ?
+                """,
+                (report_path, run_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"analysis run does not exist: {run_id}")
+
+    def get_verified_report_path(self, run_id: str) -> str | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT verified_report_path FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return (
+            str(row["verified_report_path"])
+            if row and row["verified_report_path"]
+            else None
+        )
+
+    def list_findings(
+        self,
+        run_id: str,
+        *,
+        status: VerificationStatus | None = None,
+    ) -> tuple[RiskFinding, ...]:
+        query = "SELECT payload_json FROM risk_findings WHERE run_id = ?"
+        parameters: list[Any] = [run_id]
+        if status is not None:
+            query += " AND status = ?"
+            parameters.append(status.value)
+        query += " ORDER BY finding_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(
+            RiskFinding.model_validate(_json_loads(row["payload_json"])) for row in rows
+        )
+
+    def list_evidence(
+        self,
+        run_id: str,
+        *,
+        evidence_ids: Sequence[str] | None = None,
+    ) -> tuple[Evidence, ...]:
+        query = "SELECT payload_json FROM evidence WHERE run_id = ?"
+        parameters: list[Any] = [run_id]
+        if evidence_ids is not None:
+            if not evidence_ids:
+                return ()
+            placeholders = ", ".join("?" for _ in evidence_ids)
+            query += f" AND evidence_id IN ({placeholders})"
+            parameters.extend(evidence_ids)
+        query += " ORDER BY evidence_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(Evidence.model_validate(_json_loads(row["payload_json"])) for row in rows)
+
+    def save_review(self, review: FindingReview) -> None:
+        """Atomically persist an immutable review and its resulting finding state."""
+        finding = review.resulting_finding
+        with self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT 1 FROM risk_findings
+                WHERE run_id = ? AND finding_id = ?
+                """,
+                (review.run_id, review.finding_id),
+            ).fetchone()
+            if existing is None:
+                raise KeyError(
+                    f"finding does not exist: {review.run_id}/{review.finding_id}"
+                )
+
+            known_evidence = {
+                row["evidence_id"]
+                for row in connection.execute(
+                    "SELECT evidence_id FROM evidence WHERE run_id = ?",
+                    (review.run_id,),
+                ).fetchall()
+            }
+            missing = set(finding.evidence_ids) - known_evidence
+            if missing:
+                raise ValueError(f"review references unknown evidence: {sorted(missing)}")
+
+            connection.execute(
+                """
+                UPDATE risk_findings
+                SET status = ?, confidence = ?, payload_json = ?
+                WHERE run_id = ? AND finding_id = ?
+                """,
+                (
+                    finding.status.value,
+                    finding.confidence,
+                    _json_dumps(finding.model_dump(mode="json")),
+                    review.run_id,
+                    review.finding_id,
+                ),
+            )
+            connection.execute(
+                "DELETE FROM finding_evidence WHERE run_id = ? AND finding_id = ?",
+                (review.run_id, review.finding_id),
+            )
+            connection.executemany(
+                """
+                INSERT INTO finding_evidence(run_id, finding_id, evidence_id)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (review.run_id, review.finding_id, evidence_id)
+                    for evidence_id in finding.evidence_ids
+                ],
+            )
+            edited_payload = (
+                _json_dumps(finding.model_dump(mode="json"))
+                if review.decision is ReviewDecision.EDITED
+                else None
+            )
+            connection.execute(
+                """
+                INSERT INTO reviews(
+                    review_id, run_id, finding_id, decision, reviewer, comment,
+                    edited_payload_json, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    review.review_id,
+                    review.run_id,
+                    review.finding_id,
+                    review.decision.value,
+                    review.reviewer,
+                    review.comment,
+                    edited_payload,
+                    _json_dumps(review.model_dump(mode="json")),
+                    review.created_at.isoformat(),
+                ),
+            )
+
+    def get_review(self, review_id: str) -> FindingReview | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT payload_json FROM reviews WHERE review_id = ?",
+                (review_id,),
+            ).fetchone()
+        return FindingReview.model_validate(_json_loads(row["payload_json"])) if row else None
+
+    def list_reviews(
+        self,
+        run_id: str,
+        *,
+        finding_id: str | None = None,
+    ) -> tuple[FindingReview, ...]:
+        query = "SELECT payload_json FROM reviews WHERE run_id = ?"
+        parameters: list[Any] = [run_id]
+        if finding_id is not None:
+            query += " AND finding_id = ?"
+            parameters.append(finding_id)
+        query += " ORDER BY created_at, review_id"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(
+            FindingReview.model_validate(_json_loads(row["payload_json"])) for row in rows
+        )
 
     def counts(self) -> CatalogCounts:
         tables = (
@@ -491,5 +764,28 @@ class CatalogRepository:
     def _vector_index_from_row(row: sqlite3.Row) -> VectorIndexRecord:
         return VectorIndexRecord.model_validate(dict(row))
 
+    @staticmethod
+    def _analysis_run_from_row(row: sqlite3.Row) -> AnalysisRunRecord:
+        return AnalysisRunRecord(
+            run_id=str(row["run_id"]),
+            company_id=str(row["company_id"]),
+            as_of_date=date.fromisoformat(str(row["as_of_date"])),
+            status=str(row["status"]),
+            started_at=datetime.fromisoformat(str(row["started_at"])),
+            ended_at=(
+                datetime.fromisoformat(str(row["ended_at"]))
+                if row["ended_at"]
+                else None
+            ),
+            report_path=str(row["report_path"]) if row["report_path"] else None,
+            verified_report_path=(
+                str(row["verified_report_path"])
+                if row["verified_report_path"]
+                else None
+            ),
+            error=str(row["error"]) if row["error"] else None,
+            created_at=datetime.fromisoformat(str(row["created_at"])),
+        )
 
-__all__ = ["CatalogCounts", "CatalogRepository"]
+
+__all__ = ["AnalysisRunRecord", "CatalogCounts", "CatalogRepository"]

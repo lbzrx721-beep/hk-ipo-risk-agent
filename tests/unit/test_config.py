@@ -61,3 +61,24 @@ llm:
 
     assert "visible-only-in-local-yaml" not in rendered
     assert "another-local-secret" not in rendered
+
+
+def test_model_retry_policy_is_loaded_from_project_config(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        """
+agents:
+  max_retries: 4
+  retry_initial_seconds: 0.5
+  retry_backoff_factor: 1.5
+  retry_max_seconds: 6.0
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(base_path, tmp_path / "missing-providers.yaml")
+
+    assert config.agents.max_retries == 4
+    assert config.agents.retry_initial_seconds == 0.5
+    assert config.agents.retry_backoff_factor == 1.5
+    assert config.agents.retry_max_seconds == 6.0

@@ -7,6 +7,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from ipo_risk.calculations import CalculationSpec
 from ipo_risk.domain import AgentRole, RiskSeverity
 from ipo_risk.retrieval.lexical import BM25Retriever, SearchHit
 
@@ -23,9 +24,11 @@ class RiskRule(BaseModel):
     enabled: bool = True
     severity: RiskSeverity = RiskSeverity.MEDIUM
     query: str = ""
+    query_variants: tuple[str, ...] = ()
     required_keywords: tuple[str, ...] = ()
     claim: str = ""
     max_evidence: int = Field(default=1, ge=1, le=3)
+    calculation: CalculationSpec | None = None
 
     @model_validator(mode="after")
     def enabled_rules_must_be_executable(self) -> RiskRule:
@@ -36,6 +39,17 @@ class RiskRule(BaseModel):
         if self.enabled and not self.claim:
             raise ValueError("an enabled risk rule must include claim")
         return self
+
+    @property
+    def search_queries(self) -> tuple[str, ...]:
+        """主查询加扩展问法，去除空值和重复项并保持配置顺序。"""
+        return tuple(
+            dict.fromkeys(
+                item.strip()
+                for item in (self.query, *self.query_variants)
+                if item.strip()
+            )
+        )
 
 
 def load_risk_rules(path: Path) -> list[RiskRule]:
@@ -58,15 +72,21 @@ def select_rule_candidates(
     """只保留同时包含全部锚定关键词的 BM25 候选。"""
     required = [_normalized_for_match(keyword) for keyword in rule.required_keywords]
     selected: list[SearchHit] = []
-    for hit in retriever.search(rule.query, top_k=top_k):
-        text = _normalized_for_match(hit.chunk.text)
-        if hit.chunk.is_heading or len(text) < 20:
-            continue
-        if all(keyword in text for keyword in required):
-            selected.append(hit)
-        if len(selected) >= rule.max_evidence:
-            break
-    return selected
+    by_chunk: dict[str, SearchHit] = {}
+    for query in rule.search_queries:
+        for hit in retriever.search(query, top_k=top_k):
+            text = _normalized_for_match(hit.chunk.text)
+            if hit.chunk.is_heading or len(text) < 20:
+                continue
+            if all(keyword in text for keyword in required):
+                current = by_chunk.get(hit.chunk.chunk_id)
+                if current is None or hit.score > current.score:
+                    by_chunk[hit.chunk.chunk_id] = hit
+    selected = sorted(
+        by_chunk.values(),
+        key=lambda hit: (-hit.score, hit.rank, hit.chunk.chunk_id),
+    )
+    return selected[: rule.max_evidence]
 
 
 __all__ = ["RiskRule", "load_risk_rules", "select_rule_candidates"]

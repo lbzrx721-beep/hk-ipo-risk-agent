@@ -1,4 +1,4 @@
-version: 2
+version: 3
 risks:
   - id: cash_burn
     name: 现金消耗与融资依赖
@@ -6,6 +6,9 @@ risks:
     severity: high
     evidence_fields: [cash_balance, operating_cash_flow, reporting_period]
     query: 经营活动所用现金净额 负现金流量 研发活动 现金流出
+    query_variants:
+      - 现金跑道 流动资金 未来融资需求 持续经营
+      - 研发开支 烧钱速度 现金及现金等价物 资金缺口
     required_keywords: ["負現金流量", "研發活動"]
     claim: 公司在业绩记录期持续产生经营现金净流出，且现金流出主要来自研发活动，资金消耗及后续融资需求值得关注。
 
@@ -15,6 +18,9 @@ risks:
     severity: high
     evidence_fields: [net_profit, reporting_period]
     query: 历史亏损 重大研发投资 授权收入 盈利能力
+    query_variants:
+      - 经营亏损 净亏损 尚未盈利 盈利时间表
+      - 毛利 收入确认 商业化 不确定达到或维持盈利
     required_keywords: ["歷史虧損", "重大研發投資"]
     claim: 公司在业绩记录期录得历史亏损，盈利能力受到重大研发投入、授权交易收入确认节奏等因素影响。
 
@@ -24,6 +30,9 @@ risks:
     severity: high
     evidence_fields: [top_customer_ratio, reporting_period]
     query: 五大客户 最大客户 总收入 客户集中 重大不利影响
+    query_variants:
+      - 单一客户依赖 主要客户 收入贡献 客户流失
+      - 客户集中度 信贷风险 应收款项 大客户议价能力
     required_keywords: ["五大客戶", "最大客戶"]
     claim: 公司来自前五大客户及最大客户的收入占比较高，主要客户流失或付款、续约变化可能显著影响经营表现。
 
@@ -33,6 +42,9 @@ risks:
     severity: medium
     evidence_fields: [top_supplier_ratio, reporting_period]
     query: 五大供应商 最大供应商 采购总额 临床试验 第三方服务
+    query_variants:
+      - 单一供应商依赖 关键原材料 独家供应 替代供应商
+      - 供应商集中度 外包研发 临床服务 采购依赖
     required_keywords: ["五大供應商", "最大供應商"]
     claim: 公司部分临床前评估及临床试验活动依赖外部供应商，前五大供应商占采购总额比例值得持续监测。
 
@@ -42,6 +54,9 @@ risks:
     severity: high
     evidence_fields: [license, jurisdiction, status]
     query: 监管机构 许可 牌照 批准 未能遵守 业务经营受限
+    query_variants:
+      - 监管批准 产品注册 临床试验许可 合规牌照
+      - 许可证续期 被暂停撤销 行政执法 业务限制
     required_keywords: ["監管機構", "許可證", "未能遵守"]
     claim: 公司在多个司法辖区开展生物医药研发，需要持续满足牌照、许可及监管要求，未能遵守可能导致业务受限或执法措施。
 
@@ -51,6 +66,9 @@ risks:
     severity: high
     evidence_fields: [product, stage, milestone]
     query: 候选药物 临床试验 安全性 疗效 未成功 商业化
+    query_variants:
+      - 核心产品 管线失败 临床终点 研发失败 商业化风险
+      - 候选药物审批 上市许可 试验延迟 不良事件
     required_keywords: ["候選藥物", "臨床試驗", "未成功"]
     claim: 多数由公司AI平台开发的分子尚未成功通过临床试验，候选药物的安全性、疗效和商业化仍存在较高不确定性。
 
@@ -60,8 +78,23 @@ risks:
     severity: medium
     evidence_fields: [issue_size, cornerstone_ratio, offer_price]
     query: 基石投资者 认购 发售股份 39.29% 全球发售
+    query_variants:
+      - 基石配售 锁定期 流通盘 股权集中 上市初期筹码
+      - 国际配售 公开发售 超额配股 发售价 发行结构
     required_keywords: ["基石投資者", "37,204,500", "39.29%"]
     claim: 基石投资者认购股份约占全球发售股份的39.29%，上市初期的投资者及可流通筹码结构需要关注。
+    calculation:
+      tool: calculate_percentage
+      formula: cornerstone_shares / offer_shares * 100
+      inputs:
+        cornerstone_shares:
+          path: offering.cornerstone_shares
+          source_ref: company_info:offering.cornerstone_shares
+        offer_shares:
+          path: offering.offer_shares
+          source_ref: company_info:offering.offer_shares
+      unit: percent
+      period_path: as_of_date
 
   - id: data_privacy_compliance
     name: 数据隐私与个人资料合规
@@ -69,30 +102,60 @@ risks:
     severity: medium
     evidence_fields: [jurisdiction, regulation, protected_data]
     query: 数据隐私 个人资料 安全法规 人工智能 合规
+    query_variants:
+      - 患者数据 健康信息 跨境传输 网络安全 数据泄露
+      - 个人信息保护 数据授权 人工智能训练数据 合规成本
     required_keywords: ["數據隱私", "個人資料"]
     claim: 公司在多个地区处理健康相关信息和个人资料，适用的数据隐私与安全规则复杂且持续演变，合规成本和违规风险需要关注。
 
   - id: related_party_transaction
     name: 关联交易
     owner: finance
-    enabled: false
+    severity: high
     evidence_fields: [counterparty, amount, relationship]
+    query: 关联方 关连交易 关联交易 关联人士 往来余额
+    query_variants:
+      - 控股股东 董事 实际控制人 交易金额 定价政策
+      - 关连人士 应收应付款 利益冲突 非独立交易
+    required_keywords: ["關聯方"]
+    claim: 公司存在关联方或关连人士交易，相关交易的必要性、定价公允性及持续影响需要进一步核验。
+    max_evidence: 2
 
   - id: redemption_or_vam
     name: 赎回或对赌条款
     owner: legal
-    enabled: false
+    severity: critical
     evidence_fields: [clause_text, trigger, obligation]
+    query: 赎回权 对赌 估值调整 特别权利 回购义务
+    query_variants:
+      - 优先股赎回 投资者赎回要求 强制回购 触发条件
+      - 可转换可赎回股份 上市失效 现金结算 合同义务
+    required_keywords: ["贖回"]
+    claim: 公司历史融资安排可能包含赎回、回购或估值调整等特殊权利，其终止状态、触发条件和潜在现金义务需要重点核验。
+    max_evidence: 2
 
   - id: litigation_or_penalty
     name: 诉讼与处罚
     owner: legal
-    enabled: false
+    severity: high
     evidence_fields: [matter, amount, status]
+    query: 诉讼 仲裁 行政处罚 调查 索赔 法律程序
+    query_variants:
+      - 重大法律程序 监管调查 罚款 纠纷 或有负债
+      - 知识产权诉讼 专利争议 赔偿 未决案件
+    required_keywords: ["訴訟"]
+    claim: 公司涉及或可能涉及诉讼、仲裁、监管调查或处罚事项，其财务影响与业务连续性风险需要持续关注。
+    max_evidence: 2
 
   - id: single_product_dependency
     name: 单一产品依赖
     owner: business
-    enabled: false
+    severity: high
     evidence_fields: [product, revenue_ratio]
-
+    query: 单一产品 核心产品 收入依赖 商业化依赖 产品集中
+    query_variants:
+      - 主要收入来源 核心管线 单个候选药物 产品组合有限
+      - 产品失败 收入大幅下降 缺乏多元化 替代产品
+    required_keywords: ["依賴"]
+    claim: 公司的收入、商业化进展或估值可能高度依赖少数核心产品或管线，相关产品失败会造成集中性冲击。
+    max_evidence: 2
