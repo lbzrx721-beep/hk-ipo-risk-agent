@@ -31,6 +31,8 @@ from typing import Iterator
 import fitz  # PyMuPDF
 
 from ipo_risk.parser.ocr import ocr_page
+from ipo_risk.parser.tables import TableArtifact, extract_page_tables
+from ipo_risk.parser.visual import VisualRegion, detect_visual_regions
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +93,8 @@ class PageResult:
     text_blocks: list[TextBlock] = field(default_factory=list)
     raw_text: str = ""
     char_count: int = 0
+    visual_regions: list[VisualRegion] = field(default_factory=list)
+    tables: list[TableArtifact] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +222,18 @@ def parse_page(
                 raw_text = candidate_text
                 char_count = candidate_char_count
 
+    visual_regions = detect_visual_regions(
+        page,
+        page_num=page_num,
+        text_blocks=text_blocks,
+    )
+    tables = extract_page_tables(
+        page,
+        page_num=page_num,
+        text_blocks=text_blocks,
+        visual_regions=visual_regions,
+    )
+
     return PageResult(
         page=page_num,
         width=round(rect.width, 2),
@@ -226,6 +242,8 @@ def parse_page(
         text_blocks=text_blocks,
         raw_text=raw_text,
         char_count=char_count,
+        visual_regions=visual_regions,
+        tables=tables,
     )
 
 

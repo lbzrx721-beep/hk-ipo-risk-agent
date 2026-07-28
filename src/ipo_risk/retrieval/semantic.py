@@ -27,6 +27,18 @@ class EmbeddingProvider(Protocol):
         ...
 
 
+class SemanticSearchProvider(Protocol):
+    """可参与混合检索的最小语义搜索接口。"""
+
+    def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
+        ...
+
+
+# 向量化进度回调：(已完成条数, 总条数)。首次向量化可能耗时较长，
+# 通过逐批回调让上层能够展示百分比，避免界面看似卡死。
+EmbeddingProgressCallback = Callable[[int, int], None]
+
+
 class OpenAICompatibleEmbeddingProvider:
     """通过OpenAI兼容Embedding接口批量生成稠密向量。"""
 
@@ -44,6 +56,7 @@ class OpenAICompatibleEmbeddingProvider:
         retry_backoff_factor: float = 2.0,
         retry_max_seconds: float = 8.0,
         sleep: Callable[[float], None] | None = None,
+        progress_callback: EmbeddingProgressCallback | None = None,
     ) -> None:
         if dimensions < 1 or batch_size < 1:
             raise ValueError("embedding dimensions and batch_size must be positive")
@@ -77,13 +90,15 @@ class OpenAICompatibleEmbeddingProvider:
         self.retry_count = 0
         self.request_count = 0
         self.last_attempts = 0
+        self._progress_callback = progress_callback
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """分批调用兼容接口并保持与输入一致的向量顺序。"""
         if not texts:
             return []
         vectors: list[list[float]] = []
-        for start in range(0, len(texts), self._batch_size):
+        total = len(texts)
+        for start in range(0, total, self._batch_size):
             batch = texts[start : start + self._batch_size]
             try:
                 outcome = self._retry_policy.run(
@@ -111,6 +126,9 @@ class OpenAICompatibleEmbeddingProvider:
                 if len(vector) != self.dimensions:
                     raise ValueError("embedding API returned an unexpected dimension")
                 vectors.append(vector)
+            # 每完成一批就上报进度，让上层能展示向量化百分比
+            if self._progress_callback is not None:
+                self._progress_callback(min(start + len(batch), total), total)
         return vectors
 
 
@@ -158,7 +176,13 @@ class SemanticRetriever:
             raise ValueError("embedding provider returned an unexpected vector count")
         if vectors.shape[1] != provider.dimensions:
             raise ValueError("embedding provider returned an unexpected dimension")
+        vectors.flags.writeable = False
         self._vectors = vectors
+
+    @property
+    def document_vectors(self) -> np.ndarray:
+        """返回当前文档只读向量，供后台持久化复用而不再次调用模型。"""
+        return self._vectors
 
     def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
         """返回按余弦相似度降序排列的语义候选段落。"""
@@ -298,7 +322,7 @@ class HybridRetriever:
     def __init__(
         self,
         lexical: BM25Retriever,
-        semantic: SemanticRetriever,
+        semantic: SemanticSearchProvider,
         *,
         lexical_top_k: int = 20,
         semantic_top_k: int = 20,
@@ -359,5 +383,6 @@ __all__ = [
     "HybridRetriever",
     "HybridSearchHit",
     "OpenAICompatibleEmbeddingProvider",
+    "SemanticSearchProvider",
     "SemanticRetriever",
 ]

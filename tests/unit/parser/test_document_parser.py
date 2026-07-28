@@ -175,19 +175,19 @@ class TestLayout:
 # ---------------------------------------------------------------------------
 
 class TestConfig:
-    def test_load_config_returns_valid_object(self) -> None:
-        """load_config 应该成功返回 AppConfig 实例。"""
-        config = load_config()
+    def test_load_config_returns_valid_object(self, tmp_path: Path) -> None:
+        """基础配置应可独立加载，不受开发者本地私有配置影响。"""
+        config = load_config(providers_path=tmp_path / "missing-providers.yaml")
         assert config.project_name == "hk-ipo-risk-agent"
         assert config.parser.min_text_chars_before_ocr == 80
         assert config.parser.render_dpi == 150
-        assert config.embedding.provider == "dashscope"
-        assert config.embedding.model_name == "qwen3.7-text-embedding"
-        assert config.embedding.batch_size == 20
+        assert config.embedding.provider == "zhipu"
+        assert config.embedding.model_name == "embedding-3-pro"
+        assert config.embedding.batch_size == 64
         assert config.llm.provider == "deepseek"
         assert config.llm.model_name == "deepseek-v4-flash"
-        assert config.embedding.is_configured
-        assert config.llm.is_configured
+        assert not config.embedding.is_configured
+        assert not config.llm.is_configured
 
     def test_resolve_path_returns_absolute(self) -> None:
         """resolve_path 应该返回绝对路径。"""

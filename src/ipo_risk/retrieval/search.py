@@ -27,7 +27,7 @@ class RiskRule(BaseModel):
     query_variants: tuple[str, ...] = ()
     required_keywords: tuple[str, ...] = ()
     claim: str = ""
-    max_evidence: int = Field(default=1, ge=1, le=3)
+    max_evidence: int = Field(default=1, ge=1, le=8)
     calculation: CalculationSpec | None = None
 
     @model_validator(mode="after")

@@ -15,7 +15,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr
@@ -30,13 +30,13 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
 # 各配置区段 —— 与 base.yaml 的层级一一对应
 # ---------------------------------------------------------------------------
 
+
 class PathsConfig(BaseModel):
     """各类数据目录的相对路径（相对于项目根目录）。"""
 
     prospectus_dir: str = "data/raw/prospectus"
     company_info_dir: str = "data/raw/company_info"
     market_dir: str = "data/raw/market"
-    annotations_dir: str = "data/annotations"
     interim_dir: str = "data/interim"
     processed_dir: str = "data/processed"
     artifacts_dir: str = "artifacts"
@@ -67,26 +67,44 @@ class RetrievalConfig(BaseModel):
     rerank_top_k: int = 8
 
 
+class VectorStoreConfig(BaseModel):
+    """向量存储后端配置。
+
+    backend:
+      - "numpy": 内存向量 + 磁盘缓存（单文档场景）。
+      - "chroma": ChromaDB 同步检索与持久化（兼容模式）。
+      - "hybrid": 内存立即检索，并异步把同一份向量写入 Chroma（默认）。
+    """
+
+    backend: Literal["numpy", "chroma", "hybrid"] = "hybrid"
+    chroma_persist_dir: str = "data/vector_store_v1"
+    chroma_collection: str = "prospectus_chunks"
+
+
 class EmbeddingConfig(BaseModel):
     """招股书语义检索使用的向量模型配置。"""
 
-    provider: str = "dashscope"
+    provider: str = "zhipu"
     api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
-    base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    model_name: str = "qwen3.7-text-embedding"
+    base_url: str = "https://open.bigmodel.cn/api/paas/v4"
+    model_name: str = "embedding-3-pro"
     dimensions: int = 1024
-    batch_size: int = 20
+    batch_size: int = 64
 
     @property
     def is_configured(self) -> bool:
         """是否已经在项目本地配置文件中填写有效密钥。"""
-        return bool(self.api_key.get_secret_value().strip())
+        return self.provider.lower() == "ollama" or bool(
+            self.api_key.get_secret_value().strip()
+        )
 
     def require_api_key(self) -> str:
         """返回明文密钥；仅允许模型客户端在真正调用接口时使用。"""
+        if self.provider.lower() == "ollama":
+            return "ollama"
         value = self.api_key.get_secret_value().strip()
         if not value:
-            raise RuntimeError("DashScope API Key 未配置：请检查 configs/providers.local.yaml")
+            raise RuntimeError("Embedding API Key 未配置：请检查 configs/providers.local.yaml")
         return value
 
 
@@ -99,6 +117,12 @@ class LLMConfig(BaseModel):
     model_name: str = "deepseek-v4-flash"
     temperature: float = 0.1
     max_output_tokens: int = 8192
+    supports_json_object: bool = True
+    reasoning_effort: Literal["low", "medium", "high"] | None = None
+    disable_thinking: bool = True
+    input_price_per_million_rmb: float | None = Field(default=None, ge=0.0)
+    output_price_per_million_rmb: float | None = Field(default=None, ge=0.0)
+    cached_input_price_per_million_rmb: float | None = Field(default=None, ge=0.0)
 
     @property
     def is_configured(self) -> bool:
@@ -109,8 +133,19 @@ class LLMConfig(BaseModel):
         """返回明文密钥；仅允许模型客户端在真正调用接口时使用。"""
         value = self.api_key.get_secret_value().strip()
         if not value:
-            raise RuntimeError("DeepSeek API Key 未配置：请检查 configs/providers.local.yaml")
+            raise RuntimeError(
+                f"{self.provider} API Key 未配置：请检查 configs/providers.local.yaml"
+            )
         return value
+
+
+class ModelBudgetConfig(BaseModel):
+    """可选的单公司硬预算；默认仅统计用量，不中断分析。"""
+
+    max_calls: int | None = Field(default=None, ge=1)
+    max_input_tokens: int | None = Field(default=None, ge=1)
+    max_output_tokens: int | None = Field(default=None, ge=1)
+    max_cost_rmb: float | None = Field(default=None, gt=0.0)
 
 
 class AgentsConfig(BaseModel):
@@ -123,6 +158,24 @@ class AgentsConfig(BaseModel):
     retry_initial_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
     retry_backoff_factor: float = Field(default=2.0, ge=1.0, le=10.0)
     retry_max_seconds: float = Field(default=8.0, ge=0.0, le=300.0)
+    enable_open_discovery: bool = True
+    # 风险发现先动态规划检索问题，再从向量索引取回原文和相邻上下文。
+    discovery_retrieval_query_count: int = Field(default=16, ge=4, le=20)
+    discovery_retrieval_top_k: int = Field(default=18, ge=2, le=50)
+    discovery_retrieval_lexical_top_k: int = Field(default=10, ge=1, le=30)
+    discovery_retrieval_neighbor_radius: int = Field(default=1, ge=0, le=3)
+    discovery_coverage_sections: int = Field(default=48, ge=4, le=100)
+    discovery_max_selected_chunks: int = Field(default=520, ge=50, le=2_000)
+    # 取回的原文仍按容量分包；同一波并行、下一波共享前序风险主题记忆。
+    discovery_batch_chars: int = Field(default=70_000, ge=2_000, le=1_000_000)
+    discovery_wave_size: int = Field(default=4, ge=1, le=4)
+    # 首轮完整发现，第二轮仅补充首轮遗漏的、证据独立的重大风险。
+    discovery_max_batch_passes: int = Field(default=2, ge=1, le=4)
+    consolidation_batch_size: int = Field(default=24, ge=2, le=100)
+    specialist_batch_size: int = Field(default=100, ge=2, le=200)
+    specialist_followup_rounds: int = Field(default=0, ge=0, le=2)
+    decision_conflict_batch_size: int = Field(default=12, ge=2, le=30)
+    model_budget: ModelBudgetConfig = Field(default_factory=ModelBudgetConfig)
     require_evidence: bool = True
     require_verification: bool = True
 
@@ -137,13 +190,20 @@ class PredictionConfig(BaseModel):
 
     horizons: list[int] = Field(default_factory=lambda: [1, 5, 20, 60])
     primary_horizon: int = 5
+    significant_drop_threshold_pct: float = Field(default=-10.0, ge=-100.0, le=0.0)
     split_strategy: str = "time_ordered"
     forbid_post_listing_features: bool = True
+    market_feature_windows: list[int] = Field(default_factory=lambda: [5, 20, 60])
+    recent_ipo_lookback_days: int = Field(default=180, ge=30, le=730)
+    top_k_fraction: float = Field(default=0.2, gt=0.0, le=1.0)
+    max_alert_fraction: float = Field(default=0.5, gt=0.0, lt=1.0)
+    random_state: int = 42
 
 
 # ---------------------------------------------------------------------------
 # 顶层配置
 # ---------------------------------------------------------------------------
+
 
 class AppConfig(BaseModel):
     """合并基础 YAML 与项目固定供应商 YAML 后的最终运行配置。"""
@@ -153,8 +213,12 @@ class AppConfig(BaseModel):
     paths: PathsConfig = Field(default_factory=PathsConfig)
     parser: ParserConfig = Field(default_factory=ParserConfig)
     retrieval: RetrievalConfig = Field(default_factory=RetrievalConfig)
+    vector_store: VectorStoreConfig = Field(default_factory=VectorStoreConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     llm: LLMConfig = Field(default_factory=LLMConfig)
+    specialist_llm: LLMConfig | None = None
+    # 兼容旧配置名；新代码应使用 specialist_llm。
+    discovery_llm: LLMConfig | None = None
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     prediction: PredictionConfig = Field(default_factory=PredictionConfig)
 
@@ -175,6 +239,7 @@ class AppConfig(BaseModel):
 # ---------------------------------------------------------------------------
 # 加载函数
 # ---------------------------------------------------------------------------
+
 
 def _read_yaml(path: Path) -> dict[str, Any]:
     """读取一个 YAML 映射；文件不存在时返回空映射。"""
@@ -217,13 +282,48 @@ def load_config(
     raw = _read_yaml(config_path)
     providers = _read_yaml(providers_path)
 
-    # 3. 逐区段提取，缺失的区段用空字典兜底
+    # 3. 逐区段提取，缺失的区段用空字典兖底
     project = raw.get("project", {})
     paths = raw.get("paths", {})
     parser_cfg = raw.get("parser", {})
     retrieval_cfg = raw.get("retrieval", {})
+    vector_store_cfg = raw.get("vector_store", {})
     embedding_cfg = {**raw.get("embedding", {}), **providers.get("embedding", {})}
     llm_cfg = {**raw.get("llm", {}), **providers.get("llm", {})}
+    raw_discovery_llm = raw.get("discovery_llm")
+    provider_discovery_llm = providers.get("discovery_llm")
+    raw_specialist_llm = raw.get("specialist_llm", raw_discovery_llm)
+    provider_specialist_llm = providers.get(
+        "specialist_llm",
+        provider_discovery_llm,
+    )
+    discovery_llm_cfg = None
+    if isinstance(raw_discovery_llm, dict) or isinstance(provider_discovery_llm, dict):
+        discovery_llm_cfg = {
+            **(raw_discovery_llm if isinstance(raw_discovery_llm, dict) else {}),
+            **(
+                provider_discovery_llm
+                if isinstance(provider_discovery_llm, dict)
+                else {}
+            ),
+        }
+    specialist_llm_cfg = None
+    if isinstance(raw_specialist_llm, dict) or isinstance(
+        provider_specialist_llm,
+        dict,
+    ):
+        specialist_llm_cfg = {
+            **(
+                raw_specialist_llm
+                if isinstance(raw_specialist_llm, dict)
+                else {}
+            ),
+            **(
+                provider_specialist_llm
+                if isinstance(provider_specialist_llm, dict)
+                else {}
+            ),
+        }
     agents_cfg = raw.get("agents", {})
     prediction_cfg = raw.get("prediction", {})
 
@@ -234,8 +334,19 @@ def load_config(
         paths=PathsConfig(**paths),
         parser=ParserConfig(**parser_cfg),
         retrieval=RetrievalConfig(**retrieval_cfg),
+        vector_store=VectorStoreConfig(**vector_store_cfg),
         embedding=EmbeddingConfig(**embedding_cfg),
         llm=LLMConfig(**llm_cfg),
+        specialist_llm=(
+            LLMConfig(**specialist_llm_cfg)
+            if specialist_llm_cfg is not None
+            else None
+        ),
+        discovery_llm=(
+            LLMConfig(**discovery_llm_cfg)
+            if discovery_llm_cfg is not None
+            else None
+        ),
         agents=AgentsConfig(**agents_cfg),
         prediction=PredictionConfig(**prediction_cfg),
     )

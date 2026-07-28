@@ -19,6 +19,7 @@ from ipo_risk.reviewing import (
     ReviewRunSummary,
     ReviewService,
 )
+from ipo_risk.ui import theme
 
 
 _STATUS_LABELS = {
@@ -45,10 +46,7 @@ def _run_label(run: ReviewRunSummary) -> str:
 
 
 def _finding_label(finding: RiskFinding) -> str:
-    return (
-        f"{finding.finding_id} · {_STATUS_LABELS[finding.status]} · "
-        f"{finding.title}"
-    )
+    return f"{finding.finding_id} · {_STATUS_LABELS[finding.status]} · {finding.title}"
 
 
 def _render_evidence(service: ReviewService, detail: ReviewFindingDetail) -> None:
@@ -302,17 +300,11 @@ def _render_review_form(
 
 
 def _render_exports(service: ReviewService, run: ReviewRunSummary) -> None:
-    st.divider()
-    st.subheader("导出")
-    st.caption("标注快照保存当前复核进度；正式报告仅包含已确认风险。")
-    columns = st.columns(2)
-    export_annotations = columns[0].button(
-        "导出版本化标注",
-        disabled=run.reviewed_findings == 0,
-        width="stretch",
-        key=f"export-annotations-{run.run_id}",
+    st.subheader("交付与导出")
+    st.caption(
+        "无需人工通读整份招股书；这里只复核机器已定位的风险与证据。正式报告仅包含已确认风险。"
     )
-    export_report = columns[1].button(
+    export_report = st.button(
         "导出正式报告",
         type="primary",
         disabled=not run.complete,
@@ -325,29 +317,24 @@ def _render_exports(service: ReviewService, run: ReviewRunSummary) -> None:
     elif run.verified_report_path:
         st.caption(f"最近正式报告：{run.verified_report_path}")
 
-    if export_annotations:
-        try:
-            path = service.export_review_annotations(run.run_id)
-        except (FileNotFoundError, KeyError, ValueError) as exc:
-            st.error(str(exc))
-            return
-        st.session_state["review_flash"] = f"标注快照已导出：{path}"
-        st.session_state["last_annotation_export"] = str(path)
-        st.rerun()
-
     if export_report:
         try:
-            path = service.export_verified_report(run.run_id)
+            bundle = service.export_verified_bundle(run.run_id)
         except (FileNotFoundError, IncompleteReviewError, KeyError, ValueError) as exc:
             st.error(str(exc))
             return
-        st.session_state["review_flash"] = f"正式报告已导出：{path}"
-        st.session_state["last_report_export"] = str(path)
+        st.session_state["review_flash"] = (
+            f"正式报告PDF已导出：{bundle.pdf_path}；精简JSON与完整审计包已同步生成。"
+        )
+        st.session_state["last_report_export"] = str(bundle.pdf_path)
+        st.session_state["last_report_export_json"] = str(bundle.json_path)
+        st.session_state["last_report_export_audit"] = str(bundle.audit_path)
         st.rerun()
 
-    for state_key, label in (
-        ("last_annotation_export", "下载最近标注快照"),
-        ("last_report_export", "下载最近正式报告"),
+    for state_key, label, mime in (
+        ("last_report_export", "下载正式PDF报告", "application/pdf"),
+        ("last_report_export_json", "下载精简风险JSON", "application/json"),
+        ("last_report_export_audit", "下载完整审计包", "application/json"),
     ):
         exported = st.session_state.get(state_key)
         if not exported:
@@ -358,7 +345,7 @@ def _render_exports(service: ReviewService, run: ReviewRunSummary) -> None:
                 label,
                 data=exported_path.read_bytes(),
                 file_name=exported_path.name,
-                mime="application/json",
+                mime=mime,
                 key=f"download-{state_key}",
             )
 
@@ -375,8 +362,18 @@ def render_review_app(
             page_icon=":material/fact_check:",
             layout="wide",
         )
-    st.title("人工复核工作台")
-    st.caption("核对机器候选风险的原文证据，作出可审计的人工决定。")
+        theme.inject_theme()
+    if configure_page:
+        with st.container(border=True):
+            st.caption("03 / HUMAN REVIEW")
+            st.title("人工复核工作台")
+            st.caption("核对机器候选风险的原文证据，作出可审计的人工决定。")
+    else:
+        theme.page_header(
+            "03 / HUMAN REVIEW",
+            "人工复核工作台",
+            "核对机器候选风险的原文证据，作出可审计的人工决定。",
+        )
     flash = st.session_state.pop("review_flash", None)
     if flash:
         st.success(flash)
@@ -387,55 +384,86 @@ def render_review_app(
         return
 
     run_by_id = {run.run_id: run for run in runs}
-    selected_run_id = st.selectbox(
-        "分析 run_id",
-        options=tuple(run_by_id),
-        format_func=lambda run_id: _run_label(run_by_id[run_id]),
-    )
-    run = run_by_id[selected_run_id]
+    if st.session_state.get("review_selected_run") not in run_by_id:
+        st.session_state["review_selected_run"] = runs[0].run_id
+    with st.container(border=True):
+        selector_columns = st.columns([1.15, 1.35], gap="large")
+        selected_run_id = selector_columns[0].selectbox(
+            "分析 run_id",
+            options=tuple(run_by_id),
+            format_func=lambda run_id: _run_label(run_by_id[run_id]),
+            key="review_selected_run",
+        )
+        run = run_by_id[selected_run_id]
+        findings = service.list_findings(selected_run_id)
+        finding_by_id = {finding.finding_id: finding for finding in findings}
+        selected_finding_id = selector_columns[1].selectbox(
+            "待复核风险",
+            options=tuple(finding_by_id),
+            format_func=lambda finding_id: _finding_label(finding_by_id[finding_id]),
+        )
 
-    metrics = st.columns(4)
-    metrics[0].metric("复核进度", f"{run.reviewed_findings} / {run.total_findings}")
-    metrics[1].metric("待复核", run.pending_findings)
-    metrics[2].metric("已确认", run.verified_findings)
-    metrics[3].metric("已驳回", run.rejected_findings)
+    with st.container(horizontal=True):
+        st.metric(
+            "复核进度",
+            f"{run.reviewed_findings} / {run.total_findings}",
+            border=True,
+        )
+        st.metric("待复核", run.pending_findings, border=True)
+        st.metric("已确认", run.verified_findings, border=True)
+        st.metric("已驳回", run.rejected_findings, border=True)
     progress = run.reviewed_findings / run.total_findings if run.total_findings else 0.0
-    st.progress(progress)
+    st.progress(progress, text=f"当前批次已完成 {progress:.0%}")
 
-    findings = service.list_findings(selected_run_id)
-    finding_by_id = {finding.finding_id: finding for finding in findings}
-    selected_finding_id = st.selectbox(
-        "风险结论",
-        options=tuple(finding_by_id),
-        format_func=lambda finding_id: _finding_label(finding_by_id[finding_id]),
-    )
     detail = service.get_finding_detail(selected_run_id, selected_finding_id)
     finding = detail.finding
 
-    st.header(finding.title)
-    finding_metrics = st.columns(4)
-    finding_metrics[0].metric("状态", _STATUS_LABELS[finding.status])
-    finding_metrics[1].metric("严重程度", _SEVERITY_LABELS[finding.severity])
-    finding_metrics[2].metric("置信度", f"{finding.confidence:.0%}")
-    finding_metrics[3].metric("证据数量", len(detail.evidences))
-    st.markdown(f"**风险结论**\n\n{finding.claim}")
-    if finding.uncertainty:
-        st.warning(f"剩余不确定性：{finding.uncertainty}")
+    evidence_workspace, decision_workspace = st.columns([1.75, 1], gap="large")
+    with evidence_workspace:
+        with st.container(border=True):
+            heading = st.container(
+                horizontal=True,
+                horizontal_alignment="distribute",
+                vertical_alignment="center",
+            )
+            heading.header(finding.title)
+            severity_color = theme.SEVERITY_META.get(
+                finding.severity.value,
+                ("", "gray"),
+            )[1]
+            heading.badge(
+                f"{_SEVERITY_LABELS[finding.severity]}风险",
+                color=severity_color,
+            )
+            with st.container(horizontal=True):
+                st.metric("状态", _STATUS_LABELS[finding.status], border=True)
+                st.metric("置信度", f"{finding.confidence:.0%}", border=True)
+                st.metric("证据", len(detail.evidences), border=True)
+            st.markdown(f"**风险结论**\n\n{finding.claim}")
+            if finding.uncertainty:
+                st.warning(
+                    f"剩余不确定性：{finding.uncertainty}",
+                    icon=":material/warning:",
+                )
 
-    evidence_tab, verification_tab, agent_tab, history_tab = st.tabs(
-        ["证据原文", "自动核验", "Agent轨迹", "审计记录"]
-    )
-    with evidence_tab:
-        _render_evidence(service, detail)
-    with verification_tab:
-        _render_verification(detail)
-    with agent_tab:
-        _render_agent_traces(detail)
-    with history_tab:
-        _render_history(detail)
+        evidence_tab, verification_tab, agent_tab, history_tab = st.tabs(
+            ["证据原文", "自动核验", "Agent轨迹", "审计记录"]
+        )
+        with evidence_tab:
+            _render_evidence(service, detail)
+        with verification_tab:
+            _render_verification(detail)
+        with agent_tab:
+            _render_agent_traces(detail)
+        with history_tab:
+            _render_history(detail)
 
-    _render_review_form(service, selected_run_id, detail)
-    _render_exports(service, run)
+    with decision_workspace:
+        with st.container(border=True):
+            st.caption("REVIEW DECISION")
+            _render_review_form(service, selected_run_id, detail)
+        with st.container(border=True):
+            _render_exports(service, run)
 
 
 __all__ = ["render_review_app"]

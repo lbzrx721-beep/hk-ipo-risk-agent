@@ -1,8 +1,8 @@
 # 测试结构
 
 - `unit/parser`：页码、坐标、OCR触发和截图。
-- `unit/reviewing`：证据复现、公式复算、人工复核状态机、Streamlit页面操作、审计记录、
-  版本化标注和报告门禁。
+- `unit/reviewing`：证据复现、公式复算、人工复核状态机、Streamlit页面操作、审计记录和
+  正式报告门禁。
 - `unit/ui` 与 `unit/test_uploads.py`：PDF拖拽页面、公司字段、上传登记、SHA-256去重、
   可见分析流程和完成后进入人工复核。
 - `unit/retrieval`：繁简中文BM25、真实向量接口适配、余弦语义检索、RRF融合、索引缓存与

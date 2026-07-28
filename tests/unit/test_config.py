@@ -5,6 +5,26 @@ from pathlib import Path
 import pytest
 
 from ipo_risk.config import load_config
+from pydantic import ValidationError
+
+
+def test_vector_store_backend_rejects_typos(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text("vector_store:\n  backend: chromma", encoding="utf-8")
+
+    with pytest.raises(ValidationError):
+        load_config(base_path, tmp_path / "missing-providers.yaml")
+
+
+def test_hybrid_vector_backend_is_supported_for_fast_web_analysis(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text("vector_store:\n  backend: hybrid", encoding="utf-8")
+
+    config = load_config(base_path, tmp_path / "missing-providers.yaml")
+
+    assert config.vector_store.backend == "hybrid"
 
 
 def test_provider_file_has_priority_and_environment_is_ignored(
@@ -17,8 +37,8 @@ def test_provider_file_has_priority_and_environment_is_ignored(
     base_path.write_text(
         """
 embedding:
-  provider: dashscope
-  model_name: qwen3.7-text-embedding
+  provider: zhipu
+  model_name: embedding-3-pro
 llm:
   provider: deepseek
   model_name: deepseek-v4-flash
@@ -28,18 +48,18 @@ llm:
     providers_path.write_text(
         """
 embedding:
-  api_key: project-dashscope-key
+  api_key: project-zhipu-key
 llm:
   api_key: project-deepseek-key
 """.strip(),
         encoding="utf-8",
     )
-    monkeypatch.setenv("DASHSCOPE_API_KEY", "environment-dashscope-key")
+    monkeypatch.setenv("ZHIPU_API_KEY", "environment-zhipu-key")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-deepseek-key")
 
     config = load_config(base_path, providers_path)
 
-    assert config.embedding.require_api_key() == "project-dashscope-key"
+    assert config.embedding.require_api_key() == "project-zhipu-key"
     assert config.llm.require_api_key() == "project-deepseek-key"
 
 
@@ -63,6 +83,25 @@ llm:
     assert "another-local-secret" not in rendered
 
 
+def test_ollama_embedding_uses_non_secret_compatibility_key(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        """
+embedding:
+  provider: ollama
+  base_url: http://192.168.3.91:11434/v1
+  model_name: qwen3-embedding:4b
+  dimensions: 1024
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(base_path, tmp_path / "missing-providers.yaml")
+
+    assert config.embedding.is_configured is True
+    assert config.embedding.require_api_key() == "ollama"
+
+
 def test_model_retry_policy_is_loaded_from_project_config(tmp_path: Path) -> None:
     base_path = tmp_path / "base.yaml"
     base_path.write_text(
@@ -82,3 +121,33 @@ agents:
     assert config.agents.retry_initial_seconds == 0.5
     assert config.agents.retry_backoff_factor == 1.5
     assert config.agents.retry_max_seconds == 6.0
+
+
+def test_default_discovery_pack_is_small_enough_for_early_visible_results(
+    tmp_path: Path,
+) -> None:
+    config = load_config(
+        Path("configs/base.yaml"),
+        tmp_path / "missing-providers.yaml",
+    )
+
+    assert config.agents.discovery_batch_chars == 70_000
+    assert config.agents.discovery_wave_size == 4
+    assert config.agents.discovery_retrieval_query_count == 16
+    assert config.agents.discovery_max_selected_chunks == 520
+    assert config.agents.discovery_max_batch_passes == 2
+    assert config.agents.specialist_batch_size == 100
+    assert config.agents.specialist_followup_rounds == 0
+    assert config.agents.model_budget.max_calls is None
+    assert config.agents.model_budget.max_input_tokens is None
+    assert config.agents.model_budget.max_output_tokens is None
+    assert config.llm.provider == "ark"
+    assert config.llm.model_name == "deepseek-v4-flash"
+    assert config.llm.supports_json_object is False
+    assert config.specialist_llm is not None
+    assert config.specialist_llm.provider == "ark"
+    assert config.specialist_llm.base_url == (
+        "https://ark.cn-beijing.volces.com/api/plan/v3"
+    )
+    assert config.specialist_llm.model_name == "kimi-k3"
+    assert config.specialist_llm.supports_json_object is False

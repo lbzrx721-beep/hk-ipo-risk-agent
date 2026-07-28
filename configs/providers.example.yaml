@@ -1,7 +1,28 @@
 # 复制为 providers.local.yaml 后填写真实密钥。
 # 程序固定读取项目内这个文件，不读取 Windows 用户环境变量。
 embedding:
-  api_key: "填写阿里百炼-DashScope-API-Key"
+  api_key: "填写智谱BigModel-API-Key"
 
 llm:
-  api_key: "填写DeepSeek-API-Key"
+  provider: ark
+  base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
+  supports_json_object: false
+  api_key: "填写火山方舟ARK-API-Key"
+  # 以下价格请按比赛运行时供应商账单填写；不填写时仍统计Token，但不估算人民币。
+  input_price_per_million_rmb: null
+  output_price_per_million_rmb: null
+  cached_input_price_per_million_rmb: null
+
+# 可选：专业Agent复用ARK API，只把模型名切换为Kimi。
+# 未配置时自动复用上面的DeepSeek llm，不影响开发运行。
+specialist_llm:
+  provider: ark
+  base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
+  # model_name: "deepseek-v4-flash"  # 旧专业 Agent 模型，保留但不启用
+  model_name: "kimi-k3"
+  supports_json_object: false
+  disable_thinking: true
+  api_key: "填写火山方舟ARK-API-Key"
+  input_price_per_million_rmb: null
+  output_price_per_million_rmb: null
+  cached_input_price_per_million_rmb: null

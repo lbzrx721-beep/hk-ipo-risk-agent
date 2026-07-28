@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import quote
 
 
 _INVALID_WINDOWS_CHARS = re.compile(r"[<>:\"/\\|?*\x00-\x1f]")
@@ -23,15 +24,28 @@ def safe_path_segment(value: str, field_name: str) -> str:
     return candidate
 
 
+def safe_cache_segment(value: str, field_name: str) -> str:
+    """将外部模型标识编码为可在Windows创建的单层缓存目录名。"""
+    candidate = value.strip()
+    if not candidate or candidate in {".", ".."}:
+        raise ValueError(f"{field_name} must not be empty or relative")
+    encoded = quote(candidate, safe="._-")
+    if encoded.endswith("."):
+        encoded = f"{encoded[:-1]}%2E"
+    return safe_path_segment(encoded, field_name)
+
+
 @dataclass(frozen=True)
 class DocumentPaths:
     """一份具体文档版本的全部可重建产物位置。"""
 
     pages_path: Path
+    tables_path: Path
     chunks_path: Path
     embeddings_root: Path
     evidence_dir: Path
     report_path: Path
+    prelisting_features_path: Path
 
     @classmethod
     def build(
@@ -46,18 +60,26 @@ class DocumentPaths:
         document = safe_path_segment(document_id, "document_id")
         return cls(
             pages_path=interim_root / "documents" / company / document / "pages.jsonl",
+            tables_path=interim_root / "tables" / company / document / "tables.jsonl",
             chunks_path=interim_root / "chunks" / company / document / "chunks.jsonl",
             embeddings_root=interim_root / "embeddings" / company / document,
             evidence_dir=artifacts_root / "evidence" / company / document,
             report_path=(
                 artifacts_root / "analysis" / company / document / "risk_analysis.json"
             ),
+            prelisting_features_path=(
+                artifacts_root
+                / "analysis"
+                / company
+                / document
+                / "prelisting_features.json"
+            ),
         )
 
     def embedding_dir(self, model_name: str) -> Path:
         """返回某个Embedding模型的独立索引目录。"""
-        model = safe_path_segment(model_name, "model_name")
+        model = safe_cache_segment(model_name, "model_name")
         return self.embeddings_root / model
 
 
-__all__ = ["DocumentPaths", "safe_path_segment"]
+__all__ = ["DocumentPaths", "safe_cache_segment", "safe_path_segment"]

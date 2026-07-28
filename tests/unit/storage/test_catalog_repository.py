@@ -127,6 +127,38 @@ def test_catalog_is_idempotent_and_point_in_time_selectable(tmp_path: Path) -> N
     assert counts.datasets == 1
 
 
+def test_dataset_file_can_be_relocated_to_verified_history_path(
+    tmp_path: Path,
+) -> None:
+    repository = CatalogRepository(tmp_path / "app.db")
+    repository.initialize()
+    company = _company()
+    dataset = DatasetRecord(
+        dataset_id="ds_03696_market_daily_2026-07-17_dddddddd",
+        company_id="03696",
+        dataset_type="market_daily",
+        title="日线行情",
+        local_file="data/raw/market/03696_英矽智能/日线行情.json",
+        source_hash="d" * 64,
+        available_at=date(2026, 7, 17),
+        file_format="json",
+        pre_listing_eligible=False,
+        registered_at=NOW,
+    )
+    repository.upsert_company(company)
+    repository.upsert_dataset(dataset)
+
+    history_path = (
+        "data/interim/audit/03696_英矽智能/"
+        "pre_competition_market_dddddddddddd.json"
+    )
+    repository.relocate_dataset_file(dataset.dataset_id, history_path)
+
+    relocated = repository.get_dataset(dataset.dataset_id)
+    assert relocated is not None
+    assert relocated.local_file == history_path
+
+
 def test_vector_index_and_report_are_registered(tmp_path: Path) -> None:
     repository = CatalogRepository(tmp_path / "app.db")
     repository.initialize()

@@ -6,10 +6,12 @@ from .json_report import (
     SourceDocument,
     write_risk_report,
 )
+from .pdf_report import write_verified_pdf_report
 
 __all__ = [
     "AnalysisSummary",
     "RiskAnalysisReport",
     "SourceDocument",
     "write_risk_report",
+    "write_verified_pdf_report",
 ]

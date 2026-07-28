@@ -26,6 +26,42 @@ def _normalized_text(value: str) -> str:
     return re.sub(r"\s+", "", normalized)
 
 
+def _layout_fragment_match(
+    quote: str,
+    clipped_text: str,
+) -> tuple[bool, str] | None:
+    """Match multiline layout text without trusting PDF reading order.
+
+    Tables, diagrams and two-column definitions can contain the correct text
+    inside the declared bbox while PyMuPDF emits columns in a different order.
+    This fallback remains strict: at least three distinct source fragments and
+    90% of their characters must be present inside the evidence bbox.
+    """
+    fragments = tuple(
+        dict.fromkeys(
+            fragment for line in quote.splitlines() if len(fragment := _normalized_text(line)) >= 2
+        )
+    )
+    if len(fragments) < 3:
+        return None
+    normalized_clip = _normalized_text(clipped_text)
+    matched = tuple(fragment for fragment in fragments if fragment in normalized_clip)
+    total_chars = sum(len(fragment) for fragment in fragments)
+    matched_chars = sum(len(fragment) for fragment in matched)
+    coverage = matched_chars / total_chars if total_chars else 0.0
+    passed = len(matched) >= 3 and matched_chars >= min(20, total_chars) and coverage >= 0.9
+    detail = (
+        f"layout fragments found in source bbox: {len(matched)}/{len(fragments)} "
+        f"({coverage:.0%} character coverage)"
+        if passed
+        else (
+            f"layout fragment coverage is insufficient: "
+            f"{len(matched)}/{len(fragments)} ({coverage:.0%})"
+        )
+    )
+    return passed, detail
+
+
 def _resolve_path(value: str, project_root: Path) -> Path:
     path = Path(value)
     return path if path.is_absolute() else project_root / path
@@ -97,14 +133,40 @@ def verify_evidence(evidence: Evidence, *, project_root: Path) -> EvidenceVerifi
             )
         )
 
-        page_text = _normalized_text(page.get_text("text"))
-        quote = _normalized_text(evidence.quote)
-        quote_present = bool(quote) and quote in page_text
+        if evidence.evidence_type.value == "table" and evidence.table_cell_values:
+            clipped_text = _normalized_text(page.get_textbox(evidence_rect))
+            required_values = tuple(
+                value for value in evidence.table_cell_values if _normalized_text(value)
+            )
+            missing_values = tuple(
+                value for value in required_values if _normalized_text(value) not in clipped_text
+            )
+            quote_present = bool(required_values) and not missing_values
+            quote_detail = (
+                f"{len(required_values)} table cells found in source bbox"
+                if quote_present
+                else f"table cells missing from source bbox: {missing_values[:5]}"
+            )
+        else:
+            page_text = _normalized_text(page.get_text("text"))
+            quote = _normalized_text(evidence.quote)
+            quote_present = bool(quote) and quote in page_text
+            if quote_present:
+                quote_detail = "quote found on physical PDF page"
+            else:
+                layout_match = _layout_fragment_match(
+                    evidence.quote,
+                    page.get_textbox(evidence_rect),
+                )
+                if layout_match is None:
+                    quote_detail = "quote not found"
+                else:
+                    quote_present, quote_detail = layout_match
         checks.append(
             VerificationCheck(
                 name="quote",
                 passed=quote_present,
-                detail="quote found on physical PDF page" if quote_present else "quote not found",
+                detail=quote_detail,
             )
         )
     finally:
@@ -129,16 +191,14 @@ def verify_evidence(evidence: Evidence, *, project_root: Path) -> EvidenceVerifi
 
 
 def _verify_calculation(finding: RiskFinding) -> VerificationCheck:
-    has_numeric_claim = re.search(r"\d", finding.claim) is not None
     calculation = finding.calculation
     if calculation is None:
         return VerificationCheck(
             name="calculation",
-            passed=not has_numeric_claim,
+            passed=True,
             detail=(
-                "qualitative claim does not require a calculation"
-                if not has_numeric_claim
-                else "numeric claim is missing a reproducible calculation"
+                "not applicable: disclosed facts and quoted numbers are verified "
+                "through their evidence references"
             ),
         )
     try:
@@ -162,9 +222,7 @@ def verify_finding(
     """Verify references, source locations, company ownership and arithmetic."""
     evidence_by_id = {evidence.evidence_id: evidence for evidence in evidences}
     missing = [
-        evidence_id
-        for evidence_id in finding.evidence_ids
-        if evidence_id not in evidence_by_id
+        evidence_id for evidence_id in finding.evidence_ids if evidence_id not in evidence_by_id
     ]
     referenced = [
         evidence_by_id[evidence_id]

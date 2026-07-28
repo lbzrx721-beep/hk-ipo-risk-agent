@@ -6,7 +6,6 @@ paths:
   prospectus_dir: data/raw/prospectus
   company_info_dir: data/raw/company_info
   market_dir: data/raw/market
-  annotations_dir: data/annotations
   interim_dir: data/interim
   processed_dir: data/processed
   artifacts_dir: artifacts
@@ -23,32 +22,98 @@ retrieval:
   semantic_top_k: 20
   rerank_top_k: 8
 
-# 固定职责：阿里百炼只负责向量化，真实密钥在 providers.local.yaml。
-embedding:
-  provider: dashscope
-  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
-  model_name: qwen3.7-text-embedding
-  dimensions: 1024
-  batch_size: 20
+# 向量存储后端：numpy 内存方案+磁盘缓存（单文档场景，秒级加载）。
+# Chroma 1.x 使用独立目录；旧 data/vector_store 保留为0.6时代只读备份。
+vector_store:
+  # 当前分析优先使用内存向量；同一份向量在后台写入 Chroma，不重复调用模型。
+  # Chroma 写入失败只记录 failed 状态，不中断本次报告生成。
+  backend: hybrid
+  chroma_persist_dir: data/vector_store_v1
+  chroma_collection: prospectus_chunks
 
-# 固定职责：DeepSeek 负责所有 Agent 的 LLM 推理。
+# 固定职责：智谱BigModel负责向量化，真实密钥在 providers.local.yaml。
+embedding:
+  provider: zhipu
+  base_url: https://open.bigmodel.cn/api/paas/v4
+  model_name: embedding-3-pro
+  dimensions: 1024
+  batch_size: 64
+
+# DeepSeek 负责分批全文风险发现、检索规划和少量冲突升级。
 llm:
-  provider: deepseek
-  base_url: https://api.deepseek.com
+  provider: ark
+  base_url: https://ark.cn-beijing.volces.com/api/plan/v3
   model_name: deepseek-v4-flash
   temperature: 0.1
   max_output_tokens: 8192
+  # ARK Agent Plan 当前会拒绝 json_object；仍由提示词、JSON解析和Pydantic严格校验。
+  supports_json_object: false
+
+# 四个专业 Agent 与风险发现 Agent 复用同一套 ARK 兼容 API，
+# 只切换模型名；每个角色一次批量核验。
+# 原 DeepSeek 模型配置保留作回退参考，不再作为专业 Agent 的默认模型。
+specialist_llm:
+  provider: ark
+  base_url: https://ark.cn-beijing.volces.com/api/plan/v3
+  # model_name: deepseek-v4-flash  # 旧专业 Agent 模型，保留但不启用
+  model_name: kimi-k3
+  temperature: 0.1
+  max_output_tokens: 16384
+  # 与风险Agent使用同一ARK路由，先采用本地结构校验，避免服务端参数不兼容。
+  supports_json_object: false
+  reasoning_effort: low
+  # 专业核验要求输出可审计结论，不需要长时间隐藏式思维链；关闭深度思考，
+  # 四个角色仍并行，并通过流式正文逐条生成卡片。
+  disable_thinking: true
 
 agents:
   max_retries: 2
   retry_initial_seconds: 1.0
   retry_backoff_factor: 2.0
   retry_max_seconds: 8.0
+  enable_open_discovery: true
+  # 先由模型根据当前招股书目录生成公司特异检索问题；向量命中只负责定位，
+  # 风险Agent实际阅读的是原文、相邻段落及跨章节覆盖样本。
+  discovery_retrieval_query_count: 16
+  discovery_retrieval_top_k: 18
+  discovery_retrieval_lexical_top_k: 10
+  discovery_retrieval_neighbor_radius: 1
+  discovery_coverage_sections: 48
+  # 典型6000多个全文切片压缩到约520个高召回且跨章节分散的原文切片。
+  discovery_max_selected_chunks: 520
+  # 取回原文再按容量分包，通常显著少于旧版6—12次全文扫描调用。
+  discovery_batch_chars: 70000
+  discovery_wave_size: 4
+  # 首轮完整发现；仅在模型明确仍有独立重大遗漏时再补扫一次。
+  discovery_max_batch_passes: 2
+  # 大量候选分区语义合并，降低超长JSON导致的漏项与降级概率。
+  consolidation_batch_size: 24
+  # 四个专业Agent并行；每个角色一次处理一组风险，而不是每条风险调用一次。
+  specialist_batch_size: 100
+  specialist_followup_rounds: 0
+  # 决策Agent按批复核全部有证据专业提案；模型失败时保留风险并确定性兜底。
+  decision_conflict_batch_size: 12
+  model_budget:
+    # 默认只统计调用、Token和费用，不因累计用量中断单份招股书分析。
+    max_calls: null
+    max_input_tokens: null
+    max_output_tokens: null
+    # 配置供应商实际单价后可启用人民币费用硬门禁。
+    max_cost_rmb: null
   require_evidence: true
   require_verification: true
 
 prediction:
   horizons: [1, 5, 20, 60]
   primary_horizon: 5
+  # 第N个交易日收盘价相对发行价收益率不高于-10%，定义为显著下跌。
+  significant_drop_threshold_pct: -10.0
   split_strategy: time_ordered
   forbid_post_listing_features: true
+  # 招股书发布日期为预测时点；只使用此前5/20/60个交易日的全市场情绪。
+  market_feature_windows: [5, 20, 60]
+  recent_ipo_lookback_days: 180
+  top_k_fraction: 0.2
+  # 验证集阈值不得把超过一半公司都报成风险，避免“全报风险”的无效策略。
+  max_alert_fraction: 0.5
+  random_state: 42

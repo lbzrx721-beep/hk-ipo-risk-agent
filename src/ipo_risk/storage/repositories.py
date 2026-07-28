@@ -306,6 +306,23 @@ class CatalogRepository:
             ).fetchone()
         return self._dataset_from_row(row) if row else None
 
+    def relocate_dataset_file(self, dataset_id: str, local_file: str) -> None:
+        """把历史数据集登记指向已核验的不可变备份文件。
+
+        仅用于原先的“当前文件”被新官方快照替换、且旧内容已经按原哈希备份的场景。
+        调用方必须先核对备份文件哈希；仓储层只负责原子更新路径并保留原数据集ID。
+        """
+        normalized = local_file.strip()
+        if not normalized:
+            raise ValueError("local_file must not be empty")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE datasets SET local_file = ? WHERE dataset_id = ?",
+                (normalized, dataset_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown dataset_id: {dataset_id}")
+
     def list_datasets(
         self,
         company_id: str,
@@ -525,6 +542,23 @@ class CatalogRepository:
                 (run_id,),
             ).fetchone()
         return self._analysis_run_from_row(row) if row else None
+
+    def delete_analysis_run(self, run_id: str) -> bool:
+        """删除单次分析及其派生记录，保留公司、文档与行情数据。"""
+        with self._connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if exists is None:
+                return False
+            # reviews uses ON DELETE RESTRICT so audit rows must be removed explicitly.
+            connection.execute("DELETE FROM reviews WHERE run_id = ?", (run_id,))
+            cursor = connection.execute(
+                "DELETE FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            )
+        return cursor.rowcount == 1
 
     def list_analysis_runs(
         self,

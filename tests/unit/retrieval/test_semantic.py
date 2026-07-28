@@ -123,6 +123,21 @@ def test_semantic_retriever_reuses_document_embedding_cache(tmp_path: Path) -> N
     assert second_provider.calls == []
 
 
+def test_semantic_retriever_exposes_read_only_document_vectors_without_reembedding() -> None:
+    chunks = [
+        _chunk("C1", "公司多年亏损且研发投入较高。"),
+        _chunk("C2", "董事会负责公司治理。"),
+    ]
+    provider = CountingEmbeddingProvider()
+
+    retriever = SemanticRetriever(chunks, provider)
+    vectors = retriever.document_vectors
+
+    assert provider.calls == [[chunk.text for chunk in chunks]]
+    assert vectors.shape == (2, 2)
+    assert vectors.flags.writeable is False
+
+
 class FakeEmbeddingEndpoint:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -152,6 +167,22 @@ def test_openai_compatible_embedding_provider_batches_requests_in_order() -> Non
 
     assert vectors == [[1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]
     assert [call["input"] for call in endpoint.calls] == [["甲", "乙乙"], ["丙丙丙"]]
+
+
+def test_embedding_provider_preserves_ollama_model_tag() -> None:
+    endpoint = FakeEmbeddingEndpoint()
+    provider = OpenAICompatibleEmbeddingProvider(
+        client=SimpleNamespace(embeddings=endpoint),
+        model_name="qwen3-embedding:4b",
+        dimensions=2,
+        batch_size=8,
+    )
+
+    provider.embed(["招股书文本"])
+
+    assert endpoint.calls[0]["model"] == "qwen3-embedding:4b"
+    assert endpoint.calls[0]["dimensions"] == 2
+    assert endpoint.calls[0]["encoding_format"] == "float"
 
 
 class FlakyEmbeddingEndpoint(FakeEmbeddingEndpoint):

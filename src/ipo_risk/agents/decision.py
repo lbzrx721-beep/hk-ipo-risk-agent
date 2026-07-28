@@ -1,4 +1,4 @@
-"""冲突查证与总控裁决 Agent 的结构化输出契约。"""
+"""基于专业 Agent 提案形成最终、可追踪的风险裁决建议。"""
 
 from __future__ import annotations
 
@@ -9,11 +9,12 @@ from typing import Any, Protocol
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ipo_risk.agents.analysis import JsonChatProvider, TextDeltaCallback
+from ipo_risk.agents.prompting import prompt_audit, with_correction
 from ipo_risk.domain import RiskSeverity
 
 
 class DecisionVerdict(BaseModel):
-    """决策 Agent 对同一风险的一组角色提案给出的最终判断。"""
+    """决策模型对同一风险的一组角色提案给出的整合建议。"""
 
     model_config = ConfigDict(extra="forbid", frozen=True, str_strip_whitespace=True)
 
@@ -36,9 +37,7 @@ class DecisionVerdict(BaseModel):
         if not self.source_proposal_ids:
             raise ValueError("every decision must cite at least one source proposal")
         if self.accepted and (
-            not self.claim
-            or not self.evidence_chunk_ids
-            or not self.uncertainty
+            not self.claim or not self.evidence_chunk_ids or not self.uncertainty
         ):
             raise ValueError(
                 "an accepted decision requires claim, evidence, uncertainty and sources"
@@ -76,10 +75,10 @@ class DecisionAnalyzer(Protocol):
 
 
 class DeepSeekDecisionAnalyzer:
-    """要求 DeepSeek 仅基于角色提案及其已选原文作出裁决。"""
+    """要求模型仅基于专业提案及其已选原文给出最终整合建议。"""
 
     provider_name = "deepseek"
-    prompt_version = "decision-adjudication-v1"
+    prompt_version = "decision-adjudication-v4"
 
     def __init__(
         self,
@@ -92,6 +91,7 @@ class DeepSeekDecisionAnalyzer:
         progress_callback: Callable[[str, str], None] | None = None,
     ) -> None:
         self.provider = provider
+        self.provider_name = str(getattr(provider, "provider_name", "deepseek"))
         self.model_name = provider.model_name
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
@@ -99,12 +99,31 @@ class DeepSeekDecisionAnalyzer:
         if prompt_version is not None:
             self.prompt_version = prompt_version
         self._system_prompt = system_prompt or (
-            "你是港股IPO风险决策Agent。只能使用角色Agent已经选中的招股书原文，"
-            "不得引入外部事实或新的证据ID。你必须对每个risk_type输出一个JSON裁决，"
-            "并说明接受、调整或驳回的理由。"
+            "你是港股IPO风险决策Agent，逐项复核专业Agent提案并形成最终机器建议。"
+            "只能使用专业Agent已选中的招股书原文，不得引入外部事实或新的证据ID。"
+            "无法消解时accepted=false表示保留全部提案等待人工，不代表机器驳回。"
+        )
+
+    def prompt_audit(self) -> dict[str, str]:
+        """返回决策节点实际使用的提示词审计信息。"""
+        return prompt_audit(
+            prompt=self._system_prompt,
+            version=self.prompt_version,
         )
 
     def adjudicate(self, proposals: Sequence[Any]) -> DecisionBatch:
+        return self.adjudicate_with_feedback(
+            proposals,
+            correction_feedback=None,
+        )
+
+    def adjudicate_with_feedback(
+        self,
+        proposals: Sequence[Any],
+        *,
+        correction_feedback: str | None,
+    ) -> DecisionBatch:
+        """整合当前决策批次，并支持把上一轮校验错误反馈给模型。"""
         if not proposals:
             return DecisionBatch(decisions=())
         proposal_payloads: list[dict[str, Any]] = []
@@ -119,6 +138,16 @@ class DeepSeekDecisionAnalyzer:
                     "chunk_id": chunk.chunk_id,
                     "physical_page": chunk.page,
                     "printed_page_label": chunk.printed_page_label,
+                    "source_kind": chunk.chunk_kind,
+                    "table_id": chunk.table_id,
+                    "table_cell_refs": list(chunk.table_cell_refs),
+                    "table_cells": dict(
+                        zip(
+                            chunk.table_cell_refs,
+                            chunk.table_cell_values,
+                            strict=True,
+                        )
+                    ),
                     "quote": chunk.text,
                 }
                 for chunk in analyzed.selected_chunks
@@ -144,15 +173,18 @@ class DeepSeekDecisionAnalyzer:
                 for chunk in proposal.analyzed_risk.selected_chunks
             )
         )
-        payload = {
-            "constraints": {
-                "required_risk_types": sorted(expected_risk_types),
-                "allowed_proposal_ids": list(proposal_by_id),
-                "allowed_evidence_chunk_ids": allowed_evidence,
-                "no_external_evidence": True,
+        payload = with_correction(
+            {
+                "constraints": {
+                    "required_risk_types": sorted(expected_risk_types),
+                    "allowed_proposal_ids": list(proposal_by_id),
+                    "allowed_evidence_chunk_ids": allowed_evidence,
+                    "no_external_evidence": True,
+                },
+                "proposals": proposal_payloads,
             },
-            "proposals": proposal_payloads,
-        }
+            correction_feedback,
+        )
         on_text_delta: TextDeltaCallback | None = None
         progress_callback = self._progress_callback
         if progress_callback is not None:
@@ -181,27 +213,19 @@ class DeepSeekDecisionAnalyzer:
         for decision in batch.decisions:
             unknown_proposals = set(decision.source_proposal_ids) - set(proposal_by_id)
             if unknown_proposals:
-                raise ValueError(
-                    f"decision cited unknown proposals: {sorted(unknown_proposals)}"
-                )
+                raise ValueError(f"decision cited unknown proposals: {sorted(unknown_proposals)}")
             cited = [proposal_by_id[item] for item in decision.source_proposal_ids]
-            if any(
-                proposal.analyzed_risk.rule.id != decision.risk_type
-                for proposal in cited
-            ):
+            if any(proposal.analyzed_risk.rule.id != decision.risk_type for proposal in cited):
                 raise ValueError("decision cited a proposal for another risk_type")
             allowed_for_decision = {
                 chunk.chunk_id
                 for proposal in cited
                 for chunk in proposal.analyzed_risk.selected_chunks
             }
-            unknown_evidence = (
-                set(decision.evidence_chunk_ids) - allowed_for_decision
-            )
+            unknown_evidence = set(decision.evidence_chunk_ids) - allowed_for_decision
             if unknown_evidence:
                 raise ValueError(
-                    "decision cited unknown evidence chunks: "
-                    f"{sorted(unknown_evidence)}"
+                    f"decision cited unknown evidence chunks: {sorted(unknown_evidence)}"
                 )
         return batch
 

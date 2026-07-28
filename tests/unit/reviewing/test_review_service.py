@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timezone
 from pathlib import Path
 
@@ -28,8 +29,8 @@ from ipo_risk.reporting import (
     SourceDocument,
     write_risk_report,
 )
-from ipo_risk.reviewing import IncompleteReviewError, ReviewBlockedError, ReviewService
-from ipo_risk.storage.files import read_json, sha256_file
+from ipo_risk.reviewing import IncompleteReviewError, ReviewService
+from ipo_risk.storage.files import sha256_file
 from ipo_risk.storage.repositories import CatalogRepository
 from scripts.review_findings import app as review_app
 
@@ -154,6 +155,26 @@ repository = CatalogRepository(root / "data" / "app.db")
 service = ReviewService(repository=repository, project_root=root)
 render_review_app(service)
 """,
+        default_timeout=10,
+    ).run()
+
+
+def _results_app(project_root: Path):
+    from streamlit.testing.v1 import AppTest
+
+    root_literal = repr(str(project_root))
+    return AppTest.from_string(
+        f"""
+from pathlib import Path
+from ipo_risk.reviewing import ReviewService
+from ipo_risk.storage.repositories import CatalogRepository
+from ipo_risk.ui.results_view import render_results_view
+
+root = Path({root_literal})
+repository = CatalogRepository(root / "data" / "app.db")
+service = ReviewService(repository=repository, project_root=root)
+render_results_view(service)
+""",
         default_timeout=5,
     ).run()
 
@@ -170,9 +191,7 @@ def test_confirmed_finding_is_verified_and_review_is_retrievable(tmp_path: Path)
     )
 
     assert review.resulting_finding.status is VerificationStatus.VERIFIED
-    assert repository.get_finding("RUN-TEST-001", finding.finding_id) == (
-        review.resulting_finding
-    )
+    assert repository.get_finding("RUN-TEST-001", finding.finding_id) == (review.resulting_finding)
     assert repository.get_review(review.review_id) == review
 
 
@@ -193,9 +212,7 @@ def test_rejected_finding_keeps_failed_verification_in_the_audit_log(
 
     assert review.verification.passed is False
     assert review.resulting_finding.status is VerificationStatus.REJECTED
-    assert repository.list_reviews("RUN-TEST-001", finding_id=finding.finding_id) == (
-        review,
-    )
+    assert repository.list_reviews("RUN-TEST-001", finding_id=finding.finding_id) == (review,)
 
 
 def test_edited_finding_replaces_payload_and_preserves_identity(tmp_path: Path) -> None:
@@ -224,7 +241,7 @@ def test_edited_finding_replaces_payload_and_preserves_identity(tmp_path: Path) 
     assert stored.status is VerificationStatus.VERIFIED
 
 
-def test_numeric_finding_cannot_be_confirmed_without_reproducible_calculation(
+def test_disclosed_numeric_finding_can_be_confirmed_without_derived_calculation(
     tmp_path: Path,
 ) -> None:
     service, repository, finding = _prepared_run(tmp_path)
@@ -252,23 +269,21 @@ def test_numeric_finding_cannot_be_confirmed_without_reproducible_calculation(
         "artifacts/risk_analysis.json",
     )
 
-    with pytest.raises(ReviewBlockedError) as exc_info:
-        service.review_finding(
-            run_id="RUN-TEST-001",
-            finding_id=finding.finding_id,
-            decision=ReviewDecision.CONFIRMED,
-            reviewer="analyst@example.com",
-        )
-
-    assert any(
-        check.name == "calculation" and not check.passed
-        for check in exc_info.value.verification.checks
+    review = service.review_finding(
+        run_id="RUN-TEST-001",
+        finding_id=finding.finding_id,
+        decision=ReviewDecision.CONFIRMED,
+        reviewer="analyst@example.com",
     )
 
-    assert repository.list_reviews("RUN-TEST-001") == ()
+    assert review.verification.passed is True
+    assert any(
+        check.name == "calculation" and check.passed and check.detail.startswith("not applicable")
+        for check in review.verification.checks
+    )
     stored = repository.get_finding("RUN-TEST-001", finding.finding_id)
     assert stored is not None
-    assert stored.status is VerificationStatus.PENDING_VERIFICATION
+    assert stored.status is VerificationStatus.VERIFIED
 
 
 def test_verified_report_contains_only_terminal_verified_findings(tmp_path: Path) -> None:
@@ -289,9 +304,43 @@ def test_verified_report_contains_only_terminal_verified_findings(tmp_path: Path
     assert {evidence.evidence_id for evidence in report.evidences} == set(
         report.risk_findings[0].evidence_ids
     )
+    assert report.agent_traces == ()
     assert repository.get_verified_report_path("RUN-TEST-001") == (
         "artifacts/verified_risk_analysis.json"
     )
+
+
+def test_verified_export_bundle_separates_pdf_report_and_full_audit(
+    tmp_path: Path,
+) -> None:
+    service, _, finding = _prepared_run(tmp_path)
+    service.review_finding(
+        run_id="RUN-TEST-001",
+        finding_id=finding.finding_id,
+        decision=ReviewDecision.CONFIRMED,
+        reviewer="analyst@example.com",
+        comment="原文、期间和风险表述一致。",
+    )
+
+    bundle = service.export_verified_bundle("RUN-TEST-001")
+    compact_report = RiskAnalysisReport.model_validate_json(
+        bundle.json_path.read_text(encoding="utf-8")
+    )
+    audit = json.loads(bundle.audit_path.read_text(encoding="utf-8"))
+
+    assert bundle.pdf_path.name == "verified_risk_report.pdf"
+    assert bundle.pdf_path.read_bytes().startswith(b"%PDF")
+    assert compact_report.agent_traces == ()
+    assert audit["export_type"] == "analysis_audit_bundle"
+    assert len(audit["candidate_report"]["agent_traces"]) == 1
+    assert len(audit["reviews"]) == 1
+
+    document = fitz.open(bundle.pdf_path)
+    pdf_text = "".join(page.get_text() for page in document)
+    document.close()
+    assert "客户集中度风险" in pdf_text
+    assert finding.claim in pdf_text
+    assert "Customer concentration remains material" in pdf_text
 
 
 def test_verified_report_is_blocked_while_any_finding_is_pending(tmp_path: Path) -> None:
@@ -331,9 +380,7 @@ def test_saved_candidate_report_cannot_reset_a_completed_review(tmp_path: Path) 
         reviewer="analyst@example.com",
     )
     candidate_path = tmp_path / "artifacts" / "risk_analysis.json"
-    candidate = RiskAnalysisReport.model_validate_json(
-        candidate_path.read_text(encoding="utf-8")
-    )
+    candidate = RiskAnalysisReport.model_validate_json(candidate_path.read_text(encoding="utf-8"))
 
     repository.save_analysis_report(candidate, "artifacts/risk_analysis.json")
 
@@ -378,6 +425,125 @@ def test_streamlit_workbench_renders_progress_evidence_and_actions(tmp_path: Pat
     assert {button.label for button in app.button} >= {"确认", "驳回", "编辑"}
 
 
+def test_results_view_recovers_the_latest_persisted_report_without_session_state(
+    tmp_path: Path,
+) -> None:
+    _prepared_run(tmp_path)
+
+    app = _results_app(tmp_path)
+
+    assert not app.exception
+    assert app.selectbox[0].value == "RUN-TEST-001"
+    metrics = {metric.label: metric.value for metric in app.metric}
+    assert {
+        "候选风险": "1",
+        "原文证据": "1",
+        "Agent轨迹": "1",
+    }.items() <= metrics.items()
+    assert any(item.value == "客户集中度风险" for item in app.subheader)
+
+
+def test_results_view_focuses_on_decisions_without_replaying_live_console(
+    tmp_path: Path,
+) -> None:
+    _prepared_run(tmp_path)
+
+    app = _results_app(tmp_path)
+
+    assert not app.exception
+    assert any(item.value == "决策 Agent 结论" for item in app.subheader)
+    assert any(item.value == "待复核风险" for item in app.subheader)
+    assert not any(item.value == "Agent协同回放" for item in app.subheader)
+    assert any(item.label == "分析审计与 Agent 协作摘要" for item in app.status)
+    assert not any("未能解析为结构化卡片" in item.value for item in app.warning)
+
+
+def test_delete_analysis_run_removes_derived_state_but_preserves_source(
+    tmp_path: Path,
+) -> None:
+    service, repository, finding = _prepared_run(tmp_path)
+    service.review_finding(
+        run_id="RUN-TEST-001",
+        finding_id=finding.finding_id,
+        decision=ReviewDecision.CONFIRMED,
+        reviewer="analyst@example.com",
+    )
+    bundle = service.export_verified_bundle("RUN-TEST-001")
+    source_path = tmp_path / "source.pdf"
+    report_path = tmp_path / "artifacts" / "risk_analysis.json"
+
+    result = service.delete_analysis_run("RUN-TEST-001")
+
+    assert result.run_id == "RUN-TEST-001"
+    assert result.recovery_path is not None
+    assert result.recovery_path.is_dir()
+    assert repository.get_analysis_run("RUN-TEST-001") is None
+    assert repository.list_findings("RUN-TEST-001") == ()
+    assert repository.list_reviews("RUN-TEST-001") == ()
+    assert source_path.is_file()
+    assert not report_path.exists()
+    assert not bundle.pdf_path.exists()
+    assert not bundle.json_path.exists()
+    assert not bundle.audit_path.exists()
+    recovered_names = {path.name for path in result.recovery_path.rglob("*")}
+    assert {
+        report_path.name,
+        bundle.pdf_path.name,
+        bundle.json_path.name,
+        bundle.audit_path.name,
+    } <= recovered_names
+
+
+def test_delete_analysis_run_preserves_files_referenced_by_another_run(
+    tmp_path: Path,
+) -> None:
+    service, repository, _ = _prepared_run(tmp_path)
+    report_path = tmp_path / "artifacts" / "risk_analysis.json"
+    first_report = RiskAnalysisReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+    second_trace = first_report.agent_traces[0].model_copy(
+        update={"run_id": "RUN-TEST-002", "trace_id": "T-TEST-0002"}
+    )
+    second_report = first_report.model_copy(
+        update={"run_id": "RUN-TEST-002", "agent_traces": (second_trace,)}
+    )
+    repository.save_analysis_report(
+        second_report,
+        report_path.relative_to(tmp_path).as_posix(),
+    )
+
+    result = service.delete_analysis_run("RUN-TEST-001")
+
+    assert repository.get_analysis_run("RUN-TEST-001") is None
+    assert repository.get_analysis_run("RUN-TEST-002") is not None
+    assert report_path.is_file()
+    assert report_path.resolve() in result.skipped_paths
+
+
+def test_results_view_requires_exact_run_id_before_deleting_analysis(
+    tmp_path: Path,
+) -> None:
+    _prepared_run(tmp_path)
+    app = _results_app(tmp_path)
+
+    next(button for button in app.button if button.label == "删除本次分析").click()
+    app = app.run()
+
+    confirmation = next(item for item in app.text_input if item.label == "输入 run_id 确认")
+    delete_button = next(button for button in app.button if button.label == "确认删除")
+    assert delete_button.disabled is True
+    confirmation.input("RUN-TEST-001")
+    app = app.run()
+    delete_button = next(button for button in app.button if button.label == "确认删除")
+    assert delete_button.disabled is False
+
+    delete_button.click()
+    app = app.run()
+
+    repository = CatalogRepository(tmp_path / "data" / "app.db")
+    assert repository.get_analysis_run("RUN-TEST-001") is None
+    assert any("已删除分析" in message.value for message in app.success)
+
+
 def test_streamlit_workbench_confirm_button_writes_audited_review(tmp_path: Path) -> None:
     _, repository, finding = _prepared_run(tmp_path)
     app = _review_app(tmp_path)
@@ -397,33 +563,7 @@ def test_streamlit_workbench_confirm_button_writes_audited_review(tmp_path: Path
     assert any("已确认" in message.value for message in app.success)
 
 
-def test_review_annotations_export_as_distinct_versioned_snapshots(tmp_path: Path) -> None:
-    service, _, finding = _prepared_run(tmp_path)
-    service.review_finding(
-        run_id="RUN-TEST-001",
-        finding_id=finding.finding_id,
-        decision=ReviewDecision.CONFIRMED,
-        reviewer="analyst@example.com",
-        comment="原文、期间和风险表述一致。",
-    )
-
-    first_path = service.export_review_annotations("RUN-TEST-001")
-    second_path = service.export_review_annotations("RUN-TEST-001")
-    payload = read_json(first_path)
-
-    assert first_path != second_path
-    assert first_path.parent == (
-        tmp_path / "data" / "annotations" / "TEST" / "RUN-TEST-001"
-    )
-    assert payload["schema_version"] == "1.0"
-    assert payload["run_id"] == "RUN-TEST-001"
-    assert payload["complete"] is True
-    assert payload["findings"][0]["status"] == "verified"
-    assert payload["evidences"][0]["evidence_id"] == "E-TEST-0001"
-    assert payload["reviews"][0]["decision"] == "confirmed"
-
-
-def test_streamlit_workbench_exports_annotations_and_completed_report(tmp_path: Path) -> None:
+def test_streamlit_workbench_exports_completed_report_only(tmp_path: Path) -> None:
     service, _, finding = _prepared_run(tmp_path)
     service.review_finding(
         run_id="RUN-TEST-001",
@@ -433,27 +573,15 @@ def test_streamlit_workbench_exports_annotations_and_completed_report(tmp_path: 
     )
     app = _review_app(tmp_path)
 
-    annotation_button = next(
-        button for button in app.button if button.label == "导出版本化标注"
-    )
-    report_button = next(
-        button for button in app.button if button.label == "导出正式报告"
-    )
-    assert annotation_button.disabled is False
+    report_button = next(button for button in app.button if button.label == "导出正式报告")
     assert report_button.disabled is False
-
-    annotation_button.click()
-    app = app.run()
-    assert list(
-        (tmp_path / "data" / "annotations" / "TEST" / "RUN-TEST-001").glob(
-            "review_annotations_*.json"
-        )
-    )
-    assert any("标注快照" in message.value for message in app.success)
+    assert all(button.label != "导出版本化标注" for button in app.button)
 
     next(button for button in app.button if button.label == "导出正式报告").click()
     app = app.run()
     assert (tmp_path / "artifacts" / "verified_risk_analysis.json").is_file()
+    assert (tmp_path / "artifacts" / "verified_risk_report.pdf").is_file()
+    assert (tmp_path / "artifacts" / "analysis_audit_bundle.json").is_file()
     assert any("正式报告" in message.value for message in app.success)
 
 
@@ -466,5 +594,4 @@ def test_streamlit_entrypoint_builds_review_service_from_project_root(
 
     assert service.project_root == tmp_path.resolve()
     assert service.repository.database_path == (tmp_path / "data" / "app.db").resolve()
-    assert service.annotations_root == (tmp_path / "data" / "annotations").resolve()
     assert service.repository.database_path.is_file()

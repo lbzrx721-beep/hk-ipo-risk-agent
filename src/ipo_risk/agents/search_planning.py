@@ -9,6 +9,7 @@ from typing import Any, Callable, Protocol
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from ipo_risk.agents.analysis import JsonChatProvider, TextDeltaCallback
+from ipo_risk.agents.prompting import compose_prompt, prompt_audit, with_correction
 from ipo_risk.domain import AgentRole
 from ipo_risk.retrieval.search import RiskRule
 
@@ -69,7 +70,7 @@ class DeepSeekRoleSearchPlanner:
     """让专业Agent根据职责自行生成语义检索问题。"""
 
     provider_name = "deepseek"
-    prompt_version = "role-search-planning-v1"
+    prompt_version = "role-search-planning-v4"
 
     def __init__(
         self,
@@ -78,6 +79,7 @@ class DeepSeekRoleSearchPlanner:
         temperature: float,
         max_output_tokens: int,
         system_prompt: str | None = None,
+        role_prompts: Mapping[AgentRole, str] | None = None,
         prompt_version: str | None = None,
         progress_callback: Callable[[str, str], None] | None = None,
     ) -> None:
@@ -86,15 +88,22 @@ class DeepSeekRoleSearchPlanner:
         self._temperature = temperature
         self._max_output_tokens = max_output_tokens
         self._progress_callback = progress_callback
+        self._role_prompts = dict(role_prompts or {})
         if prompt_version is not None:
             self.prompt_version = prompt_version
         self._system_prompt = system_prompt or (
             "你是港股IPO招股书专业搜索Agent。请根据角色职责和风险定义，自主生成"
             "能够从招股书语义向量索引中发现证据的中文搜索问题。不要依赖固定关键词。"
-            "每类风险生成3至6个互补问题，覆盖直接披露、同义表达、表格说明和交叉引用。"
+            "每类风险生成3至6个互补问题，同时覆盖支持证据、反证、终止或改善条款、"
+            "表格说明和交叉引用。"
             "只输出JSON对象，字段为role和plans；plans中每项包含risk_type、queries和"
             "coverage_note。coverage_note只描述覆盖范围，不输出思维链。"
         )
+
+    def prompt_audit(self, role: AgentRole) -> dict[str, str]:
+        """返回该角色搜索规划实际使用的提示词审计信息。"""
+        prompt = compose_prompt(self._system_prompt, self._role_prompts.get(role))
+        return prompt_audit(prompt=prompt, version=self.prompt_version)
 
     def plan(
         self,
@@ -102,31 +111,50 @@ class DeepSeekRoleSearchPlanner:
         *,
         feedback: Mapping[str, Any] | None = None,
     ) -> RoleSearchPlan:
+        return self.plan_with_feedback(
+            rules,
+            feedback=feedback,
+            correction_feedback=None,
+        )
+
+    def plan_with_feedback(
+        self,
+        rules: Sequence[RiskRule],
+        *,
+        feedback: Mapping[str, Any] | None = None,
+        correction_feedback: str | None,
+    ) -> RoleSearchPlan:
+        """生成语义检索计划，并支持结构校验后的定向纠错。"""
         selected_rules = tuple(rules)
         if not selected_rules:
             raise ValueError("search planning requires at least one risk rule")
         role = selected_rules[0].owner
         if any(rule.owner is not role for rule in selected_rules):
             raise ValueError("one search plan can only contain one Agent role")
-        payload: dict[str, Any] = {
-            "role": role.value,
-            "responsibilities": [
-                {
-                    "risk_type": rule.id,
-                    "risk_name": rule.name,
-                    "default_severity": rule.severity.value,
-                    "risk_definition": rule.claim,
-                    "evidence_fields": list(rule.evidence_fields),
-                }
-                for rule in selected_rules
-            ],
-            "requirements": {
-                "queries_per_risk": "3-6",
-                "semantic_questions_only": True,
-                "cover_every_risk_type": True,
-                "output_json": True,
+        payload: dict[str, Any] = with_correction(
+            {
+                "role": role.value,
+                "responsibilities": [
+                    {
+                        "risk_type": rule.id,
+                        "risk_name": rule.name,
+                        "default_severity": rule.severity.value,
+                        "review_question": rule.claim,
+                        "evidence_fields": list(rule.evidence_fields),
+                    }
+                    for rule in selected_rules
+                ],
+                "requirements": {
+                    "queries_per_risk": "3-6",
+                    "semantic_questions_only": True,
+                    "include_support_and_counterevidence_queries": True,
+                    "review_question_is_not_a_company_fact": True,
+                    "cover_every_risk_type": True,
+                    "output_json": True,
+                },
             },
-        }
+            correction_feedback,
+        )
         if feedback:
             payload["previous_search_feedback"] = dict(feedback)
 
@@ -139,7 +167,10 @@ class DeepSeekRoleSearchPlanner:
 
             on_text_delta = report_delta
         request: dict[str, Any] = {
-            "system_prompt": self._system_prompt,
+            "system_prompt": compose_prompt(
+                self._system_prompt,
+                self._role_prompts.get(role),
+            ),
             "user_prompt": json.dumps(payload, ensure_ascii=False),
             "temperature": self._temperature,
             "max_output_tokens": self._max_output_tokens,

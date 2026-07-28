@@ -15,7 +15,7 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
 
 def create_review_service(project_root: Path | None = None) -> ReviewService:
-    """按指定项目根目录连接SQLite及版本化标注目录。"""
+    """按指定项目根目录连接SQLite复核服务。"""
     root = (project_root or _PROJECT_ROOT).resolve()
     config = load_config(
         config_path=root / "configs" / "base.yaml",
@@ -26,7 +26,6 @@ def create_review_service(project_root: Path | None = None) -> ReviewService:
     return ReviewService(
         repository=repository,
         project_root=root,
-        annotations_root=root / config.paths.annotations_dir,
     )
 
 

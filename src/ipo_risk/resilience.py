@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Generic, TypeVar
+
+from pydantic import ValidationError
 
 
 T = TypeVar("T")
@@ -28,6 +31,11 @@ def retry_transient_api_error(error: Exception) -> bool:
 
 def retry_model_node_error(error: Exception) -> bool:
     """模型节点还会重试可由再次生成修复的结构和证据校验错误。"""
+    # 预算门禁属于确定性暂停条件，重试不会恢复额度，必须立即向上传播。
+    from ipo_risk.agents.usage import ModelBudgetExceededError
+
+    if isinstance(error, ModelBudgetExceededError):
+        return False
     return isinstance(error, ValueError) or retry_transient_api_error(error)
 
 
@@ -35,6 +43,7 @@ def retry_model_node_error(error: Exception) -> bool:
 class RetryResult(Generic[T]):
     value: T
     attempts: int
+    errors: tuple[str, ...] = ()
 
 
 class RetryExhaustedError(RuntimeError):
@@ -48,7 +57,7 @@ class RetryExhaustedError(RuntimeError):
 
 @dataclass(frozen=True)
 class RetryPolicy:
-    """与LangGraph节点RetryPolicy等价的同步最小实现。"""
+    """保留精确尝试次数审计的模型子步骤同步重试策略。"""
 
     max_retries: int = 0
     initial_seconds: float = 1.0
@@ -68,22 +77,91 @@ class RetryPolicy:
     def run(self, operation: Callable[[], T]) -> RetryResult[T]:
         attempts = 0
         delay = self.initial_seconds
+        errors: list[str] = []
         while True:
             attempts += 1
             try:
-                return RetryResult(value=operation(), attempts=attempts)
+                return RetryResult(
+                    value=operation(),
+                    attempts=attempts,
+                    errors=tuple(errors),
+                )
             except Exception as error:
+                errors.append(_compact_error(error))
                 retries_used = attempts - 1
                 if retries_used >= self.max_retries or not self.retry_if(error):
                     raise RetryExhaustedError(attempts, error) from error
                 self.sleep(min(delay, self.max_seconds))
                 delay = min(delay * self.backoff_factor, self.max_seconds)
 
+    def run_with_feedback(
+        self,
+        operation: Callable[[str | None], T],
+    ) -> RetryResult[T]:
+        """重试模型结构错误时，把具体校验问题反馈给下一次生成。"""
+        attempts = 0
+        delay = self.initial_seconds
+        feedback: str | None = None
+        errors: list[str] = []
+        while True:
+            attempts += 1
+            try:
+                return RetryResult(
+                    value=operation(feedback),
+                    attempts=attempts,
+                    errors=tuple(errors),
+                )
+            except Exception as error:
+                compact = _compact_error(error)
+                errors.append(compact)
+                retries_used = attempts - 1
+                if retries_used >= self.max_retries or not self.retry_if(error):
+                    raise RetryExhaustedError(attempts, error) from error
+                feedback = (
+                    _model_validation_feedback(error)
+                    if isinstance(error, (ValueError, ValidationError))
+                    else None
+                )
+                self.sleep(min(delay, self.max_seconds))
+                delay = min(delay * self.backoff_factor, self.max_seconds)
+
+
+def _compact_error(error: Exception, *, limit: int = 4_000) -> str:
+    message = str(error).strip() or type(error).__name__
+    return message[:limit]
+
+
+def _model_validation_feedback(error: Exception) -> str:
+    """把 Pydantic/JSON 错误压缩成模型可直接修正的结构化反馈。"""
+    if isinstance(error, ValidationError):
+        details: list[dict[str, object]] = []
+        for item in error.errors(include_url=False, include_input=True)[:12]:
+            raw_input = item.get("input")
+            try:
+                rendered_input = json.dumps(raw_input, ensure_ascii=False)
+            except TypeError:
+                rendered_input = repr(raw_input)
+            details.append(
+                {
+                    "field": ".".join(str(part) for part in item.get("loc", ())),
+                    "error": str(item.get("msg", "validation error")),
+                    "invalid_value": rendered_input[:500],
+                }
+            )
+        return json.dumps(details, ensure_ascii=False)[:4_000]
+    if isinstance(error, json.JSONDecodeError):
+        excerpt = error.doc[max(0, error.pos - 300) : error.pos + 300]
+        return (f"返回内容不是合法JSON：{error.msg}，位置{error.pos}；错误附近内容：{excerpt}")[
+            :4_000
+        ]
+    return _compact_error(error)
+
 
 __all__ = [
     "RetryExhaustedError",
     "RetryPolicy",
     "RetryResult",
+    "_model_validation_feedback",
     "retry_model_node_error",
     "retry_transient_api_error",
 ]
