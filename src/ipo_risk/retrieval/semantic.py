@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from hashlib import sha256
+import os
 from pathlib import Path
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import shutil
 from typing import Any, Protocol
+from threading import Lock
+from uuid import uuid4
 
 import numpy as np
 
@@ -27,6 +32,17 @@ class EmbeddingProvider(Protocol):
         ...
 
 
+class SemanticSearchProvider(Protocol):
+    """可参与混合检索的最小语义搜索接口。"""
+
+    def search(self, query: str, top_k: int = 20) -> list[SearchHit]: ...
+
+
+# 向量化进度回调：(已完成条数, 总条数)。首次向量化可能耗时较长，
+# 通过逐批回调让上层能够展示百分比，避免界面看似卡死。
+EmbeddingProgressCallback = Callable[[int, int], None]
+
+
 class OpenAICompatibleEmbeddingProvider:
     """通过OpenAI兼容Embedding接口批量生成稠密向量。"""
 
@@ -36,6 +52,8 @@ class OpenAICompatibleEmbeddingProvider:
         model_name: str,
         dimensions: int,
         batch_size: int,
+        request_concurrency: int = 1,
+        timeout_seconds: float = 120.0,
         api_key: str | None = None,
         base_url: str | None = None,
         client: Any | None = None,
@@ -44,18 +62,30 @@ class OpenAICompatibleEmbeddingProvider:
         retry_backoff_factor: float = 2.0,
         retry_max_seconds: float = 8.0,
         sleep: Callable[[float], None] | None = None,
+        progress_callback: EmbeddingProgressCallback | None = None,
+        batch_cache_dir: Path | None = None,
     ) -> None:
-        if dimensions < 1 or batch_size < 1:
-            raise ValueError("embedding dimensions and batch_size must be positive")
+        if dimensions < 1 or batch_size < 1 or request_concurrency < 1:
+            raise ValueError(
+                "embedding dimensions, batch_size and request_concurrency must be positive"
+            )
+        if timeout_seconds <= 0:
+            raise ValueError("embedding timeout_seconds must be positive")
         if client is None:
             if not api_key or not base_url:
                 raise ValueError("api_key and base_url are required without a client")
             from openai import OpenAI
 
-            client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+            client = OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=0,
+                timeout=timeout_seconds,
+            )
         self.model_name = model_name
         self.dimensions = dimensions
         self._batch_size = batch_size
+        self._request_concurrency = request_concurrency
         self._client = client
         self._retry_policy = (
             RetryPolicy(
@@ -77,41 +107,201 @@ class OpenAICompatibleEmbeddingProvider:
         self.retry_count = 0
         self.request_count = 0
         self.last_attempts = 0
+        self._progress_callback = progress_callback
+        self._counter_lock = Lock()
+        self._batch_cache_root = (
+            Path(batch_cache_dir).resolve() if batch_cache_dir is not None else None
+        )
+        self._active_batch_cache_dir: Path | None = None
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         """分批调用兼容接口并保持与输入一致的向量顺序。"""
         if not texts:
             return []
-        vectors: list[list[float]] = []
-        for start in range(0, len(texts), self._batch_size):
-            batch = texts[start : start + self._batch_size]
+        if self._batch_cache_root is not None:
+            return self._embed_with_batch_cache(texts)
+        return self._embed_without_batch_cache(texts)
+
+    def _embed_without_batch_cache(
+        self,
+        texts: list[str],
+    ) -> list[list[float]]:
+        total = len(texts)
+        batches = [
+            (start, texts[start : start + self._batch_size])
+            for start in range(0, total, self._batch_size)
+        ]
+        if len(batches) == 1 or self._request_concurrency == 1:
+            vectors: list[list[float]] = []
+            completed = 0
+            for _, batch in batches:
+                vectors.extend(self._embed_batch(batch))
+                completed += len(batch)
+                self._report_progress(completed, total)
+            return vectors
+
+        # 多连接并发只改变请求调度，不改变结果顺序。每批结果按其原始
+        # start 位置写回，避免服务端响应先后顺序污染 chunk_id 对应关系。
+        results: dict[int, list[list[float]]] = {}
+        completed = 0
+        with ThreadPoolExecutor(
+            max_workers=min(self._request_concurrency, len(batches)),
+            thread_name_prefix="embedding-request",
+        ) as executor:
+            future_to_batch = {
+                executor.submit(self._embed_batch, batch): (start, len(batch))
+                for start, batch in batches
+            }
+            for future in as_completed(future_to_batch):
+                start, batch_count = future_to_batch[future]
+                results[start] = future.result()
+                completed += batch_count
+                self._report_progress(completed, total)
+        return [vector for start, _ in batches for vector in results[start]]
+
+    def _embed_with_batch_cache(
+        self,
+        texts: list[str],
+    ) -> list[list[float]]:
+        """逐批持久化向量；临时失败后只补未完成批次。"""
+        total = len(texts)
+        batches = [
+            (start, texts[start : start + self._batch_size])
+            for start in range(0, total, self._batch_size)
+        ]
+        cache_dir = self._batch_checkpoint_dir(texts)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        self._active_batch_cache_dir = cache_dir
+        results: dict[int, list[list[float]]] = {}
+        missing: list[tuple[int, list[str], Path]] = []
+        completed = 0
+        for index, (start, batch) in enumerate(batches):
+            path = cache_dir / f"batch-{index:06d}.npy"
+            cached = self._load_batch_checkpoint(path, len(batch))
+            if cached is None:
+                missing.append((start, batch, path))
+                continue
+            results[start] = cached
+            completed += len(batch)
+        if completed:
+            self._report_progress(completed, total)
+        if missing:
+            executor = ThreadPoolExecutor(
+                max_workers=min(self._request_concurrency, len(missing)),
+                thread_name_prefix="embedding-checkpoint",
+            )
+            future_to_batch = {
+                executor.submit(
+                    self._embed_and_checkpoint_batch,
+                    batch,
+                    path,
+                ): (start, len(batch))
+                for start, batch, path in missing
+            }
             try:
-                outcome = self._retry_policy.run(
-                    lambda: self._client.embeddings.create(
-                        model=self.model_name,
-                        input=batch,
-                        dimensions=self.dimensions,
-                        encoding_format="float",
-                    )
-                )
-            except RetryExhaustedError as error:
-                self.last_attempts = error.attempts
-                self.request_count += error.attempts
-                self.retry_count += error.attempts - 1
-                raise error.last_error from error
-            response = outcome.value
-            self.last_attempts = outcome.attempts
-            self.request_count += outcome.attempts
-            self.retry_count += outcome.attempts - 1
-            ordered = sorted(response.data, key=lambda item: item.index)
-            if len(ordered) != len(batch):
-                raise ValueError("embedding API returned an unexpected vector count")
-            for item in ordered:
-                vector = [float(value) for value in item.embedding]
-                if len(vector) != self.dimensions:
-                    raise ValueError("embedding API returned an unexpected dimension")
-                vectors.append(vector)
+                for future in as_completed(future_to_batch):
+                    start, batch_count = future_to_batch[future]
+                    results[start] = future.result()
+                    completed += batch_count
+                    self._report_progress(completed, total)
+            except Exception:
+                for future in future_to_batch:
+                    future.cancel()
+                executor.shutdown(wait=True, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
+        return [vector for start, _ in batches for vector in results[start]]
+
+    def clear_batch_checkpoint(self) -> None:
+        """最终文档向量缓存写入成功后清理临时分批检查点。"""
+        cache_dir = self._active_batch_cache_dir
+        if cache_dir is None:
+            return
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        self._active_batch_cache_dir = None
+
+    def _batch_checkpoint_dir(self, texts: list[str]) -> Path:
+        assert self._batch_cache_root is not None
+        digest = sha256()
+        digest.update(
+            (f"{self.model_name}\0{self.dimensions}\0{self._batch_size}\0").encode("utf-8")
+        )
+        for text in texts:
+            digest.update(text.encode("utf-8"))
+            digest.update(b"\0")
+        return self._batch_cache_root / digest.hexdigest()
+
+    def _load_batch_checkpoint(
+        self,
+        path: Path,
+        expected_count: int,
+    ) -> list[list[float]] | None:
+        if not path.is_file():
+            return None
+        try:
+            vectors = np.load(path, allow_pickle=False)
+        except (OSError, ValueError):
+            path.unlink(missing_ok=True)
+            return None
+        if vectors.shape != (expected_count, self.dimensions):
+            path.unlink(missing_ok=True)
+            return None
+        return vectors.astype(np.float32, copy=False).tolist()
+
+    def _embed_and_checkpoint_batch(
+        self,
+        batch: list[str],
+        path: Path,
+    ) -> list[list[float]]:
+        vectors = self._embed_batch(batch)
+        array = np.asarray(vectors, dtype=np.float32)
+        if array.shape != (len(batch), self.dimensions):
+            raise ValueError("embedding API returned an unexpected batch shape")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            with temporary.open("wb") as stream:
+                np.save(stream, array, allow_pickle=False)
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
         return vectors
+
+    def _embed_batch(self, batch: list[str]) -> list[list[float]]:
+        """执行一批向量请求；该方法可由多个工作线程并发调用。"""
+        try:
+            outcome = self._retry_policy.run(
+                lambda: self._client.embeddings.create(
+                    model=self.model_name,
+                    input=batch,
+                    dimensions=self.dimensions,
+                    encoding_format="float",
+                )
+            )
+        except RetryExhaustedError as error:
+            self._record_attempts(error.attempts)
+            raise error.last_error from error
+        self._record_attempts(outcome.attempts)
+        ordered = sorted(outcome.value.data, key=lambda item: item.index)
+        if len(ordered) != len(batch):
+            raise ValueError("embedding API returned an unexpected vector count")
+        vectors: list[list[float]] = []
+        for item in ordered:
+            vector = [float(value) for value in item.embedding]
+            if len(vector) != self.dimensions:
+                raise ValueError("embedding API returned an unexpected dimension")
+            vectors.append(vector)
+        return vectors
+
+    def _record_attempts(self, attempts: int) -> None:
+        with self._counter_lock:
+            self.last_attempts = attempts
+            self.request_count += attempts
+            self.retry_count += attempts - 1
+
+    def _report_progress(self, completed: int, total: int) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(min(completed, total), total)
 
 
 class SemanticRetriever:
@@ -158,7 +348,13 @@ class SemanticRetriever:
             raise ValueError("embedding provider returned an unexpected vector count")
         if vectors.shape[1] != provider.dimensions:
             raise ValueError("embedding provider returned an unexpected dimension")
+        vectors.flags.writeable = False
         self._vectors = vectors
+
+    @property
+    def document_vectors(self) -> np.ndarray:
+        """返回当前文档只读向量，供后台持久化复用而不再次调用模型。"""
+        return self._vectors
 
     def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
         """返回按余弦相似度降序排列的语义候选段落。"""
@@ -298,7 +494,7 @@ class HybridRetriever:
     def __init__(
         self,
         lexical: BM25Retriever,
-        semantic: SemanticRetriever,
+        semantic: SemanticSearchProvider,
         *,
         lexical_top_k: int = 20,
         semantic_top_k: int = 20,
@@ -359,5 +555,6 @@ __all__ = [
     "HybridRetriever",
     "HybridSearchHit",
     "OpenAICompatibleEmbeddingProvider",
+    "SemanticSearchProvider",
     "SemanticRetriever",
 ]

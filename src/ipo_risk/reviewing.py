@@ -2,13 +2,11 @@
 
 from __future__ import annotations
 
+import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Literal
 from uuid import uuid4
-
-from pydantic import BaseModel, ConfigDict, model_validator
 
 from ipo_risk.agents.verifier import verify_finding as run_verification
 from ipo_risk.domain import (
@@ -21,6 +19,7 @@ from ipo_risk.domain import (
     VerificationStatus,
 )
 from ipo_risk.reporting import AnalysisSummary, RiskAnalysisReport, write_risk_report
+from ipo_risk.reporting import write_verified_pdf_report
 from ipo_risk.storage.files import read_json, write_json
 from ipo_risk.storage.paths import safe_path_segment
 from ipo_risk.storage.repositories import CatalogRepository
@@ -77,47 +76,24 @@ class ReviewFindingDetail:
     agent_traces: tuple[AgentTrace, ...]
 
 
-class ReviewAnnotationBundle(BaseModel):
-    """一次人工复核进度的不可变、可追溯标注快照。"""
+@dataclass(frozen=True)
+class AnalysisDeletionResult:
+    """一次分析删除后的可恢复位置和路径处理结果。"""
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
-
-    schema_version: Literal["1.0"] = "1.0"
-    annotation_version: str
-    exported_at: datetime
     run_id: str
-    company_id: str
-    company_name: str
-    document_id: str
-    source_hash: str
-    complete: bool
-    findings: tuple[RiskFinding, ...]
-    evidences: tuple[Evidence, ...]
-    reviews: tuple[FindingReview, ...]
+    recovery_path: Path | None
+    moved_paths: tuple[Path, ...]
+    missing_paths: tuple[Path, ...]
+    skipped_paths: tuple[Path, ...]
 
-    @model_validator(mode="after")
-    def validate_snapshot(self) -> ReviewAnnotationBundle:
-        known_evidence = {evidence.evidence_id for evidence in self.evidences}
-        referenced_evidence = {
-            evidence_id
-            for finding in self.findings
-            for evidence_id in finding.evidence_ids
-        }
-        if referenced_evidence - known_evidence:
-            raise ValueError("annotation findings reference missing evidence")
-        if any(review.run_id != self.run_id for review in self.reviews):
-            raise ValueError("annotation review belongs to another run")
-        pending = any(
-            finding.status
-            in {
-                VerificationStatus.PROPOSED,
-                VerificationStatus.PENDING_VERIFICATION,
-            }
-            for finding in self.findings
-        )
-        if self.complete == pending:
-            raise ValueError("complete must match current finding states")
-        return self
+
+@dataclass(frozen=True)
+class VerifiedExportBundle:
+    """Human PDF, compact verified JSON and the separate complete audit."""
+
+    pdf_path: Path
+    json_path: Path
+    audit_path: Path
 
 
 class ReviewService:
@@ -128,13 +104,9 @@ class ReviewService:
         *,
         repository: CatalogRepository,
         project_root: Path,
-        annotations_root: Path | None = None,
     ) -> None:
         self.repository = repository
         self.project_root = project_root.resolve()
-        self.annotations_root = (
-            annotations_root or self.project_root / "data" / "annotations"
-        ).resolve()
 
     def list_runs(self) -> tuple[ReviewRunSummary, ...]:
         summaries: list[ReviewRunSummary] = []
@@ -151,12 +123,8 @@ class ReviewService:
                 }
                 for finding in findings
             )
-            verified = sum(
-                finding.status is VerificationStatus.VERIFIED for finding in findings
-            )
-            rejected = sum(
-                finding.status is VerificationStatus.REJECTED for finding in findings
-            )
+            verified = sum(finding.status is VerificationStatus.VERIFIED for finding in findings)
+            rejected = sum(finding.status is VerificationStatus.REJECTED for finding in findings)
             summaries.append(
                 ReviewRunSummary(
                     run_id=run.run_id,
@@ -177,6 +145,115 @@ class ReviewService:
 
     def list_findings(self, run_id: str) -> tuple[RiskFinding, ...]:
         return self.repository.list_findings(run_id)
+
+    def delete_analysis_run(self, run_id: str) -> AnalysisDeletionResult:
+        """删除指定运行，派生文件移入项目回收区并保留原始文档。"""
+        run = self.repository.get_analysis_run(run_id)
+        if run is None:
+            raise KeyError(f"analysis run does not exist: {run_id}")
+
+        run_segment = safe_path_segment(run_id, "run_id")
+        candidates: list[tuple[Path, str, Path]] = []
+        missing: list[Path] = []
+        skipped: list[Path] = []
+
+        def resolve_project_reference(reference: str) -> Path:
+            path = Path(reference)
+            if not path.is_absolute():
+                path = self.project_root / path
+            return path.resolve()
+
+        def related_export_paths(reference: str) -> tuple[Path, ...]:
+            primary = resolve_project_reference(reference)
+            if primary.name != "verified_risk_analysis.json":
+                return (primary,)
+            return (
+                primary,
+                primary.with_name("verified_risk_report.pdf"),
+                primary.with_name("analysis_audit_bundle.json"),
+            )
+
+        # A document or derived asset may be reused by multiple analysis runs.
+        # Such files remain active; only the selected run's database links are removed.
+        protected_paths = {
+            resolve_project_reference(document.local_file)
+            for document in self.repository.list_documents(run.company_id)
+        }
+        for other_run in self.repository.list_analysis_runs():
+            if other_run.run_id == run_id:
+                continue
+            protected_paths.update(
+                related_path
+                for reference in (
+                    other_run.report_path,
+                    other_run.verified_report_path,
+                )
+                if reference
+                for related_path in related_export_paths(reference)
+            )
+            protected_paths.update(
+                resolve_project_reference(evidence.screenshot_path)
+                for evidence in self.repository.list_evidence(other_run.run_id)
+                if evidence.screenshot_path
+            )
+
+        def add_project_candidate(reference: str) -> None:
+            source = resolve_project_reference(reference)
+            if not source.is_relative_to(self.project_root) or source in protected_paths:
+                skipped.append(source)
+            elif source.exists():
+                candidates.append((source, "project", source.relative_to(self.project_root)))
+            else:
+                missing.append(source)
+
+        if run.report_path:
+            add_project_candidate(run.report_path)
+        if run.verified_report_path:
+            for related_path in related_export_paths(run.verified_report_path):
+                add_project_candidate(str(related_path))
+
+        for evidence in self.repository.list_evidence(run_id):
+            if evidence.screenshot_path:
+                add_project_candidate(evidence.screenshot_path)
+
+        unique_candidates: list[tuple[Path, str, Path]] = []
+        seen_sources: set[Path] = set()
+        for candidate in candidates:
+            if candidate[0] not in seen_sources:
+                unique_candidates.append(candidate)
+                seen_sources.add(candidate[0])
+
+        recovery_path: Path | None = None
+        moved: list[tuple[Path, Path]] = []
+        if unique_candidates:
+            version = f"{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}-{uuid4().hex[:8]}"
+            recovery_path = self.project_root / ".trash" / "analysis_runs" / run_segment / version
+            try:
+                for source, category, relative_path in unique_candidates:
+                    destination = recovery_path / category / relative_path
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(source), str(destination))
+                    moved.append((source, destination))
+                if not self.repository.delete_analysis_run(run_id):
+                    raise KeyError(f"analysis run does not exist: {run_id}")
+            except Exception:
+                for source, destination in reversed(moved):
+                    source.parent.mkdir(parents=True, exist_ok=True)
+                    if destination.exists():
+                        shutil.move(str(destination), str(source))
+                if recovery_path.exists():
+                    shutil.rmtree(recovery_path)
+                raise
+        elif not self.repository.delete_analysis_run(run_id):
+            raise KeyError(f"analysis run does not exist: {run_id}")
+
+        return AnalysisDeletionResult(
+            run_id=run_id,
+            recovery_path=recovery_path,
+            moved_paths=tuple(source for source, _ in moved),
+            missing_paths=tuple(dict.fromkeys(missing)),
+            skipped_paths=tuple(dict.fromkeys(skipped)),
+        )
 
     def get_agent_traces(self, run_id: str) -> tuple[AgentTrace, ...]:
         """从候选报告读取不可变 Agent 轨迹，供复核和审计展示。"""
@@ -318,15 +395,11 @@ class ReviewService:
             raise IncompleteReviewError(incomplete)
 
         verified_findings = tuple(
-            finding
-            for finding in stored_findings
-            if finding.status is VerificationStatus.VERIFIED
+            finding for finding in stored_findings if finding.status is VerificationStatus.VERIFIED
         )
         evidence_ids = tuple(
             dict.fromkeys(
-                evidence_id
-                for finding in verified_findings
-                for evidence_id in finding.evidence_ids
+                evidence_id for finding in verified_findings for evidence_id in finding.evidence_ids
             )
         )
         evidences = self.repository.list_evidence(run_id, evidence_ids=evidence_ids)
@@ -353,7 +426,7 @@ class ReviewService:
             ),
             evidences=evidences,
             risk_findings=verified_findings,
-            agent_traces=candidate.agent_traces,
+            agent_traces=(),
             evidence_display_zh_hans=evidence_display,
         )
         destination = output_path or candidate_path.with_name("verified_risk_analysis.json")
@@ -367,13 +440,13 @@ class ReviewService:
         self.repository.set_verified_report_path(run_id, stored_path)
         return destination
 
-    def export_review_annotations(
+    def export_verified_bundle(
         self,
         run_id: str,
         *,
-        output_path: Path | None = None,
-    ) -> Path:
-        """把当前风险、证据和审计记录导出为一个新的版本化标注快照。"""
+        output_directory: Path | None = None,
+    ) -> VerifiedExportBundle:
+        """Export a concise PDF/JSON plus a separately labelled full audit."""
         candidate_reference = self.repository.get_analysis_report_path(run_id)
         if candidate_reference is None:
             raise KeyError(f"analysis run does not exist or has no report: {run_id}")
@@ -382,60 +455,54 @@ class ReviewService:
             candidate_path = self.project_root / candidate_path
         if not candidate_path.is_file():
             raise FileNotFoundError(candidate_path)
-        candidate = RiskAnalysisReport.model_validate(read_json(candidate_path))
 
-        findings = self.repository.list_findings(run_id)
-        evidence_ids = tuple(
-            dict.fromkeys(
-                evidence_id
-                for finding in findings
-                for evidence_id in finding.evidence_ids
-            )
+        directory = output_directory or candidate_path.parent
+        if not directory.is_absolute():
+            directory = self.project_root / directory
+        directory.mkdir(parents=True, exist_ok=True)
+        compact_path = self.export_verified_report(
+            run_id,
+            output_path=directory / "verified_risk_analysis.json",
         )
-        evidences = self.repository.list_evidence(run_id, evidence_ids=evidence_ids)
+        compact_report = RiskAnalysisReport.model_validate(read_json(compact_path))
+        candidate_report = RiskAnalysisReport.model_validate(read_json(candidate_path))
+        stored_findings = self.repository.list_findings(run_id)
         reviews = self.repository.list_reviews(run_id)
-        complete = all(
-            finding.status
-            in {VerificationStatus.VERIFIED, VerificationStatus.REJECTED}
-            for finding in findings
-        )
-        exported_at = datetime.now(timezone.utc)
-        version = f"{exported_at:%Y%m%dT%H%M%S%fZ}-{uuid4().hex[:8]}"
-        bundle = ReviewAnnotationBundle(
-            annotation_version=version,
-            exported_at=exported_at,
-            run_id=run_id,
-            company_id=candidate.company_id,
-            company_name=candidate.company_name,
-            document_id=candidate.source_document.document_id,
-            source_hash=candidate.source_document.source_hash,
-            complete=complete,
-            findings=findings,
-            evidences=evidences,
-            reviews=reviews,
+
+        audit_path = directory / "analysis_audit_bundle.json"
+        write_json(
+            {
+                "schema_version": "1.0",
+                "export_type": "analysis_audit_bundle",
+                "run_id": run_id,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "candidate_report": candidate_report.model_dump(mode="json"),
+                "final_findings": [finding.model_dump(mode="json") for finding in stored_findings],
+                "reviews": [review.model_dump(mode="json") for review in reviews],
+            },
+            audit_path,
         )
 
-        if output_path is None:
-            company_segment = safe_path_segment(candidate.company_id, "company_id")
-            run_segment = safe_path_segment(run_id, "run_id")
-            destination = (
-                self.annotations_root
-                / company_segment
-                / run_segment
-                / f"review_annotations_{version}.json"
-            )
-        else:
-            destination = output_path
-            if not destination.is_absolute():
-                destination = self.project_root / destination
-        return write_json(bundle.model_dump(mode="json"), destination, pretty=True)
+        pdf_path = directory / "verified_risk_report.pdf"
+        write_verified_pdf_report(
+            compact_report,
+            pdf_path,
+            reviews=reviews,
+            project_root=self.project_root,
+        )
+        return VerifiedExportBundle(
+            pdf_path=pdf_path,
+            json_path=compact_path,
+            audit_path=audit_path,
+        )
 
 
 __all__ = [
+    "AnalysisDeletionResult",
     "IncompleteReviewError",
     "ReviewBlockedError",
-    "ReviewAnnotationBundle",
     "ReviewFindingDetail",
     "ReviewRunSummary",
     "ReviewService",
+    "VerifiedExportBundle",
 ]

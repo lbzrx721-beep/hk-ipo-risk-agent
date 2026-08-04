@@ -20,6 +20,7 @@ import hashlib
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import orjson
 
@@ -86,13 +87,19 @@ def write_json(data: Any, path: Path, pretty: bool = True) -> Path:
         写入的文件路径。
     """
     ensure_dir(path.parent)
-    if pretty:
-        # 用标准库 json 做格式化输出（可读性更好）
-        text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
-        path.write_text(text, encoding="utf-8")
-    else:
-        # 用 orjson 做紧凑输出（速度更快）
-        path.write_bytes(orjson.dumps(data, option=orjson.OPT_INDENT_2))
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        if pretty:
+            # 用标准库 json 做格式化输出（可读性更好）
+            text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+            temporary.write_text(text, encoding="utf-8")
+        else:
+            # 用 orjson 做紧凑输出（速度更快）
+            temporary.write_bytes(orjson.dumps(data, option=orjson.OPT_INDENT_2))
+        temporary.replace(path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
     return path
 
 

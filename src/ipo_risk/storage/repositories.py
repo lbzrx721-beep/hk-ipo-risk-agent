@@ -306,6 +306,23 @@ class CatalogRepository:
             ).fetchone()
         return self._dataset_from_row(row) if row else None
 
+    def relocate_dataset_file(self, dataset_id: str, local_file: str) -> None:
+        """把历史数据集登记指向已核验的不可变备份文件。
+
+        仅用于原先的“当前文件”被新官方快照替换、且旧内容已经按原哈希备份的场景。
+        调用方必须先核对备份文件哈希；仓储层只负责原子更新路径并保留原数据集ID。
+        """
+        normalized = local_file.strip()
+        if not normalized:
+            raise ValueError("local_file must not be empty")
+        with self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE datasets SET local_file = ? WHERE dataset_id = ?",
+                (normalized, dataset_id),
+            )
+            if cursor.rowcount != 1:
+                raise KeyError(f"unknown dataset_id: {dataset_id}")
+
     def list_datasets(
         self,
         company_id: str,
@@ -486,6 +503,15 @@ class CatalogRepository:
                     }
                 ):
                     continue
+                # 模型重试可能缩小或替换已采纳证据；先清理旧关联，避免审计表
+                # 继续残留不再属于当前风险结论的证据ID。
+                connection.execute(
+                    """
+                    DELETE FROM finding_evidence
+                    WHERE run_id = ? AND finding_id = ?
+                    """,
+                    (report.run_id, finding.finding_id),
+                )
                 for evidence_id in finding.evidence_ids:
                     connection.execute(
                         """
@@ -526,6 +552,23 @@ class CatalogRepository:
             ).fetchone()
         return self._analysis_run_from_row(row) if row else None
 
+    def delete_analysis_run(self, run_id: str) -> bool:
+        """删除单次分析及其派生记录，保留公司、文档与行情数据。"""
+        with self._connection() as connection:
+            exists = connection.execute(
+                "SELECT 1 FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+            if exists is None:
+                return False
+            # reviews uses ON DELETE RESTRICT so audit rows must be removed explicitly.
+            connection.execute("DELETE FROM reviews WHERE run_id = ?", (run_id,))
+            cursor = connection.execute(
+                "DELETE FROM analysis_runs WHERE run_id = ?",
+                (run_id,),
+            )
+        return cursor.rowcount == 1
+
     def list_analysis_runs(
         self,
         *,
@@ -537,6 +580,32 @@ class CatalogRepository:
             query += " WHERE status = ?"
             parameters.append(status)
         query += " ORDER BY created_at DESC, run_id DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(self._analysis_run_from_row(row) for row in rows)
+
+    def list_analysis_runs_for_source_hash(
+        self,
+        source_hash: str,
+        *,
+        status: str | None = None,
+    ) -> tuple[AnalysisRunRecord, ...]:
+        """按PDF内容指纹查找历史运行，供上传入口避免重复调用模型。"""
+        clauses = ["documents.source_hash = ?"]
+        parameters: list[Any] = [source_hash.strip().lower()]
+        if status is not None:
+            clauses.append("analysis_runs.status = ?")
+            parameters.append(status)
+        query = (
+            "SELECT DISTINCT analysis_runs.* FROM analysis_runs "
+            "JOIN analysis_run_documents "
+            "ON analysis_run_documents.run_id = analysis_runs.run_id "
+            "JOIN documents "
+            "ON documents.document_id = analysis_run_documents.document_id "
+            "WHERE "
+            + " AND ".join(clauses)
+            + " ORDER BY analysis_runs.created_at DESC, analysis_runs.run_id DESC"
+        )
         with self._connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(self._analysis_run_from_row(row) for row in rows)

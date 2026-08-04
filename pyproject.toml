@@ -12,6 +12,7 @@ dependencies = [
     "PyYAML>=6,<7",
     "orjson>=3.10,<4",
     "structlog>=24,<27",
+    "langgraph>=1.0,<2",
     "typer>=0.12,<1",
     "rich>=13,<15",
 ]
@@ -31,6 +32,8 @@ retrieval = [
     "jieba>=0.42,<1",
     "numpy>=2,<3",
     "sentence-transformers>=4,<6",
+    "psycopg[binary]>=3.2,<4",
+    "pgvector>=0.3,<1",
 ]
 data = [
     "numpy>=2,<3",
@@ -52,10 +55,6 @@ api = [
     "httpx>=0.28,<1",
     "openai>=1.60,<3",
     "tenacity>=9,<10",
-]
-ui = [
-    "streamlit>=1.42,<2",
-    "plotly>=6,<7",
 ]
 reporting = [
     "jinja2>=3.1,<4",
@@ -79,6 +78,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
+cache_dir = "tmp/tests/cache"
+addopts = "--basetemp=tmp/tests/runtime"
 markers = [
     "integration: 使用公开真实文件验证端到端链路",
 ]
@@ -102,7 +103,18 @@ module = [
     "rank_bm25.*",
     "rapidocr",
     "rapidocr.*",
+    "reportlab",
+    "reportlab.*",
     "yaml",
     "yaml.*",
+    "psycopg",
+    "psycopg.*",
+    "pgvector",
+    "pgvector.*",
+    "joblib",
+    "sklearn",
+    "sklearn.*",
+    "pandas",
+    "pandas.*",
 ]
 ignore_missing_imports = true

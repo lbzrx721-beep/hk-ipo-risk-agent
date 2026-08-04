@@ -6,6 +6,7 @@ from ipo_risk.agents.analysis import EvidenceAnalysis
 from ipo_risk.agents.grounded import GroundedAnalysisEngine
 from ipo_risk.domain import AgentRole, RiskSeverity
 from ipo_risk.retrieval.chunker import DocumentChunk
+from ipo_risk.retrieval.lexical import SearchHit
 from ipo_risk.retrieval.search import RiskRule
 from ipo_risk.resilience import RetryPolicy
 
@@ -49,6 +50,46 @@ class SemanticMeaningProvider:
         for text in texts:
             vectors.append([1.0, 0.0] if "研发" in text or "現金" in text else [0.0, 1.0])
         return vectors
+
+
+class FixedSemanticSearcher:
+    def __init__(self, hit: DocumentChunk) -> None:
+        self.hit = hit
+        self.queries: list[str] = []
+
+    def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
+        self.queries.append(query)
+        return [SearchHit(chunk=self.hit, score=0.95, rank=1)]
+
+
+def test_discovery_corpus_keeps_vector_hit_neighbors_and_section_coverage() -> None:
+    chunks = [
+        _chunk(f"C{index}", f"原文段落{index}，包含当前章节的公司披露信息。")
+        for index in range(1, 9)
+    ]
+    chunks[0] = chunks[0].model_copy(update={"is_heading": True, "text": "业务概览"})
+    chunks[5] = chunks[5].model_copy(update={"is_heading": True, "text": "重大合同"})
+    semantic = FixedSemanticSearcher(chunks[3])
+    engine = GroundedAnalysisEngine(
+        chunks,
+        [_rule()],
+        semantic_retriever=semantic,
+    )
+
+    selected = engine.select_discovery_corpus(
+        ["重大合同中的终止条件"],
+        semantic_top_k_per_query=3,
+        lexical_top_k_per_query=1,
+        neighbor_radius=1,
+        coverage_section_count=2,
+        max_chunks=7,
+    )
+    selected_ids = {chunk.chunk_id for chunk in selected}
+
+    assert semantic.queries == ["重大合同中的终止条件"]
+    assert {"C3", "C4", "C5"}.issubset(selected_ids)
+    assert "C1" in selected_ids
+    assert len(selected) <= 7
 
 
 class SelectingAnalyzer:

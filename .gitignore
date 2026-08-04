@@ -2,6 +2,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.pytest-tmp-*/
 .mypy_cache/
 .ruff_cache/
 .coverage
@@ -11,6 +12,13 @@ venv/
 *.egg-info/
 build/
 dist/
+
+# Node frontend
+node_modules/
+.playwright-cli/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
 
 # Secrets and local settings
 .env
@@ -41,8 +49,19 @@ artifacts/**
 *.joblib
 *.pkl
 
+# ChromaDB vector store
+data/vector_store/
+data/vector_store*/
+
 # Logs and reports
 *.log
+output/
+
+# Local repair and recoverable workspace files
+.codex-repair/
+.codex-remote-attachments/
+.trash/
+.npmrc
 
 # IDE / OS
 .idea/

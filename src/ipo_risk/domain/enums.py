@@ -42,6 +42,7 @@ class AgentRole(StrEnum):
     """可出现在 AgentTrace 和 Evidence 中的标准角色名。"""
 
     DOCUMENT_PARSER = "document_parser"
+    DISCOVERY = "discovery"
     FINANCE = "finance"
     LEGAL = "legal"
     BUSINESS = "business"

@@ -72,6 +72,48 @@ def test_build_page_chunks_preserves_page_label_and_excludes_footer() -> None:
     assert "– 61 –" not in chunks[0].text
 
 
+def test_build_page_chunks_skips_zero_width_text_block() -> None:
+    page = PageResult(
+        page=1,
+        width=595.0,
+        height=842.0,
+        has_text_layer=True,
+        text_blocks=[
+            TextBlock(
+                page=1,
+                x0=100.0,
+                y0=120.0,
+                x1=100.0,
+                y1=140.0,
+                text="异常零宽文字块",
+                font_size=10.5,
+                block_no=1,
+            ),
+            TextBlock(
+                page=1,
+                x0=70.0,
+                y0=160.0,
+                x1=525.0,
+                y1=180.0,
+                text="正常风险证据仍然保留。",
+                font_size=10.5,
+                block_no=2,
+            ),
+        ],
+    )
+
+    chunks = build_page_chunks(
+        page,
+        company_id="03696",
+        document_id="prospectus_2025-12-18",
+        source_file="data/raw/prospectus/03696_英矽智能/招股章程.pdf",
+        source_hash="a" * 64,
+        available_at=date(2025, 12, 18),
+    )
+
+    assert [chunk.text for chunk in chunks] == ["正常风险证据仍然保留。"]
+
+
 def test_bm25_retrieves_relevant_traditional_chinese_evidence() -> None:
     chunks = [
         _chunk("C1", 30, "我們的經營產生負現金流量，現金流出主要來自研發活動。"),

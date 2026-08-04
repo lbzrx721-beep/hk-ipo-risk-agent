@@ -138,6 +138,9 @@ class Evidence(ContractModel):
     confidence: float = Field(ge=0.0, le=1.0)
     available_at: date
     screenshot_path: NonEmptyStr | None = None
+    table_id: NonEmptyStr | None = None
+    table_cell_refs: tuple[NonEmptyStr, ...] = ()
+    table_cell_values: tuple[str, ...] = ()
     created_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("source_hash", mode="before")
@@ -159,6 +162,14 @@ class Evidence(ContractModel):
             raise ValueError("bbox origin must be non-negative")
         if x1 <= x0 or y1 <= y0:
             raise ValueError("bbox must satisfy x0 < x1 and y0 < y1")
+        if self.evidence_type is EvidenceType.TABLE and not self.table_id:
+            raise ValueError("table evidence requires table_id")
+        if self.evidence_type is not EvidenceType.TABLE and (
+            self.table_id or self.table_cell_refs or self.table_cell_values
+        ):
+            raise ValueError("non-table evidence cannot contain table metadata")
+        if len(self.table_cell_refs) != len(self.table_cell_values):
+            raise ValueError("table cell references and values must align")
         return self
 
 
@@ -229,6 +240,15 @@ class RiskFinding(ContractModel):
     created_by: AgentRole
     calculation: Calculation | None = None
     uncertainty: NonEmptyStr | None = None
+    specialist_status: Literal[
+        "supported",
+        "needs_more_evidence",
+        "evidence_insufficient",
+        "subject_or_period_mismatch",
+        "duplicate_merged",
+        "conflict",
+        "technical_failure",
+    ] | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("created_at")

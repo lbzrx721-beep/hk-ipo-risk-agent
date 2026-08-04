@@ -7,7 +7,7 @@ dependencies:
   - setuptools>=68
   - wheel
   - pip:
-      - -e .[dev,pdf,ocr,retrieval,data,modeling,api,ui,reporting]
+      - -e .[dev,pdf,ocr,retrieval,data,modeling,api,reporting]
 variables:
   PYTHONUTF8: "1"
   PYTHONIOENCODING: utf-8
