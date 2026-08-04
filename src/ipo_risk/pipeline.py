@@ -76,14 +76,15 @@ from ipo_risk.retrieval.semantic import (
     OpenAICompatibleEmbeddingProvider,
     SemanticRetriever,
 )
-from ipo_risk.retrieval.chroma import ChromaRetriever
-from ipo_risk.retrieval.persistence import (
-    ChromaPersistenceTask,
-    ChromaWriterFactory,
-    PersistenceSnapshot,
-)
+from ipo_risk.retrieval.pgvector import PgVectorRetriever
 from ipo_risk.resilience import RetryPolicy, retry_model_node_error
-from ipo_risk.storage.files import read_json, sha256_file, write_json, write_jsonl
+from ipo_risk.storage.files import (
+    read_json,
+    read_jsonl,
+    sha256_file,
+    write_json,
+    write_jsonl,
+)
 from ipo_risk.storage.ingestion import register_company_sources
 from ipo_risk.storage.paths import DocumentPaths
 from ipo_risk.storage.repositories import CatalogRepository
@@ -98,12 +99,7 @@ class _DeferredSemanticRetriever:
 
     def __init__(
         self,
-        future: Future[
-            tuple[
-                SemanticRetriever | ChromaRetriever | None,
-                ChromaPersistenceTask | None,
-            ]
-        ],
+        future: Future[SemanticRetriever | PgVectorRetriever | None],
         progress_callback: ProgressCallback | None,
     ) -> None:
         self._future = future
@@ -121,7 +117,7 @@ class _DeferredSemanticRetriever:
                         "embedding_join_wait",
                         "风险发现正在等待内存语义索引，以检索风险原文与相邻上下文。",
                     )
-        retriever, _persistence_task = self._future.result()
+        retriever = self._future.result()
         if self._join_reported:
             with self._join_lock:
                 if self._join_reported:
@@ -132,6 +128,12 @@ class _DeferredSemanticRetriever:
                         "内存语义索引已接入，风险发现开始构建高召回原文包。",
                     )
         return [] if retriever is None else retriever.search(query, top_k=top_k)
+
+    def close(self) -> None:
+        """分析结束后释放pgvector连接。"""
+        retriever = self._future.result()
+        if isinstance(retriever, PgVectorRetriever):
+            retriever.close()
 
 
 def _now() -> datetime:
@@ -185,8 +187,158 @@ class AnalysisArtifacts:
     tables_path: Path | None = None
     embedding_dir: Path | None = None
     prelisting_features_path: Path | None = None
-    vector_persistence_task: ChromaPersistenceTask | None = None
     model_usage: ModelUsageSnapshot | None = None
+
+
+@dataclass(frozen=True)
+class PreparedProspectus:
+    """可在批量预处理与正式Agent分析之间复用的文档级产物。"""
+
+    pages: tuple[dict[str, Any], ...]
+    tables: tuple[dict[str, Any], ...]
+    chunks: tuple[DocumentChunk, ...]
+    paths: DocumentPaths
+    cache_hit: bool
+    started_at: datetime
+    ended_at: datetime
+
+
+_PREPARATION_SCHEMA_VERSION = 1
+
+
+def _prepare_prospectus_source(
+    *,
+    pdf_path: Path,
+    company_id: str,
+    company_folder: str,
+    document_id: str,
+    source_file: str,
+    source_hash: str,
+    available_at: date,
+    interim_root: Path,
+    artifacts_root: Path,
+    min_text_chars_before_ocr: int,
+    progress_callback: ProgressCallback | None,
+) -> PreparedProspectus:
+    """解析PDF并落盘；相同文档与解析参数再次运行时直接复用。"""
+    started_at = _now()
+    paths = DocumentPaths.build(
+        interim_root=interim_root,
+        artifacts_root=artifacts_root,
+        company_folder=company_folder,
+        document_id=document_id,
+    )
+    manifest_path = paths.chunks_path.with_name("preparation.json")
+    expected_manifest = {
+        "schema_version": _PREPARATION_SCHEMA_VERSION,
+        "source_hash": source_hash,
+        "min_text_chars_before_ocr": min_text_chars_before_ocr,
+    }
+    if (
+        manifest_path.is_file()
+        and paths.pages_path.is_file()
+        and paths.tables_path.is_file()
+        and paths.chunks_path.is_file()
+    ):
+        try:
+            manifest = read_json(manifest_path)
+            if all(manifest.get(key) == value for key, value in expected_manifest.items()):
+                pages = tuple(read_jsonl(paths.pages_path))
+                tables = tuple(read_jsonl(paths.tables_path))
+                chunks = tuple(
+                    DocumentChunk.model_validate(item) for item in read_jsonl(paths.chunks_path)
+                )
+                if pages and chunks:
+                    _emit_progress(
+                        progress_callback,
+                        "parsing_cache_hit",
+                        (f"已复用解析缓存：{len(pages)}页，{len(chunks)}个文本切片。"),
+                    )
+                    return PreparedProspectus(
+                        pages=pages,
+                        tables=tables,
+                        chunks=chunks,
+                        paths=paths,
+                        cache_hit=True,
+                        started_at=started_at,
+                        ended_at=_now(),
+                    )
+        except (OSError, TypeError, ValueError):
+            # 缓存不完整或版本不兼容时安全重建，不污染正式分析。
+            pass
+
+    pages_buffer: list[dict[str, Any]] = []
+    tables_buffer: list[dict[str, Any]] = []
+    chunks_buffer: list[DocumentChunk] = []
+    with fitz.open(pdf_path) as source_document:
+        total_pages = source_document.page_count
+    _emit_progress(progress_callback, "parsing_started", "开始解析PDF页面与坐标。")
+    parsed_pages = parse_document(
+        pdf_path,
+        min_chars=min_text_chars_before_ocr,
+    )
+    for page_number, page_result in enumerate(parsed_pages, start=1):
+        pages_buffer.append(
+            _page_record(
+                page_result,
+                company_id=company_id,
+                document_id=document_id,
+                source_hash=source_hash,
+            )
+        )
+        tables_buffer.extend(
+            {
+                **asdict(table),
+                "company_id": company_id,
+                "document_id": document_id,
+                "source_hash": source_hash,
+            }
+            for table in page_result.tables
+        )
+        chunks_buffer.extend(
+            build_page_chunks(
+                page_result,
+                company_id=company_id,
+                document_id=document_id,
+                source_file=source_file,
+                source_hash=source_hash,
+                available_at=available_at,
+            )
+        )
+        _emit_progress(
+            progress_callback,
+            "parsing_progress",
+            (
+                f"[{page_number}/{total_pages}] 已解析PDF第{page_number}页，"
+                "正在构建文本、坐标与视觉区域索引。"
+            ),
+        )
+    if not chunks_buffer:
+        raise RuntimeError("prospectus parsing produced no searchable chunks")
+    write_jsonl(pages_buffer, paths.pages_path)
+    write_jsonl(tables_buffer, paths.tables_path)
+    write_jsonl(
+        [chunk.model_dump(mode="json") for chunk in chunks_buffer],
+        paths.chunks_path,
+    )
+    write_json(
+        {
+            **expected_manifest,
+            "page_count": len(pages_buffer),
+            "table_count": len(tables_buffer),
+            "chunk_count": len(chunks_buffer),
+        },
+        manifest_path,
+    )
+    return PreparedProspectus(
+        pages=tuple(pages_buffer),
+        tables=tuple(tables_buffer),
+        chunks=tuple(chunks_buffer),
+        paths=paths,
+        cache_hit=False,
+        started_at=started_at,
+        ended_at=_now(),
+    )
 
 
 def analyze_prospectus(
@@ -217,8 +369,9 @@ def analyze_prospectus(
     risk_scope_review_controller: RiskScopeReviewController | None = None,
     decision_conflict_batch_size: int = 12,
     vector_store_backend: str = "numpy",
-    chroma_persist_dir: Path | None = None,
-    chroma_collection: str = "prospectus_chunks",
+    postgres_dsn: str | None = None,
+    postgres_schema: str = "ipo_risk",
+    postgres_connect_timeout_seconds: float = 10.0,
     lexical_top_k: int = 80,
     semantic_top_k: int = 20,
     rerank_top_k: int = 8,
@@ -226,8 +379,6 @@ def analyze_prospectus(
     retry_initial_seconds: float = 1.0,
     retry_backoff_factor: float = 2.0,
     retry_max_seconds: float = 8.0,
-    chroma_writer_factory: ChromaWriterFactory | None = None,
-    vector_persistence_status_callback: (Callable[[PersistenceSnapshot], None] | None) = None,
     progress_callback: ProgressCallback | None = None,
     model_usage_ledger: ModelUsageLedger | None = None,
 ) -> AnalysisArtifacts:
@@ -244,82 +395,33 @@ def analyze_prospectus(
         raise ValueError("prospectus SHA-256 does not match company metadata")
     source_file = _portable_path(pdf_path, project_root)
 
-    pages: list[dict[str, Any]] = []
-    tables: list[dict[str, Any]] = []
-    chunks: list[DocumentChunk] = []
-    parse_started = _now()
-    with fitz.open(pdf_path) as source_document:
-        total_pages = source_document.page_count
-    _emit_progress(progress_callback, "parsing_started", "开始解析PDF页面与坐标。")
-    parsed_pages = parse_document(
-        pdf_path,
-        min_chars=min_text_chars_before_ocr,
-    )
-    for page_number, page_result in enumerate(parsed_pages, start=1):
-        pages.append(
-            _page_record(
-                page_result,
-                company_id=company_id,
-                document_id=document_id,
-                source_hash=source_hash,
-            )
-        )
-        tables.extend(
-            {
-                **asdict(table),
-                "company_id": company_id,
-                "document_id": document_id,
-                "source_hash": source_hash,
-            }
-            for table in page_result.tables
-        )
-        chunks.extend(
-            build_page_chunks(
-                page_result,
-                company_id=company_id,
-                document_id=document_id,
-                source_file=source_file,
-                source_hash=source_hash,
-                available_at=available_at,
-            )
-        )
-        if (
-            page_number == 1
-            or page_number % 10 == 0
-            or page_number == total_pages
-        ):
-            _emit_progress(
-                progress_callback,
-                "parsing_progress",
-                (
-                    f"[{page_number}/{total_pages}] 已解析PDF第{page_number}页，"
-                    "正在构建文本、坐标与视觉区域索引。"
-                ),
-            )
-    parse_ended = _now()
-    if not chunks:
-        raise RuntimeError("prospectus parsing produced no searchable chunks")
-    visual_region_count = sum(
-        len(page.get("visual_regions", [])) for page in pages
-    )
-
-    document_paths = DocumentPaths.build(
-        interim_root=interim_root,
-        artifacts_root=artifacts_root,
+    prepared = _prepare_prospectus_source(
+        pdf_path=pdf_path,
+        company_id=company_id,
         company_folder=company_folder,
         document_id=document_id,
+        source_file=source_file,
+        source_hash=source_hash,
+        available_at=available_at,
+        interim_root=interim_root,
+        artifacts_root=artifacts_root,
+        min_text_chars_before_ocr=min_text_chars_before_ocr,
+        progress_callback=progress_callback,
     )
-    write_jsonl(pages, document_paths.pages_path)
-    write_jsonl(tables, document_paths.tables_path)
-    write_jsonl(
-        [chunk.model_dump(mode="json") for chunk in chunks],
-        document_paths.chunks_path,
-    )
+    pages = list(prepared.pages)
+    tables = list(prepared.tables)
+    chunks = list(prepared.chunks)
+    parse_started = prepared.started_at
+    parse_ended = prepared.ended_at
+    visual_region_count = sum(len(page.get("visual_regions", [])) for page in pages)
+
+    document_paths = prepared.paths
     _emit_progress(
         progress_callback,
         "parsing_completed",
         (
-            f"PDF解析完成：{len(pages)}页，{len(chunks)}个文本切片，"
+            f"{'解析缓存复用' if prepared.cache_hit else 'PDF解析完成'}："
+            f"{len(pages)}页，{len(chunks)}个文本切片，"
             f"结构化{len(tables)}张表格，并识别{visual_region_count}个"
             "表格/图片/流程图候选。"
         ),
@@ -341,6 +443,7 @@ def analyze_prospectus(
                 "structured_table_count": len(tables),
                 "visual_region_count": visual_region_count,
                 "visual_detection_mode": "local_geometry_first",
+                "cache_hit": prepared.cache_hit,
             },
             status=ToolCallStatus.SUCCEEDED,
         )
@@ -373,78 +476,73 @@ def analyze_prospectus(
         else None
     )
     semantic_retriever: (
-        SemanticRetriever | ChromaRetriever | _DeferredSemanticRetriever | None
+        SemanticRetriever
+        | PgVectorRetriever
+        | _DeferredSemanticRetriever
+        | None
     ) = None
-    vector_persistence_task: ChromaPersistenceTask | None = None
     vector_executor: ThreadPoolExecutor | None = None
-    vector_future: Future[
-        tuple[
-            SemanticRetriever | ChromaRetriever | None,
-            ChromaPersistenceTask | None,
-        ]
-    ] | None = None
+    vector_future: Future[SemanticRetriever | PgVectorRetriever | None] | None = None
     if embedding_provider is not None:
-        def build_semantic_index() -> tuple[
-            SemanticRetriever | ChromaRetriever | None,
-            ChromaPersistenceTask | None,
-        ]:
+
+        def build_semantic_index() -> SemanticRetriever | PgVectorRetriever | None:
             _emit_progress(
                 progress_callback,
                 "embedding_started",
                 f"后台正在建立语义索引：{len(chunks)}个招股书切片。",
             )
-            persistence_task: ChromaPersistenceTask | None = None
             try:
-                if vector_store_backend == "chroma":
-                    if chroma_persist_dir is None:
-                        raise ValueError("chroma_persist_dir is required for Chroma")
-                    chroma = ChromaRetriever(
+                if vector_store_backend == "pgvector":
+                    if not postgres_dsn:
+                        raise ValueError("postgres_dsn is required for pgvector")
+                    pgvector = PgVectorRetriever(
                         embedding_provider,
-                        persist_dir=chroma_persist_dir,
-                        collection_name=chroma_collection,
+                        dsn=postgres_dsn,
+                        schema=postgres_schema,
+                        connect_timeout_seconds=postgres_connect_timeout_seconds,
                     )
-                    added = chroma.add_chunks(chunks, skip_existing_document=True)
-                    retriever: SemanticRetriever | ChromaRetriever = chroma
+                    if pgvector.activate_document(
+                        document_id,
+                        source_hash=source_hash,
+                        expected_chunk_count=len(chunks),
+                    ):
+                        added = 0
+                    else:
+                        memory_retriever = SemanticRetriever(
+                            chunks,
+                            embedding_provider,
+                            cache_dir=embedding_cache_dir,
+                        )
+                        added = pgvector.add_chunks(
+                            chunks,
+                            skip_existing_document=False,
+                            precomputed_embeddings=memory_retriever.document_vectors,
+                            company_name=company_name,
+                        )
+                    retriever = pgvector
+                    action = "复用完整文档" if added == 0 else f"新增{added}条向量"
                     _emit_progress(
                         progress_callback,
                         "vector_store_indexed",
-                        f"ChromaDB索引就绪：新增{added}条，总计{chroma.count}条。",
+                        f"pgvector索引就绪：{action}。",
                     )
-                elif vector_store_backend in {"numpy", "hybrid"}:
+                elif vector_store_backend == "numpy":
                     memory_retriever = SemanticRetriever(
                         chunks,
                         embedding_provider,
                         cache_dir=embedding_cache_dir,
                     )
                     retriever = memory_retriever
-                    if vector_store_backend == "hybrid":
-                        if chroma_persist_dir is None:
-                            raise ValueError(
-                                "chroma_persist_dir is required for hybrid vector storage"
-                            )
-                        persistence_task = ChromaPersistenceTask(
-                            chunks=chunks,
-                            document_vectors=memory_retriever.document_vectors,
-                            provider=embedding_provider,
-                            persist_dir=chroma_persist_dir,
-                            collection_name=chroma_collection,
-                            writer_factory=chroma_writer_factory,
-                            status_callback=vector_persistence_status_callback,
-                            progress_callback=progress_callback,
-                        )
                 else:
-                    raise ValueError("vector_store_backend must be numpy, chroma, or hybrid")
+                    raise ValueError(
+                        "vector_store_backend must be numpy or pgvector"
+                    )
                 _emit_progress(
                     progress_callback,
                     "embedding_completed",
-                    (
-                        f"后台语义索引已就绪：{len(chunks)}条，"
-                        f"{embedding_provider.dimensions}维。"
-                    ),
+                    (f"后台语义索引已就绪：{len(chunks)}条，{embedding_provider.dimensions}维。"),
                 )
-                if persistence_task is not None:
-                    persistence_task.start()
-                return retriever, persistence_task
+                return retriever
             except Exception as exc:  # noqa: BLE001
                 _logger.warning("语义索引不可用，降级到BM25: %s", exc, exc_info=True)
                 _emit_progress(
@@ -452,7 +550,7 @@ def analyze_prospectus(
                     "embedding_fallback",
                     f"语义索引失败，已降级到关键词检索：{exc}",
                 )
-                return None, None
+                return None
 
         vector_executor = ThreadPoolExecutor(
             max_workers=1,
@@ -520,7 +618,7 @@ def analyze_prospectus(
             progress_callback=progress_callback,
         )
         if vector_future is not None:
-            _retriever, vector_persistence_task = vector_future.result()
+            vector_future.result()
     finally:
         if vector_executor is not None:
             vector_executor.shutdown(wait=True)
@@ -529,9 +627,7 @@ def analyze_prospectus(
     supported_decision_count = sum(
         decision.analysis.supported for decision in multi_agent_result.decisions
     )
-    unresolved_decision_count = (
-        len(multi_agent_result.decisions) - supported_decision_count
-    )
+    unresolved_decision_count = len(multi_agent_result.decisions) - supported_decision_count
     _emit_progress(
         progress_callback,
         "agents_completed",
@@ -683,8 +779,7 @@ def analyze_prospectus(
                 chunk.chunk_id: chunk for chunk in decision.selected.selected_chunks
             }
             selected_chunks = tuple(
-                selected_chunk_by_id[chunk_id]
-                for chunk_id in final_analysis.evidence_chunk_ids
+                selected_chunk_by_id[chunk_id] for chunk_id in final_analysis.evidence_chunk_ids
             )
             finding_claim = final_analysis.claim
             finding_uncertainty = final_analysis.uncertainty
@@ -713,8 +808,7 @@ def analyze_prospectus(
                 continue
             finding_claim = rule.claim
             finding_uncertainty = (
-                f"专业Agent状态：{decision.specialist_status.value}。"
-                f"{final_analysis.uncertainty}"
+                f"专业Agent状态：{decision.specialist_status.value}。{final_analysis.uncertainty}"
             ).strip()
 
         finding_evidence_ids: list[str] = []
@@ -763,11 +857,7 @@ def analyze_prospectus(
                     evidence_type=(
                         EvidenceType.TABLE
                         if chunk.chunk_kind == "table"
-                        else (
-                            EvidenceType.OCR_TEXT
-                            if chunk.is_ocr
-                            else EvidenceType.TEXT
-                        )
+                        else (EvidenceType.OCR_TEXT if chunk.is_ocr else EvidenceType.TEXT)
                     ),
                     extractor=AgentRole.DOCUMENT_PARSER,
                     confidence=0.82 if chunk.is_ocr else 0.97,
@@ -816,6 +906,7 @@ def analyze_prospectus(
                 created_by=rule.owner,
                 calculation=calculation,
                 uncertainty=finding_uncertainty,
+                specialist_status=decision.specialist_status.value,
             )
         )
 
@@ -956,6 +1047,8 @@ def analyze_prospectus(
         )
         if all(path.is_file() for path in required_index_files):
             embedding_dir = candidate_embedding_dir
+    if isinstance(semantic_retriever, _DeferredSemanticRetriever):
+        semantic_retriever.close()
     return AnalysisArtifacts(
         report=report,
         report_path=document_paths.report_path,
@@ -964,12 +1057,7 @@ def analyze_prospectus(
         tables_path=document_paths.tables_path,
         embedding_dir=embedding_dir,
         prelisting_features_path=prelisting_features_path,
-        vector_persistence_task=vector_persistence_task,
-        model_usage=(
-            model_usage_ledger.snapshot()
-            if model_usage_ledger is not None
-            else None
-        ),
+        model_usage=(model_usage_ledger.snapshot() if model_usage_ledger is not None else None),
     )
 
 
@@ -1029,54 +1117,14 @@ def analyze_company(
             model_name=config.embedding.model_name,
             dimensions=config.embedding.dimensions,
             batch_size=config.embedding.batch_size,
-            max_retries=config.agents.max_retries,
-            retry_initial_seconds=config.agents.retry_initial_seconds,
-            retry_backoff_factor=config.agents.retry_backoff_factor,
-            retry_max_seconds=config.agents.retry_max_seconds,
+            request_concurrency=config.embedding.request_concurrency,
+            timeout_seconds=config.embedding.timeout_seconds,
+            max_retries=config.embedding.max_retries,
+            retry_initial_seconds=config.embedding.retry_initial_seconds,
+            retry_backoff_factor=config.embedding.retry_backoff_factor,
+            retry_max_seconds=config.embedding.retry_max_seconds,
             progress_callback=embedding_progress,
         )
-
-    vector_persistence_status_callback: Callable[[PersistenceSnapshot], None] | None = None
-    if embedding_provider is not None and config.vector_store.backend == "hybrid":
-        index_suffix = sha256(
-            f"{embedding_provider.model_name}:{embedding_provider.dimensions}".encode()
-        ).hexdigest()[:12]
-        vector_index_id = f"VI-{document.document_id}-{index_suffix}"
-        vector_cache_dir = DocumentPaths.build(
-            interim_root=root / config.paths.interim_dir,
-            artifacts_root=root / config.paths.artifacts_dir,
-            company_folder=company_folder,
-            document_id=document.document_id,
-        ).embedding_dir(embedding_provider.model_name)
-
-        def vector_persistence_status_callback(
-            snapshot: PersistenceSnapshot,
-        ) -> None:
-            repository.upsert_vector_index(
-                VectorIndexRecord(
-                    index_id=vector_index_id,
-                    document_id=document.document_id,
-                    source_hash=document.source_hash,
-                    embedding_provider=config.embedding.provider,
-                    embedding_model=embedding_provider.model_name,
-                    dimensions=embedding_provider.dimensions,
-                    chunk_count=snapshot.chunk_count,
-                    vectors_path=_portable_path(
-                        vector_cache_dir / "vectors.npy",
-                        root,
-                    ),
-                    metadata_path=_portable_path(
-                        vector_cache_dir / "metadata.json",
-                        root,
-                    ),
-                    manifest_path=_portable_path(
-                        vector_cache_dir / "manifest.json",
-                        root,
-                    ),
-                    status=snapshot.status,
-                    created_at=_now(),
-                )
-            )
 
     evidence_analyzer: EvidenceAnalyzer | None = None
     specialist_analyzer: SpecialistBatchAnalyzer | None = None
@@ -1109,28 +1157,24 @@ def analyze_company(
             base_url=config.llm.base_url,
             model_name=config.llm.model_name,
             provider_name=config.llm.provider,
-            request_extra_body=(
-                None if config.llm.disable_thinking else {}
-            ),
+            request_extra_body=(None if config.llm.disable_thinking else {}),
             supports_json_object=config.llm.supports_json_object,
             reasoning_effort=config.llm.reasoning_effort,
             usage_ledger=model_usage_ledger,
             pricing=ModelPricing(
                 input_per_million_rmb=config.llm.input_price_per_million_rmb,
                 output_per_million_rmb=config.llm.output_price_per_million_rmb,
-                cached_input_per_million_rmb=(
-                    config.llm.cached_input_price_per_million_rmb
-                ),
+                cached_input_per_million_rmb=(config.llm.cached_input_price_per_million_rmb),
             ),
         )
         # 风险发现由主 DeepSeek 模型分批扫描，四个专业角色再各用一次
         # specialist_llm 长上下文模型核验。
         specialist_config = (
             config.specialist_llm
-            if config.specialist_llm is not None
-            and config.specialist_llm.is_configured
+            if config.specialist_llm is not None and config.specialist_llm.is_configured
             else config.llm
         )
+
         def build_specialist_provider(
             role: AgentRole,
         ) -> OpenAICompatibleJsonChatProvider:
@@ -1146,29 +1190,22 @@ def analyze_company(
                 base_url=specialist_config.base_url,
                 model_name=specialist_config.model_name,
                 provider_name=specialist_config.provider,
-                request_extra_body=(
-                    None if specialist_config.disable_thinking else {}
-                ),
+                request_extra_body=(None if specialist_config.disable_thinking else {}),
                 supports_json_object=specialist_config.supports_json_object,
                 reasoning_effort=specialist_config.reasoning_effort,
                 reasoning_progress_callback=(
-                    report_reasoning_started
-                    if progress_callback is not None
-                    else None
+                    report_reasoning_started if progress_callback is not None else None
                 ),
                 usage_ledger=model_usage_ledger,
                 pricing=ModelPricing(
-                    input_per_million_rmb=(
-                        specialist_config.input_price_per_million_rmb
-                    ),
-                    output_per_million_rmb=(
-                        specialist_config.output_price_per_million_rmb
-                    ),
+                    input_per_million_rmb=(specialist_config.input_price_per_million_rmb),
+                    output_per_million_rmb=(specialist_config.output_price_per_million_rmb),
                     cached_input_per_million_rmb=(
                         specialist_config.cached_input_price_per_million_rmb
                     ),
                 ),
             )
+
         specialist_providers = {
             role: build_specialist_provider(role)
             for role in (
@@ -1241,10 +1278,7 @@ def analyze_company(
                     root / "prompts" / "discovery" / "risk_consolidation_v3.md"
                 ).read_text(encoding="utf-8"),
                 retrieval_planning_system_prompt=(
-                    root
-                    / "prompts"
-                    / "discovery"
-                    / "vector_query_planning_v2.md"
+                    root / "prompts" / "discovery" / "vector_query_planning_v2.md"
                 ).read_text(encoding="utf-8"),
                 prompt_version="document-first-risk-discovery-v6",
                 progress_callback=progress_callback,
@@ -1259,22 +1293,12 @@ def analyze_company(
                 wave_size=config.agents.discovery_wave_size,
                 max_batch_passes=config.agents.discovery_max_batch_passes,
                 consolidation_batch_size=(config.agents.consolidation_batch_size),
-                retrieval_query_count=(
-                    config.agents.discovery_retrieval_query_count
-                ),
+                retrieval_query_count=(config.agents.discovery_retrieval_query_count),
                 retrieval_top_k=config.agents.discovery_retrieval_top_k,
-                retrieval_lexical_top_k=(
-                    config.agents.discovery_retrieval_lexical_top_k
-                ),
-                retrieval_neighbor_radius=(
-                    config.agents.discovery_retrieval_neighbor_radius
-                ),
-                retrieval_coverage_sections=(
-                    config.agents.discovery_coverage_sections
-                ),
-                retrieval_max_selected_chunks=(
-                    config.agents.discovery_max_selected_chunks
-                ),
+                retrieval_lexical_top_k=(config.agents.discovery_retrieval_lexical_top_k),
+                retrieval_neighbor_radius=(config.agents.discovery_retrieval_neighbor_radius),
+                retrieval_coverage_sections=(config.agents.discovery_coverage_sections),
+                retrieval_max_selected_chunks=(config.agents.discovery_max_selected_chunks),
             )
 
     artifacts = analyze_prospectus(
@@ -1304,8 +1328,15 @@ def analyze_company(
         risk_scope_review_controller=risk_scope_review_controller,
         decision_conflict_batch_size=config.agents.decision_conflict_batch_size,
         vector_store_backend=config.vector_store.backend,
-        chroma_persist_dir=root / config.vector_store.chroma_persist_dir,
-        chroma_collection=config.vector_store.chroma_collection,
+        postgres_dsn=(
+            config.vector_store.require_postgres_dsn()
+            if config.vector_store.backend == "pgvector"
+            else None
+        ),
+        postgres_schema=config.vector_store.postgres_schema,
+        postgres_connect_timeout_seconds=(
+            config.vector_store.postgres_connect_timeout_seconds
+        ),
         lexical_top_k=config.retrieval.lexical_top_k,
         semantic_top_k=config.retrieval.semantic_top_k,
         rerank_top_k=config.retrieval.rerank_top_k,
@@ -1313,7 +1344,6 @@ def analyze_company(
         retry_initial_seconds=config.agents.retry_initial_seconds,
         retry_backoff_factor=config.agents.retry_backoff_factor,
         retry_max_seconds=config.agents.retry_max_seconds,
-        vector_persistence_status_callback=(vector_persistence_status_callback),
         progress_callback=progress_callback,
         model_usage_ledger=model_usage_ledger,
     )
@@ -1324,7 +1354,6 @@ def analyze_company(
     if (
         embedding_provider is not None
         and artifacts.embedding_dir is not None
-        and config.vector_store.backend != "hybrid"
     ):
         index_suffix = sha256(
             f"{embedding_provider.model_name}:{embedding_provider.dimensions}".encode()
@@ -1357,9 +1386,135 @@ def analyze_company(
     return artifacts
 
 
+@dataclass(frozen=True)
+class CompanyPreparationResult:
+    """批量队列在正式Agent分析前完成的可复用预处理摘要。"""
+
+    company_folder: str
+    document_id: str
+    page_count: int
+    chunk_count: int
+    embedding_ready: bool
+    embedding_cache_hit: bool
+    parser_cache_hit: bool
+
+
+def prepare_company_semantic_index(
+    company_folder: str,
+    *,
+    project_root: Path | None = None,
+    request_concurrency: int | None = None,
+    embedding_provider: OpenAICompatibleEmbeddingProvider | None = None,
+    progress_callback: ProgressCallback | None = None,
+) -> CompanyPreparationResult:
+    """只解析并向量化一家公司，不调用风险或专业Agent。"""
+    config = load_config()
+    root = (project_root or config.project_root).resolve()
+    repository = CatalogRepository(root / config.paths.database)
+    ingestion = register_company_sources(
+        company_folder,
+        project_root=root,
+        repository=repository,
+    )
+    prospectuses = [
+        item
+        for item in ingestion.documents
+        if item.document_type == "prospectus" and item.media_type == "application/pdf"
+    ]
+    if not prospectuses:
+        raise RuntimeError(f"no registered prospectus PDF for {company_folder}")
+    document = max(
+        prospectuses,
+        key=lambda item: (item.available_at, item.document_date, item.document_id),
+    )
+    pdf_path = root / document.local_file
+    source_hash = sha256_file(pdf_path)
+    if source_hash != document.source_hash.lower():
+        raise ValueError("prospectus SHA-256 does not match company metadata")
+    prepared = _prepare_prospectus_source(
+        pdf_path=pdf_path,
+        company_id=ingestion.company.company_id,
+        company_folder=company_folder,
+        document_id=document.document_id,
+        source_file=_portable_path(pdf_path, root),
+        source_hash=source_hash,
+        available_at=document.available_at,
+        interim_root=root / config.paths.interim_dir,
+        artifacts_root=root / config.paths.artifacts_dir,
+        min_text_chars_before_ocr=config.parser.min_text_chars_before_ocr,
+        progress_callback=progress_callback,
+    )
+    embedding_ready = False
+    embedding_cache_hit = False
+    if config.embedding.is_configured:
+        provider = (
+            embedding_provider
+            if embedding_provider is not None
+            else OpenAICompatibleEmbeddingProvider(
+                api_key=config.embedding.require_api_key(),
+                base_url=config.embedding.base_url,
+                model_name=config.embedding.model_name,
+                dimensions=config.embedding.dimensions,
+                batch_size=config.embedding.batch_size,
+                request_concurrency=(
+                    request_concurrency
+                    if request_concurrency is not None
+                    else config.embedding.request_concurrency
+                ),
+                timeout_seconds=config.embedding.timeout_seconds,
+                max_retries=config.embedding.max_retries,
+                retry_initial_seconds=config.embedding.retry_initial_seconds,
+                retry_backoff_factor=config.embedding.retry_backoff_factor,
+                retry_max_seconds=config.embedding.retry_max_seconds,
+                progress_callback=(
+                    (
+                        lambda completed, total: _emit_progress(
+                            progress_callback,
+                            "embedding_progress",
+                            (
+                                f"预向量化 [{completed}/{total}] · "
+                                f"{round(completed / total * 100) if total else 100}%"
+                            ),
+                        )
+                    )
+                    if progress_callback is not None
+                    else None
+                ),
+            )
+        )
+        _emit_progress(
+            progress_callback,
+            "embedding_started",
+            f"开始预向量化{len(prepared.chunks)}个招股书切片。",
+        )
+        SemanticRetriever(
+            list(prepared.chunks),
+            provider,
+            cache_dir=prepared.paths.embedding_dir(provider.model_name),
+        )
+        embedding_cache_hit = provider.request_count == 0
+        embedding_ready = True
+        _emit_progress(
+            progress_callback,
+            "embedding_completed",
+            f"预向量化完成：{len(prepared.chunks)}条。",
+        )
+    return CompanyPreparationResult(
+        company_folder=company_folder,
+        document_id=document.document_id,
+        page_count=len(prepared.pages),
+        chunk_count=len(prepared.chunks),
+        embedding_ready=embedding_ready,
+        embedding_cache_hit=embedding_cache_hit,
+        parser_cache_hit=prepared.cache_hit,
+    )
+
+
 __all__ = [
     "AnalysisArtifacts",
+    "CompanyPreparationResult",
     "ProgressCallback",
     "analyze_company",
     "analyze_prospectus",
+    "prepare_company_semantic_index",
 ]

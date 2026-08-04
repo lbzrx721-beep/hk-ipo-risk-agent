@@ -13,6 +13,13 @@ venv/
 build/
 dist/
 
+# Node frontend
+node_modules/
+.playwright-cli/
+frontend/*.tsbuildinfo
+frontend/vite.config.js
+frontend/vite.config.d.ts
+
 # Secrets and local settings
 .env
 configs/providers.local.yaml
@@ -52,6 +59,7 @@ output/
 
 # Local repair and recoverable workspace files
 .codex-repair/
+.codex-remote-attachments/
 .trash/
 .npmrc
 

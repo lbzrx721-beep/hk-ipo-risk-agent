@@ -84,19 +84,21 @@ def build_page_chunks(
     )
 
     chunks: list[DocumentChunk] = []
-    table_bboxes = tuple(table.bbox for table in page_result.tables)
+    table_bboxes = tuple(table.bbox for table in page_result.tables if _is_valid_bbox(table.bbox))
     for paragraph_index, paragraph in enumerate(paragraphs, start=1):
         text = paragraph.text.strip()
-        if not text or any(
-            _intersection_ratio(paragraph.bbox, table_bbox) >= 0.55
-            for table_bbox in table_bboxes
+        if (
+            not text
+            or not _is_valid_bbox(paragraph.bbox)
+            or any(
+                _intersection_ratio(paragraph.bbox, table_bbox) >= 0.55
+                for table_bbox in table_bboxes
+            )
         ):
             continue
         chunks.append(
             DocumentChunk(
-                chunk_id=(
-                    f"C-{company_id}-{page_result.page:04d}-{paragraph_index:03d}"
-                ),
+                chunk_id=(f"C-{company_id}-{page_result.page:04d}-{paragraph_index:03d}"),
                 company_id=company_id,
                 document_id=document_id,
                 source_file=source_file,
@@ -112,14 +114,12 @@ def build_page_chunks(
             )
         )
     for table_index, table in enumerate(page_result.tables, start=1):
+        if not _is_valid_bbox(table.bbox):
+            continue
         row_groups = _table_row_groups(table.rows)
         for group_index, row_indexes in enumerate(row_groups, start=1):
             grouped_rows = tuple(table.rows[index] for index in row_indexes)
-            grouped_cells = tuple(
-                cell
-                for cell in table.cells
-                if cell.row - 1 in row_indexes
-            )
+            grouped_cells = tuple(cell for cell in table.cells if cell.row - 1 in row_indexes)
             chunks.append(
                 DocumentChunk(
                     chunk_id=(
@@ -156,6 +156,11 @@ def build_page_chunks(
                 )
             )
     return chunks
+
+
+def _is_valid_bbox(bbox: tuple[float, float, float, float]) -> bool:
+    x0, y0, x1, y1 = bbox
+    return x0 >= 0 and y0 >= 0 and x1 > x0 and y1 > y0
 
 
 def _table_row_groups(
@@ -215,10 +220,9 @@ def _table_chunk_text(
     lines.append("逐行语义:")
     for row in rows:
         lines.append(
-            "- " + "；".join(
-                f"{header}={value}"
-                for header, value in zip(headers, row, strict=True)
-                if value
+            "- "
+            + "；".join(
+                f"{header}={value}" for header, value in zip(headers, row, strict=True) if value
             )
         )
     if footnotes:

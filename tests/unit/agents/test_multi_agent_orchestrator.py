@@ -302,6 +302,47 @@ def test_search_planning_falls_back_to_fixed_retrieval_and_audits_reason() -> No
     assert search_call.output["fallback_error"] == "temporary malformed search plan"
 
 
+def test_search_planning_fallback_keeps_existing_open_risk_queries() -> None:
+    chunks = [
+        _chunk("C-OPEN", "dynamic business risk remains material"),
+        _chunk("C-KNOWN", "cash burn remains material"),
+    ]
+    rules = [
+        _rule("open_dynamic_business_risk", AgentRole.FINANCE, "dynamic business risk"),
+        _rule("cash_burn", AgentRole.FINANCE, "cash burn"),
+    ]
+    planner = FlakyFinanceSearchPlanner(failures=99)
+    engine = GroundedAnalysisEngine(
+        chunks,
+        rules,
+        evidence_analyzer=OwnerAwareAnalyzer(),
+    )
+
+    result = MultiAgentOrchestrator(
+        engine,
+        rules,
+        search_planner=planner,
+        search_retry_policy=RetryPolicy(
+            max_retries=1,
+            initial_seconds=0,
+            retry_if=retry_model_node_error,
+        ),
+    ).run(run_id="RUN-OPEN-FALLBACK", source_ref="prospectus.pdf")
+
+    search_call = next(
+        trace for trace in result.traces if trace.agent is AgentRole.FINANCE
+    ).tool_calls[0]
+    assert search_call.output["mode"] == "fixed_query_fallback"
+    assert search_call.output["queries_by_risk"] == {
+        "open_dynamic_business_risk": ["dynamic business risk"]
+    }
+    assert search_call.output["repair_errors"] == ["temporary malformed search plan"]
+    assert {proposal.analyzed_risk.rule.id for proposal in result.proposals} == {
+        "open_dynamic_business_risk",
+        "cash_burn",
+    }
+
+
 def test_orchestrator_dispatches_rules_to_role_agents_with_parent_child_traces() -> None:
     chunks = [
         _chunk("C-FIN", "cash burn remains material"),
@@ -1075,7 +1116,7 @@ def test_deepseek_decision_agent_streams_content_to_decision_channel() -> None:
 
     assert (
         "agent:decision:delta",
-        '{"decisions":[{"risk_type":"cash_burn"}]}',
+        '[[batch:1/1]]{"decisions":[{"risk_type":"cash_burn"}]}',
     ) in progress_events
     assert any(stage == "agent:decision:structured" for stage, _detail in progress_events)
 

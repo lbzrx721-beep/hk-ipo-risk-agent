@@ -6,6 +6,8 @@ from pathlib import Path
 import fitz
 
 from ipo_risk.parser.document_parser import parse_document
+from ipo_risk.parser.tables import _clean_borderless_value, extract_page_tables
+from ipo_risk.parser.visual import VisualRegion, VisualRegionKind
 from ipo_risk.retrieval.chunker import build_page_chunks
 
 
@@ -115,3 +117,72 @@ def test_borderless_table_restores_year_and_unit_hierarchy(tmp_path: Path) -> No
     )
     assert table.rows[0] == ("Revenue", "200", "100", "240", "100")
     assert table.rows[-1] == ("Operating cash flow", "(10)", "(5)", "24", "10")
+
+
+def test_aligned_text_false_positive_never_falls_back_to_find_tables() -> None:
+    class PageThatMustNotRunFindTables:
+        def find_tables(self, **_kwargs):
+            raise AssertionError("aligned text must not call PyMuPDF find_tables")
+
+    candidate = VisualRegion(
+        region_id="VR-0007-001",
+        page=7,
+        kind=VisualRegionKind.TABLE,
+        bbox=(70.0, 90.0, 520.0, 570.0),
+        confidence=0.72,
+        reasons=(
+            "aligned_text_columns",
+            "horizontal_lines=0",
+            "vertical_lines=0",
+        ),
+    )
+
+    tables = extract_page_tables(
+        PageThatMustNotRunFindTables(),  # type: ignore[arg-type]
+        page_num=7,
+        text_blocks=(),
+        visual_regions=(candidate,),
+    )
+
+    assert tables == []
+
+
+def test_long_table_of_contents_dotted_leader_is_cleaned_in_linear_time() -> None:
+    dotted_leader = "章節名稱 " + ". " * 2_000
+
+    assert _clean_borderless_value(dotted_leader) == "章節名稱"
+
+
+def test_timed_out_grid_table_is_marked_for_visual_followup() -> None:
+    class TimedOutExtractor:
+        def extract(self, **_kwargs):
+            return (), "table_extraction_timeout"
+
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    candidate = VisualRegion(
+        region_id="VR-0001-001",
+        page=1,
+        kind=VisualRegionKind.TABLE,
+        bbox=(70.0, 90.0, 520.0, 570.0),
+        confidence=0.9,
+        reasons=(
+            "aligned_grid_lines",
+            "horizontal_lines=8",
+            "vertical_lines=5",
+        ),
+    )
+    deferred: set[str] = set()
+
+    tables = extract_page_tables(
+        page,
+        page_num=1,
+        text_blocks=(),
+        visual_regions=(candidate,),
+        isolated_extractor=TimedOutExtractor(),  # type: ignore[arg-type]
+        deferred_region_ids=deferred,
+    )
+    document.close()
+
+    assert tables == []
+    assert deferred == {candidate.region_id}

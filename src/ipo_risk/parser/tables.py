@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass
+import multiprocessing
+from multiprocessing.pool import Pool
+from pathlib import Path
 from typing import Any, Sequence
 
 import fitz
@@ -32,6 +35,9 @@ _CURRENCIES = (
     ("美元", "USD"),
     ("USD", "USD"),
 )
+
+_TABLE_WORKER_DOCUMENT: fitz.Document | None = None
+_DEFAULT_TABLE_EXTRACTION_TIMEOUT_SECONDS = 8.0
 
 
 @dataclass(frozen=True)
@@ -67,12 +73,114 @@ class TableArtifact:
     requires_vision: bool = False
 
 
+def _initialize_table_worker(pdf_path: str) -> None:
+    """在隔离进程中只打开一次PDF，供逐页表格解析复用。"""
+    global _TABLE_WORKER_DOCUMENT
+    _TABLE_WORKER_DOCUMENT = fitz.open(pdf_path)
+
+
+def _extract_grid_candidate_in_worker(
+    page_index: int,
+    page_num: int,
+    candidate: VisualRegion,
+    text_blocks: Sequence[Any],
+    first_table_index: int,
+) -> tuple[TableArtifact, ...]:
+    document = _TABLE_WORKER_DOCUMENT
+    if document is None:
+        raise RuntimeError("isolated table worker did not open the PDF")
+    page = document.load_page(page_index)
+    return tuple(
+        _extract_grid_candidate(
+            page,
+            page_num=page_num,
+            candidate=candidate,
+            text_blocks=text_blocks,
+            first_table_index=first_table_index,
+        )
+    )
+
+
+class IsolatedTableExtractor:
+    """把可能卡死的PyMuPDF表格识别放进可终止的独立进程。"""
+
+    def __init__(
+        self,
+        pdf_path: Path,
+        *,
+        timeout_seconds: float = _DEFAULT_TABLE_EXTRACTION_TIMEOUT_SECONDS,
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("table extraction timeout must be positive")
+        self._pdf_path = pdf_path.resolve()
+        self._timeout_seconds = timeout_seconds
+        self._context = multiprocessing.get_context("spawn")
+        self._pool: Pool | None = None
+
+    def extract(
+        self,
+        *,
+        page_index: int,
+        page_num: int,
+        candidate: VisualRegion,
+        text_blocks: Sequence[Any],
+        first_table_index: int,
+    ) -> tuple[tuple[TableArtifact, ...], str | None]:
+        pool = self._ensure_pool()
+        pending = pool.apply_async(
+            _extract_grid_candidate_in_worker,
+            (
+                page_index,
+                page_num,
+                candidate,
+                tuple(text_blocks),
+                first_table_index,
+            ),
+        )
+        try:
+            return tuple(pending.get(timeout=self._timeout_seconds)), None
+        except multiprocessing.TimeoutError:
+            self._terminate_pool()
+            return (), "table_extraction_timeout"
+        except Exception:  # noqa: BLE001 - 单页失败必须降级，不能中断全文解析
+            self._terminate_pool()
+            return (), "table_extraction_failed"
+
+    def close(self) -> None:
+        pool = self._pool
+        self._pool = None
+        if pool is None:
+            return
+        pool.close()
+        pool.join()
+
+    def _ensure_pool(self) -> Pool:
+        if self._pool is None:
+            self._pool = self._context.Pool(
+                processes=1,
+                initializer=_initialize_table_worker,
+                initargs=(str(self._pdf_path),),
+                maxtasksperchild=200,
+            )
+        return self._pool
+
+    def _terminate_pool(self) -> None:
+        pool = self._pool
+        self._pool = None
+        if pool is None:
+            return
+        pool.terminate()
+        pool.join()
+
+
 def extract_page_tables(
     page: fitz.Page,
     *,
     page_num: int,
     text_blocks: Sequence[Any],
     visual_regions: Sequence[VisualRegion],
+    isolated_extractor: IsolatedTableExtractor | None = None,
+    deferred_region_ids: set[str] | None = None,
 ) -> list[TableArtifact]:
     """只对本地识别出的表格候选做结构解析，避免逐页调用模型。"""
     candidates = [
@@ -83,6 +191,10 @@ def extract_page_tables(
     artifacts: list[TableArtifact] = []
     for candidate in candidates:
         if "aligned_text_columns" in candidate.reasons:
+            if _looks_like_table_of_contents(candidate, text_blocks):
+                # 招股书目录经常由“标题 + 点线 + 页码”组成，位置对齐后很像
+                # 无边框表格。它不是业务表格，跳过可避免无效解析和伪表格入库。
+                continue
             borderless = _extract_borderless_artifacts(
                 page_num=page_num,
                 first_table_index=len(artifacts) + 1,
@@ -91,30 +203,65 @@ def extract_page_tables(
             )
             if borderless:
                 artifacts.extend(borderless)
-                continue
-        strategy = (
-            "text"
-            if "aligned_text_columns" in candidate.reasons
-            else "lines"
-        )
-        clip = _expanded_clip(candidate.bbox, page.rect)
-        try:
-            finder = page.find_tables(clip=clip, strategy=strategy)
-        except Exception:
-            finder = None
-        tables = tuple(getattr(finder, "tables", ()) or ())
-        for table in tables:
-            artifact = _table_to_artifact(
-                table,
+            # 对齐文本候选已经由确定性解析器处理。若未形成有效表格，通常是目录、
+            # 点线页码等误报；不再回退到可能长时间卡住的 find_tables(text)。
+            continue
+
+        warning: str | None = None
+        if isolated_extractor is not None:
+            extracted, warning = isolated_extractor.extract(
+                page_index=page_num - 1,
                 page_num=page_num,
-                table_index=len(artifacts) + 1,
                 candidate=candidate,
                 text_blocks=text_blocks,
+                first_table_index=len(artifacts) + 1,
             )
-            if artifact is None:
+        else:
+            try:
+                extracted = tuple(
+                    _extract_grid_candidate(
+                        page,
+                        page_num=page_num,
+                        candidate=candidate,
+                        text_blocks=text_blocks,
+                        first_table_index=len(artifacts) + 1,
+                    )
+                )
+            except Exception:  # noqa: BLE001 - 保持直接调用兼容性
+                extracted = ()
+                warning = "table_extraction_failed"
+        if warning is not None and deferred_region_ids is not None:
+            deferred_region_ids.add(candidate.region_id)
+        for artifact in extracted:
+            if any(
+                _bbox_overlap(artifact.bbox, item.bbox) >= 0.85
+                for item in artifacts
+            ):
                 continue
-            if any(_bbox_overlap(artifact.bbox, item.bbox) >= 0.85 for item in artifacts):
-                continue
+            artifacts.append(artifact)
+    return artifacts
+
+
+def _extract_grid_candidate(
+    page: fitz.Page,
+    *,
+    page_num: int,
+    candidate: VisualRegion,
+    text_blocks: Sequence[Any],
+    first_table_index: int,
+) -> list[TableArtifact]:
+    clip = _expanded_clip(candidate.bbox, page.rect)
+    finder = page.find_tables(clip=clip, strategy="lines")
+    artifacts: list[TableArtifact] = []
+    for table in tuple(getattr(finder, "tables", ()) or ()):
+        artifact = _table_to_artifact(
+            table,
+            page_num=page_num,
+            table_index=first_table_index + len(artifacts),
+            candidate=candidate,
+            text_blocks=text_blocks,
+        )
+        if artifact is not None:
             artifacts.append(artifact)
     return artifacts
 
@@ -420,8 +567,43 @@ def _block_center_in_rect(block: Any, rect: fitz.Rect) -> bool:
 
 def _clean_borderless_value(value: object) -> str:
     text = _normalize_cell(value)
-    text = re.sub(r"(?:\s*\.\s*){2,}$", "", text).strip()
-    return text
+    # 不使用 ``(?:\s*\.\s*){2,}$``：面对目录页数百个“点 + 空格”时，
+    # 该表达式存在大量等价匹配路径，会产生灾难性回溯。下面的线性扫描
+    # 只剥离由空格和点组成、且至少含两个点的尾部。
+    trimmed = text.rstrip()
+    tail_start = len(trimmed)
+    while tail_start > 0 and trimmed[tail_start - 1] in ". ":
+        tail_start -= 1
+    dotted_tail = trimmed[tail_start:]
+    if dotted_tail.count(".") >= 2:
+        trimmed = trimmed[:tail_start].rstrip()
+    return trimmed
+
+
+def _looks_like_table_of_contents(
+    candidate: VisualRegion,
+    text_blocks: Sequence[Any],
+) -> bool:
+    """识别目录中的点线页码布局，避免把它当成无边框业务表格。"""
+    candidate_rect = fitz.Rect(candidate.bbox)
+    values = [
+        _normalize_cell(block.text)
+        for block in text_blocks
+        if _block_center_in_rect(block, candidate_rect)
+        and _normalize_cell(block.text)
+    ]
+    if len(values) < 6:
+        return False
+    dotted_lines = sum(
+        value.count(".") >= 8
+        and len(value.replace(".", "").replace(" ", "")) <= 20
+        for value in values
+    )
+    page_numbers = sum(
+        bool(re.fullmatch(r"(?:[IVXLCDM]+-)?\d{1,4}", value, re.IGNORECASE))
+        for value in values
+    )
+    return dotted_lines >= 2 and page_numbers >= 2
 
 
 def _table_to_artifact(

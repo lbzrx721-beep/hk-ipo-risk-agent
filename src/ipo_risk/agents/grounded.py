@@ -48,7 +48,7 @@ class EvidenceAnalyzer(Protocol):
 
 
 class SemanticSearcher(Protocol):
-    """语义检索器的最小接口，SemanticRetriever 和 ChromaRetriever 均满足。"""
+    """语义检索器的最小接口，NumPy与pgvector检索器均满足。"""
 
     def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
         """返回按余弦相似度降序排列的语义候选段落。"""
@@ -198,7 +198,7 @@ class GroundedAnalysisEngine:
         )
 
         if semantic_retriever is not None:
-            # 外部传入的语义检索器（如 ChromaRetriever）优先使用
+            # 外部传入的语义检索器（如 PgVectorRetriever）优先使用
             self._semantic = semantic_retriever
             self._hybrid = HybridRetriever(
                 self._lexical,

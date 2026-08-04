@@ -248,6 +248,12 @@ def test_vector_index_and_report_are_registered(tmp_path: Path) -> None:
     repository.save_analysis_report(report, report_path)
 
     assert repository.get_vector_index(vector_index.index_id) == vector_index
+    matching_runs = repository.list_analysis_runs_for_source_hash(
+        document.source_hash,
+        status="succeeded",
+    )
+    assert [run.run_id for run in matching_runs] == [report.run_id]
+    assert repository.list_analysis_runs_for_source_hash("f" * 64) == ()
     counts = repository.counts()
     assert counts.vector_indexes == 1
     assert counts.analysis_runs == 1

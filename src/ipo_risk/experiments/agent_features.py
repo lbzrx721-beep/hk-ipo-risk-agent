@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import (
+    FIRST_COMPLETED,
+    Future,
+    ThreadPoolExecutor,
+    as_completed,
+    wait,
+)
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -11,19 +18,26 @@ from pathlib import Path
 from threading import Lock
 from time import perf_counter
 import traceback
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 
+from ipo_risk.agents.intervention import RiskScopeReviewController
 from ipo_risk.config import AppConfig, load_config
 from ipo_risk.agents.usage import ModelBudgetExceededError
 from ipo_risk.modeling.features import build_agent_feature_snapshot
-from ipo_risk.pipeline import AnalysisArtifacts, analyze_company
+from ipo_risk.pipeline import (
+    AnalysisArtifacts,
+    analyze_company,
+    prepare_company_semantic_index,
+)
 from ipo_risk.reporting import RiskAnalysisReport
 from ipo_risk.storage.files import read_json, write_json
 
 
 Analyzer = Callable[..., AnalysisArtifacts]
+CompanyPreparer = Callable[..., object]
+PreparationProgress = Callable[[int, int, str, str], None]
 AGENT_FEATURE_SCHEMA_VERSION = 2
 
 
@@ -105,6 +119,243 @@ def select_pilot_companies(
     )
 
 
+def normalize_historical_agent_features(
+    project_root: Path | str,
+    *,
+    experiment_name: str = "agent_feature_history_normalized_v1",
+) -> AgentFeatureExperimentResult:
+    """把既有风险报告统一为最新版Agent特征，不重新调用模型。"""
+    root = Path(project_root).resolve()
+    experiment_dir = root / "artifacts" / "experiments" / experiment_name
+    company_dir = experiment_dir / "companies"
+    company_dir.mkdir(parents=True, exist_ok=True)
+    selection_path = experiment_dir / "selection.json"
+    status_path = experiment_dir / "status.json"
+    summary_path = experiment_dir / "summary.json"
+    agent_matrix_path = experiment_dir / "agent_feature_matrix.csv"
+
+    reports_by_company: dict[str, tuple[RiskAnalysisReport, Path]] = {}
+    report_root = root / "artifacts" / "analysis"
+    for report_path in sorted(report_root.rglob("risk_analysis.json")):
+        report = RiskAnalysisReport.model_validate(read_json(report_path))
+        company_id = report.company_id.zfill(5)
+        current = reports_by_company.get(company_id)
+        if current is None or report.generated_at > current[0].generated_at:
+            reports_by_company[company_id] = (report, report_path)
+    if not reports_by_company:
+        raise ValueError("no historical risk reports found")
+
+    base_path = (
+        root
+        / "data"
+        / "processed"
+        / "modeling"
+        / "prelisting_feature_matrix.csv"
+    )
+    if not base_path.is_file():
+        raise FileNotFoundError(f"missing prelisting feature matrix: {base_path}")
+    base = pd.read_csv(base_path, dtype={"company_id": str})
+    base["company_id"] = base["company_id"].astype(str).str.zfill(5)
+    base_by_id = {
+        str(row["company_id"]): row
+        for row in base.to_dict(orient="records")
+    }
+
+    existing_payloads: dict[str, dict[str, Any]] = {}
+    experiments_root = root / "artifacts" / "experiments"
+    for feature_path in sorted(experiments_root.glob("*/companies/*.json")):
+        if feature_path.parent == company_dir:
+            continue
+        payload = read_json(feature_path)
+        run_id = str(payload.get("run_id") or "")
+        if run_id:
+            existing_payloads[run_id] = payload
+
+    selected: list[dict[str, Any]] = []
+    status_companies: dict[str, dict[str, Any]] = {}
+    normalized_at = _now()
+    for company_id, (report, report_path) in sorted(reports_by_company.items()):
+        base_row = base_by_id.get(company_id)
+        if base_row is None:
+            raise ValueError(
+                f"historical report company is missing from feature matrix: {company_id}"
+            )
+        existing = existing_payloads.get(report.run_id, {})
+        company_folder = str(
+            existing.get("company_folder")
+            or report_path.parents[1].name
+        )
+        split = str(base_row.get("split") or existing.get("split") or "")
+        prospectus_date = str(
+            base_row.get("prospectus_date")
+            or report.source_document.available_at.isoformat()
+        )
+        row = {
+            "company_id": company_id,
+            "company_folder": company_folder,
+            "company_name": report.company_name,
+            "prospectus_date": prospectus_date,
+            "source_hash": report.source_document.source_hash,
+            "split": split,
+            "label_status": "complete",
+        }
+        selected.append(row)
+
+        snapshot = build_agent_feature_snapshot(
+            report,
+            as_of_date=report.source_document.available_at,
+        )
+        feature_path = company_dir / f"{company_id}.json"
+        payload = {
+            "schema_version": 1,
+            "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
+            "experiment_name": experiment_name,
+            **{key: row[key] for key in (
+                "company_id",
+                "company_folder",
+                "company_name",
+                "split",
+                "prospectus_date",
+                "source_hash",
+            )},
+            "run_id": report.run_id,
+            "started_at": existing.get("started_at"),
+            "ended_at": existing.get("ended_at") or report.generated_at.isoformat(),
+            "duration_seconds": existing.get("duration_seconds"),
+            "finding_count": report.summary.finding_count,
+            "evidence_count": report.summary.evidence_count,
+            "trace_count": len(report.agent_traces),
+            "report_path": _portable(report_path, root),
+            "embedding_dir": existing.get("embedding_dir"),
+            "features": {
+                name: feature.model_dump(mode="json")
+                for name, feature in sorted(snapshot.items())
+            },
+            "model_fingerprint": existing.get("model_fingerprint"),
+            "normalization": {
+                "normalized_at": normalized_at,
+                "source": "historical_risk_report",
+                "model_reinvoked": False,
+            },
+        }
+        write_json(payload, feature_path)
+        status_companies[company_folder] = {
+            "company_id": company_id,
+            "company_folder": company_folder,
+            "split": split,
+            "state": "completed",
+            "ended_at": payload["ended_at"],
+            "duration_seconds": payload["duration_seconds"],
+            "run_id": report.run_id,
+            "finding_count": report.summary.finding_count,
+            "evidence_count": report.summary.evidence_count,
+            "feature_path": _portable(feature_path, root),
+        }
+
+    selected.sort(
+        key=lambda row: (
+            str(row["split"]),
+            str(row["prospectus_date"]),
+            str(row["company_id"]),
+        )
+    )
+    normalization_fingerprint = {
+        "kind": "historical_report_normalization",
+        "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
+        "model_reinvoked": False,
+    }
+    write_json(
+        {
+            "schema_version": 1,
+            "created_at": normalized_at,
+            "selection_policy": "all_unique_historical_risk_reports",
+            "label_values_used_for_selection": False,
+            "model_fingerprint": normalization_fingerprint,
+            "companies": selected,
+        },
+        selection_path,
+    )
+    write_json(
+        {
+            "schema_version": 1,
+            "created_at": normalized_at,
+            "companies": status_companies,
+            "queue_state": "completed",
+            "pause_reason": None,
+            "normalization": normalization_fingerprint,
+        },
+        status_path,
+    )
+    augmented_matrix_path = _write_feature_matrices(
+        root,
+        company_dir=company_dir,
+        agent_matrix_path=agent_matrix_path,
+        selected=selected,
+    )
+    agent_matrix = pd.read_csv(agent_matrix_path, dtype={"company_id": str})
+    identity_columns = {
+        "company_id",
+        "company_folder",
+        "company_name",
+        "split",
+        "prospectus_date",
+        "run_id",
+        "duration_seconds",
+    }
+    feature_columns = sorted(
+        column for column in agent_matrix.columns if column not in identity_columns
+    )
+    split_counts = {
+        str(split): int(count)
+        for split, count in agent_matrix["split"].value_counts().sort_index().items()
+    }
+    summary = {
+        "schema_version": 1,
+        "experiment_name": experiment_name,
+        "updated_at": normalized_at,
+        "normalization_source": "historical_risk_reports",
+        "model_reinvoked": False,
+        "selected_count": len(selected),
+        "completed_count": len(selected),
+        "failed_count": 0,
+        "pending_count": 0,
+        "total_findings": sum(
+            report.summary.finding_count
+            for report, _path in reports_by_company.values()
+        ),
+        "total_evidences": sum(
+            report.summary.evidence_count
+            for report, _path in reports_by_company.values()
+        ),
+        "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
+        "agent_feature_count": len(feature_columns),
+        "agent_feature_columns": feature_columns,
+        "split_counts": split_counts,
+        "models": normalization_fingerprint,
+        "selection_path": _portable(selection_path, root),
+        "status_path": _portable(status_path, root),
+        "agent_feature_matrix_path": _portable(agent_matrix_path, root),
+        "augmented_feature_matrix_path": (
+            _portable(augmented_matrix_path, root)
+            if augmented_matrix_path is not None
+            else None
+        ),
+        "failed_companies": [],
+    }
+    write_json(summary, summary_path)
+    return AgentFeatureExperimentResult(
+        experiment_dir=experiment_dir,
+        selection_path=selection_path,
+        status_path=status_path,
+        summary_path=summary_path,
+        agent_feature_matrix_path=agent_matrix_path,
+        augmented_feature_matrix_path=augmented_matrix_path,
+        selected_count=len(selected),
+        completed_count=len(selected),
+        failed_count=0,
+    )
+
+
 def run_agent_feature_experiment(
     project_root: Path,
     *,
@@ -112,11 +363,19 @@ def run_agent_feature_experiment(
     sample_size: int = 20,
     splits: tuple[str, ...] = ("train", "validation"),
     company_folders: tuple[str, ...] = (),
+    company_rows: tuple[dict[str, Any], ...] = (),
     min_findings: int = 1,
     continue_on_error: bool = True,
+    pause_requested: Callable[[], bool] | None = None,
     analyzer: Analyzer = analyze_company,
+    preparer: CompanyPreparer | None = None,
+    preparation_progress: PreparationProgress | None = None,
+    risk_scope_review_controllers: (
+        Mapping[str, RiskScopeReviewController] | None
+    ) = None,
+    agent_company_concurrency: int | None = None,
 ) -> AgentFeatureExperimentResult:
-    """顺序运行Agent分析；每家公司完成后立即落盘，重复运行自动续跑。"""
+    """并行预处理文档并受控并行运行公司Agent；每家公司独立落盘。"""
     root = project_root.resolve()
     config = load_config()
     experiment_dir = root / "artifacts" / "experiments" / experiment_name
@@ -131,7 +390,11 @@ def run_agent_feature_experiment(
     manifest_path = (
         root / "data" / "processed" / "competition" / "company_manifest.jsonl"
     )
-    manifest_rows = _read_jsonl(manifest_path)
+    manifest_rows = (
+        [dict(row) for row in company_rows]
+        if company_rows
+        else _read_jsonl(manifest_path)
+    )
     fingerprint = _experiment_fingerprint(root, config)
     selected = _load_or_create_selection(
         selection_path,
@@ -144,20 +407,110 @@ def run_agent_feature_experiment(
     status = _load_status(status_path, selected)
     status["queue_state"] = "running"
     status["pause_reason"] = None
-    consecutive_failure_key: str | None = None
-    consecutive_failure_count = 0
+    status_lock = Lock()
 
     selected_by_folder = {
         str(row["company_folder"]): row for row in selected
     }
-    for company_folder, manifest_row in selected_by_folder.items():
+    effective_preparer = (
+        prepare_company_semantic_index
+        if preparer is None and analyzer is analyze_company
+        else preparer
+    )
+    if effective_preparer is not None:
+        pending_folders = [
+            company_folder
+            for company_folder in selected_by_folder
+            if status["companies"][company_folder].get("state") != "completed"
+        ]
+        if pending_folders:
+            worker_count = min(
+                config.embedding.document_concurrency,
+                (
+                    config.embedding.request_concurrency
+                    if config.embedding.is_configured
+                    else config.embedding.document_concurrency
+                ),
+                len(pending_folders),
+            )
+            per_document_request_concurrency = max(
+                1,
+                config.embedding.request_concurrency // worker_count,
+            )
+            status["preparation"] = {
+                "state": "running",
+                "completed": 0,
+                "total": len(pending_folders),
+                "document_concurrency": worker_count,
+                "request_concurrency_per_document": (
+                    per_document_request_concurrency
+                ),
+            }
+            write_json(status, status_path)
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="prospectus-preparation",
+            ) as executor:
+                futures = {}
+                for company_folder in pending_folders:
+                    company_id = str(
+                        selected_by_folder[company_folder]["company_id"]
+                    ).zfill(5)
+                    events = _EventLogger(event_dir / f"{company_id}.jsonl")
+                    current = status["companies"][company_folder]
+                    current["preparation_state"] = "running"
+                    futures[
+                        executor.submit(
+                            effective_preparer,
+                            company_folder,
+                            project_root=root,
+                            request_concurrency=(
+                                per_document_request_concurrency
+                            ),
+                            progress_callback=events,
+                        )
+                    ] = company_folder
+                write_json(status, status_path)
+                completed_preparations = 0
+                for future in as_completed(futures):
+                    company_folder = futures[future]
+                    current = status["companies"][company_folder]
+                    try:
+                        future.result()
+                        current["preparation_state"] = "completed"
+                        preparation_state = "completed"
+                    except Exception as exc:  # noqa: BLE001
+                        # 预处理失败不直接淘汰公司；正式分析仍会重试并可降级BM25。
+                        current["preparation_state"] = "failed"
+                        current["preparation_error"] = (
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        preparation_state = "failed"
+                    completed_preparations += 1
+                    status["preparation"]["completed"] = completed_preparations
+                    write_json(status, status_path)
+                    if preparation_progress is not None:
+                        preparation_progress(
+                            completed_preparations,
+                            len(pending_folders),
+                            company_folder,
+                            preparation_state,
+                        )
+            status["preparation"]["state"] = "completed"
+            write_json(status, status_path)
+
+    def analyze_one_company(
+        company_folder: str,
+        manifest_row: dict[str, Any],
+    ) -> tuple[str | None, bool]:
+        """执行一家公司的完整流水线，返回失败指纹与预算暂停标记。"""
         company_id = str(manifest_row["company_id"]).zfill(5)
         feature_path = company_dir / f"{company_id}.json"
         current = status["companies"][company_folder]
         if current.get("state") == "completed" and feature_path.is_file():
             payload = read_json(feature_path)
             if payload.get("feature_schema_version") == AGENT_FEATURE_SCHEMA_VERSION:
-                continue
+                return None, False
             report_path = root / str(payload["report_path"])
             report = RiskAnalysisReport.model_validate(read_json(report_path))
             feature_snapshot = build_agent_feature_snapshot(
@@ -170,29 +523,38 @@ def run_agent_feature_experiment(
                 for name, feature in sorted(feature_snapshot.items())
             }
             write_json(payload, feature_path)
-            continue
+            return None, False
 
         started_at = _now()
         started_clock = perf_counter()
-        current.update(
-            {
-                "state": "running",
-                "started_at": started_at,
-                "ended_at": None,
-                "error": None,
-            }
-        )
-        write_json(status, status_path)
-        events = _EventLogger(event_dir / f"{company_id}.jsonl")
-        try:
-            artifacts = analyzer(
-                company_folder,
-                project_root=root,
-                min_findings=min_findings,
-                progress_callback=events,
+        with status_lock:
+            current.update(
+                {
+                    "state": "running",
+                    "started_at": started_at,
+                    "ended_at": None,
+                    "error": None,
+                }
             )
-            if artifacts.vector_persistence_task is not None:
-                artifacts.vector_persistence_task.wait(timeout=300)
+            write_json(status, status_path)
+        events = _EventLogger(event_dir / f"{company_id}.jsonl")
+        controller = (
+            risk_scope_review_controllers.get(company_folder)
+            if risk_scope_review_controllers is not None
+            else None
+        )
+        review_wait_before = (
+            controller.wait_seconds() if controller is not None else 0.0
+        )
+        try:
+            analyzer_kwargs: dict[str, Any] = {
+                "project_root": root,
+                "min_findings": min_findings,
+                "progress_callback": events,
+            }
+            if controller is not None:
+                analyzer_kwargs["risk_scope_review_controller"] = controller
+            artifacts = analyzer(company_folder, **analyzer_kwargs)
             report = artifacts.report
             as_of_date = report.source_document.available_at
             feature_snapshot = build_agent_feature_snapshot(
@@ -200,7 +562,15 @@ def run_agent_feature_experiment(
                 as_of_date=as_of_date,
             )
             ended_at = _now()
-            duration_seconds = round(perf_counter() - started_clock, 3)
+            review_wait_seconds = (
+                max(0.0, controller.wait_seconds() - review_wait_before)
+                if controller is not None
+                else 0.0
+            )
+            duration_seconds = round(
+                max(0.0, perf_counter() - started_clock - review_wait_seconds),
+                3,
+            )
             payload = {
                 "schema_version": 1,
                 "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
@@ -231,53 +601,162 @@ def run_agent_feature_experiment(
                 "model_fingerprint": fingerprint,
             }
             write_json(payload, feature_path)
-            current.update(
-                {
-                    "state": "completed",
-                    "ended_at": ended_at,
-                    "duration_seconds": duration_seconds,
-                    "run_id": report.run_id,
-                    "finding_count": report.summary.finding_count,
-                    "evidence_count": report.summary.evidence_count,
-                    "feature_path": _portable(feature_path, root),
-                }
-            )
-            consecutive_failure_key = None
-            consecutive_failure_count = 0
+            with status_lock:
+                current.update(
+                    {
+                        "state": "completed",
+                        "ended_at": ended_at,
+                        "duration_seconds": duration_seconds,
+                        "run_id": report.run_id,
+                        "finding_count": report.summary.finding_count,
+                        "evidence_count": report.summary.evidence_count,
+                        "feature_path": _portable(feature_path, root),
+                    }
+                )
+                write_json(status, status_path)
+            return None, False
         except Exception as exc:  # noqa: BLE001 - 批量任务必须记录单公司失败后续跑
             ended_at = _now()
             budget_pause = isinstance(exc, ModelBudgetExceededError)
-            current.update(
-                {
-                    "state": "paused" if budget_pause else "failed",
-                    "ended_at": ended_at,
-                    "duration_seconds": round(perf_counter() - started_clock, 3),
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "traceback": traceback.format_exc(),
-                }
+            review_wait_seconds = (
+                max(0.0, controller.wait_seconds() - review_wait_before)
+                if controller is not None
+                else 0.0
             )
-            failure_key = f"{type(exc).__name__}:{str(exc).strip()[:300]}"
-            if failure_key == consecutive_failure_key:
-                consecutive_failure_count += 1
-            else:
-                consecutive_failure_key = failure_key
-                consecutive_failure_count = 1
-            circuit_open = budget_pause or consecutive_failure_count >= 2
-            if circuit_open:
-                status["queue_state"] = "paused"
-                status["pause_reason"] = (
-                    str(exc)
-                    if budget_pause
-                    else (
-                        "连续两家公司出现相同失败，队列已安全暂停："
-                        f"{failure_key}"
-                    )
+            with status_lock:
+                current.update(
+                    {
+                        "state": "paused" if budget_pause else "failed",
+                        "ended_at": ended_at,
+                        "duration_seconds": round(
+                            max(
+                                0.0,
+                                perf_counter()
+                                - started_clock
+                                - review_wait_seconds,
+                            ),
+                            3,
+                        ),
+                        "error": f"{type(exc).__name__}: {exc}",
+                        "traceback": traceback.format_exc(),
+                    }
                 )
-            write_json(status, status_path)
+                write_json(status, status_path)
+            failure_key = f"{type(exc).__name__}:{str(exc).strip()[:300]}"
             if not continue_on_error:
                 raise
-            if circuit_open:
-                break
+            return failure_key, budget_pause
+
+    pending_items = [
+        (company_folder, manifest_row)
+        for company_folder, manifest_row in selected_by_folder.items()
+    ]
+    requested_concurrency = (
+        agent_company_concurrency
+        if agent_company_concurrency is not None
+        else config.agents.company_concurrency
+    )
+    company_worker_count = min(
+        max(1, requested_concurrency),
+        max(1, len(pending_items)),
+    )
+    status["agent_execution"] = {
+        "state": "running",
+        "company_concurrency": company_worker_count,
+        "active": 0,
+    }
+    write_json(status, status_path)
+    failure_counts: dict[str, int] = {}
+    circuit_reason: str | None = None
+    next_item = 0
+    active_futures: dict[Future[tuple[str | None, bool]], str] = {}
+
+    def can_submit() -> bool:
+        return (
+            next_item < len(pending_items)
+            and circuit_reason is None
+            and not (pause_requested is not None and pause_requested())
+        )
+
+    with ThreadPoolExecutor(
+        max_workers=company_worker_count,
+        thread_name_prefix="company-agent",
+    ) as executor:
+        while len(active_futures) < company_worker_count and can_submit():
+            company_folder, manifest_row = pending_items[next_item]
+            next_item += 1
+            active_futures[
+                executor.submit(
+                    analyze_one_company,
+                    company_folder,
+                    manifest_row,
+                )
+            ] = company_folder
+        with status_lock:
+            status["agent_execution"]["active"] = len(active_futures)
+            write_json(status, status_path)
+
+        while active_futures:
+            completed_futures = cast(
+                set[Future[tuple[str | None, bool]]],
+                wait(
+                    active_futures,
+                    return_when=FIRST_COMPLETED,
+                ).done,
+            )
+            for company_future in completed_futures:
+                active_futures.pop(company_future)
+                failure_key, budget_pause = company_future.result()
+                if failure_key is not None:
+                    failure_counts[failure_key] = (
+                        failure_counts.get(failure_key, 0) + 1
+                    )
+                    if budget_pause:
+                        circuit_reason = failure_key.split(":", maxsplit=1)[-1]
+                    elif failure_counts[failure_key] >= 2:
+                        circuit_reason = (
+                            "两家公司出现相同失败，队列已安全暂停："
+                            f"{failure_key}"
+                        )
+            while len(active_futures) < company_worker_count and can_submit():
+                company_folder, manifest_row = pending_items[next_item]
+                next_item += 1
+                active_futures[
+                    executor.submit(
+                        analyze_one_company,
+                        company_folder,
+                        manifest_row,
+                    )
+                ] = company_folder
+            with status_lock:
+                status["agent_execution"]["active"] = len(active_futures)
+                write_json(status, status_path)
+
+    pause_was_requested = pause_requested is not None and pause_requested()
+    has_unfinished_company = any(
+        item.get("state") in {"pending", "running", "paused"}
+        for item in status["companies"].values()
+    )
+    if circuit_reason is not None or (
+        pause_was_requested and has_unfinished_company
+    ):
+        status["queue_state"] = "paused"
+        status["pause_reason"] = (
+            circuit_reason
+            if circuit_reason is not None
+            else "已按用户要求在当前运行公司完成后暂停。"
+        )
+    status["agent_execution"]["state"] = "completed"
+    status["agent_execution"]["active"] = 0
+    write_json(status, status_path)
+
+    unfinished_states = {"pending", "running", "paused"}
+    if status.get("queue_state") != "paused" and not any(
+        item.get("state") in unfinished_states
+        for item in status["companies"].values()
+    ):
+        status["queue_state"] = "completed"
+        status["pause_reason"] = None
         write_json(status, status_path)
 
     agent_matrix_path = experiment_dir / "agent_feature_matrix.csv"
@@ -571,6 +1050,7 @@ def _now() -> str:
 
 __all__ = [
     "AgentFeatureExperimentResult",
+    "normalize_historical_agent_features",
     "run_agent_feature_experiment",
     "select_pilot_companies",
 ]

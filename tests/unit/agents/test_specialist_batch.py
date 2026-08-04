@@ -12,6 +12,7 @@ from ipo_risk.agents.specialist import (
 from ipo_risk.domain import AgentRole, RiskSeverity
 from ipo_risk.retrieval import DocumentChunk
 from ipo_risk.retrieval.search import RiskRule
+from ipo_risk.resilience import RetryPolicy, retry_model_node_error
 
 
 def _chunk(index: int) -> DocumentChunk:
@@ -282,3 +283,73 @@ def test_only_risks_requesting_more_evidence_enter_followup_batch() -> None:
     assert provider.batch_sizes == [2, 1]
     assert all(item.analysis.supported for item in results)
     assert results[0].analysis.claim.endswith("经补证后获得直接支持。")
+
+
+class RemoteProtocolError(RuntimeError):
+    pass
+
+
+class InterruptedStreamProvider(BatchProvider):
+    def __init__(self, *, always_fail: bool) -> None:
+        super().__init__()
+        self.always_fail = always_fail
+
+    def complete_json(self, **request: object) -> dict[str, object]:
+        if self.always_fail or self.calls == 0:
+            self.calls += 1
+            raise RemoteProtocolError(
+                "peer closed connection without sending complete message body "
+                "(incomplete chunked read)"
+            )
+        return super().complete_json(**request)
+
+
+def test_incomplete_chunked_read_is_retried_and_recovers() -> None:
+    provider = InterruptedStreamProvider(always_fail=False)
+    retries: list[tuple[int, float]] = []
+    analyzer = DeepSeekSpecialistBatchAnalyzer(
+        provider,
+        temperature=0.1,
+        max_output_tokens=4_096,
+        batch_size=20,
+        progress_callback=lambda stage, detail: (
+            retries.append((int("第" in detail), 0.0))
+            if stage.endswith(":retrying")
+            else None
+        ),
+        retry_policy=RetryPolicy(
+            max_retries=3,
+            initial_seconds=0,
+            retry_if=retry_model_node_error,
+        ),
+    )
+
+    result = analyzer.analyze_batch(
+        [SpecialistTask(rule=_rule(1), candidates=(_chunk(1),))]
+    )
+
+    assert result.assessments[0].status is SpecialistStatus.SUPPORTED
+    assert result.attempts_by_risk[_rule(1).id] == 2
+    assert len(retries) == 1
+
+
+def test_exhausted_stream_failure_is_not_mislabeled_as_evidence_insufficient() -> None:
+    provider = InterruptedStreamProvider(always_fail=True)
+    analyzer = DeepSeekSpecialistBatchAnalyzer(
+        provider,
+        temperature=0.1,
+        max_output_tokens=4_096,
+        batch_size=20,
+        retry_policy=RetryPolicy(
+            max_retries=2,
+            initial_seconds=0,
+            retry_if=retry_model_node_error,
+        ),
+    )
+
+    result = analyzer.analyze_batch(
+        [SpecialistTask(rule=_rule(1), candidates=(_chunk(1),))]
+    )
+
+    assert result.assessments[0].status is SpecialistStatus.TECHNICAL_FAILURE
+    assert result.attempts_by_risk[_rule(1).id] == 3

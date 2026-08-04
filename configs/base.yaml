@@ -22,14 +22,12 @@ retrieval:
   semantic_top_k: 20
   rerank_top_k: 8
 
-# 向量存储后端：numpy 内存方案+磁盘缓存（单文档场景，秒级加载）。
-# Chroma 1.x 使用独立目录；旧 data/vector_store 保留为0.6时代只读备份。
+# 向量存储后端：pgvector负责正式持久化与RAG检索，NumPy保留本地备份。
 vector_store:
-  # 当前分析优先使用内存向量；同一份向量在后台写入 Chroma，不重复调用模型。
-  # Chroma 写入失败只记录 failed 状态，不中断本次报告生成。
-  backend: hybrid
-  chroma_persist_dir: data/vector_store_v1
-  chroma_collection: prospectus_chunks
+  backend: pgvector
+  postgres_dsn_env: IPO_RISK_POSTGRES_DSN
+  postgres_schema: ipo_risk
+  postgres_connect_timeout_seconds: 30
 
 # 固定职责：智谱BigModel负责向量化，真实密钥在 providers.local.yaml。
 embedding:
@@ -38,6 +36,15 @@ embedding:
   model_name: embedding-3-pro
   dimensions: 1024
   batch_size: 64
+  # Provider级并发：单文档内同时发送的向量批次数。
+  request_concurrency: 4
+  # 批量队列可同时预处理的PDF数；Agent公司级并发由agents.company_concurrency控制。
+  document_concurrency: 5
+  timeout_seconds: 120
+  max_retries: 2
+  retry_initial_seconds: 1
+  retry_backoff_factor: 2
+  retry_max_seconds: 8
 
 # DeepSeek 负责分批全文风险发现、检索规划和少量冲突升级。
 llm:
@@ -61,16 +68,20 @@ specialist_llm:
   max_output_tokens: 16384
   # 与风险Agent使用同一ARK路由，先采用本地结构校验，避免服务端参数不兼容。
   supports_json_object: false
-  reasoning_effort: low
+  # reasoning_effort 只能在启用思考模式时发送；当前关闭思考，因此不配置。
+  reasoning_effort: null
   # 专业核验要求输出可审计结论，不需要长时间隐藏式思维链；关闭深度思考，
   # 四个角色仍并行，并通过流式正文逐条生成卡片。
   disable_thinking: true
 
 agents:
-  max_retries: 2
+  # 首次请求失败后最多自动重试3次；只针对连接、限流、服务端和可修复结构错误。
+  max_retries: 3
   retry_initial_seconds: 1.0
   retry_backoff_factor: 2.0
   retry_max_seconds: 8.0
+  # 批量队列同时推进的公司数；每家公司内部的专业 Agent 仍并行。
+  company_concurrency: 2
   enable_open_discovery: true
   # 先由模型根据当前招股书目录生成公司特异检索问题；向量命中只负责定位，
   # 风险Agent实际阅读的是原文、相邻段落及跨章节覆盖样本。

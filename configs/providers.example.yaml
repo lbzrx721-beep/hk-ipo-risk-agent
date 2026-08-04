@@ -2,6 +2,12 @@
 # 程序固定读取项目内这个文件，不读取 Windows 用户环境变量。
 embedding:
   api_key: "填写智谱BigModel-API-Key"
+  # 向量供应商级性能参数，可按本地Ollama或云API能力独立调整。
+  batch_size: 64
+  request_concurrency: 4
+  document_concurrency: 5
+  timeout_seconds: 120
+  max_retries: 2
 
 llm:
   provider: ark
@@ -26,3 +32,7 @@ specialist_llm:
   input_price_per_million_rmb: null
   output_price_per_million_rmb: null
   cached_input_price_per_million_rmb: null
+
+# 批量分析的公司级 Agent 并发。建议从2开始，再按供应商限流逐步提高。
+agents:
+  company_concurrency: 2

@@ -5,7 +5,6 @@ from pathlib import Path
 from threading import Event
 
 import fitz
-import numpy as np
 
 from ipo_risk.agents.analysis import EvidenceAnalysis
 from ipo_risk.agents.decision import DecisionBatch, DecisionVerdict
@@ -48,22 +47,6 @@ class DiscoveryAwareEmbeddingProvider(TinyEmbeddingProvider):
                 timeout=3
             )
         return super().embed(texts)
-
-
-class RecordingChromaWriter:
-    def __init__(self) -> None:
-        self.document_vectors: np.ndarray | None = None
-
-    def add_chunks(
-        self,
-        chunks,
-        *,
-        skip_existing_document=True,
-        precomputed_embeddings=None,
-    ) -> int:
-        del skip_existing_document
-        self.document_vectors = precomputed_embeddings
-        return len(chunks)
 
 
 class TinyDeepSeekAnalyzer:
@@ -397,68 +380,3 @@ risks:
     )
     assert discovery_trace.tool_calls[0].tool_name == "open_risk_discovery"
     assert discovery_trace.output_refs == ("open_abcdef123456",)
-
-
-def test_hybrid_vector_backend_uses_memory_then_persists_same_vectors(
-    tmp_path: Path,
-) -> None:
-    pdf_path = tmp_path / "prospectus.pdf"
-    rules_path = tmp_path / "risks.yaml"
-    _write_pdf(pdf_path)
-    rules_path.write_text(
-        """
-risks:
-  - id: cash_burn
-    name: Cash burn
-    owner: finance
-    severity: high
-    query: cash outflow research financing
-    required_keywords: [cash outflow, research]
-    claim: Verify continuing cash outflow.
-""".strip(),
-        encoding="utf-8",
-    )
-    provider = RecordingEmbeddingProvider()
-    writer = RecordingChromaWriter()
-    progress_events: list[str] = []
-
-    artifacts = analyze_prospectus(
-        pdf_path=pdf_path,
-        company_id="03696",
-        company_name="Test Company",
-        company_folder="03696_test",
-        document_id="prospectus_2025-12-18",
-        available_at=date(2025, 12, 18),
-        project_root=tmp_path,
-        interim_root=tmp_path / "interim",
-        artifacts_root=tmp_path / "artifacts",
-        risk_rules_path=rules_path,
-        embedding_provider=provider,
-        evidence_analyzer=TinyDeepSeekAnalyzer(),
-        decision_analyzer=TinyDeepSeekDecisionAnalyzer(),
-        vector_store_backend="hybrid",
-        chroma_persist_dir=tmp_path / "chroma",
-        chroma_writer_factory=lambda _provider, _path, _name: writer,
-        lexical_top_k=5,
-        semantic_top_k=5,
-        rerank_top_k=3,
-        progress_callback=lambda stage, detail: progress_events.append(stage),
-    )
-
-    task = artifacts.vector_persistence_task
-    assert task is not None
-    assert task.wait(timeout=2)
-    assert task.snapshot().status == "ready"
-    assert writer.document_vectors is not None
-    assert writer.document_vectors.shape == (
-        artifacts.report.source_document.chunk_count,
-        provider.dimensions,
-    )
-    document_embedding_calls = [
-        call
-        for call in provider.calls
-        if any("persistent cash outflow" in text for text in call)
-    ]
-    assert len(document_embedding_calls) == 1
-    assert "vector_persistence_started" in progress_events
-    assert "vector_persistence_completed" in progress_events

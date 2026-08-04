@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from threading import Condition
+from time import perf_counter
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -123,6 +124,7 @@ class RiskScopeReviewController:
         self._condition = Condition()
         self._request: RiskScopeReviewRequest | None = None
         self._decision: RiskScopeReviewDecision | None = None
+        self._wait_seconds = 0.0
 
     def request_review(
         self,
@@ -135,8 +137,10 @@ class RiskScopeReviewController:
             self._request = request
             self._decision = None
             self._condition.notify_all()
+            wait_started = perf_counter()
             while self._decision is None:
                 self._condition.wait()
+            self._wait_seconds += max(0.0, perf_counter() - wait_started)
             decision = self._decision
             self._request = None
             self._decision = None
@@ -164,6 +168,11 @@ class RiskScopeReviewController:
     def pending_request(self) -> RiskScopeReviewRequest | None:
         with self._condition:
             return self._request
+
+    def wait_seconds(self) -> float:
+        """返回该控制器累计等待人工提交的秒数。"""
+        with self._condition:
+            return self._wait_seconds
 
     def wait_for_request(self, timeout: float | None = None) -> bool:
         """仅供测试和受控协调使用，页面通过快照轮询。"""

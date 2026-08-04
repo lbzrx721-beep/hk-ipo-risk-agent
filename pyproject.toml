@@ -32,7 +32,8 @@ retrieval = [
     "jieba>=0.42,<1",
     "numpy>=2,<3",
     "sentence-transformers>=4,<6",
-    "chromadb>=1.5.9,<2",
+    "psycopg[binary]>=3.2,<4",
+    "pgvector>=0.3,<1",
 ]
 data = [
     "numpy>=2,<3",
@@ -54,11 +55,6 @@ api = [
     "httpx>=0.28,<1",
     "openai>=1.60,<3",
     "tenacity>=9,<10",
-]
-ui = [
-    "streamlit>=1.42,<2",
-    "plotly>=6,<7",
-    "pandas>=2.2,<4",
 ]
 reporting = [
     "jinja2>=3.1,<4",
@@ -82,8 +78,8 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-cache_dir = "tmp/pytest_cache"
-addopts = "--basetemp=tmp/pytest_runtime"
+cache_dir = "tmp/tests/cache"
+addopts = "--basetemp=tmp/tests/runtime"
 markers = [
     "integration: 使用公开真实文件验证端到端链路",
 ]
@@ -111,8 +107,10 @@ module = [
     "reportlab.*",
     "yaml",
     "yaml.*",
-    "chromadb",
-    "chromadb.*",
+    "psycopg",
+    "psycopg.*",
+    "pgvector",
+    "pgvector.*",
     "joblib",
     "sklearn",
     "sklearn.*",

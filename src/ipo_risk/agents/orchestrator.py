@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import operator
 import json
+from inspect import signature
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -818,6 +819,7 @@ class MultiAgentOrchestrator:
             planning_started = _now()
             search_attempts = 1
             search_error: str | None = None
+            search_repair_errors: list[str] = []
             search_mode = "fixed_query_fallback"
             try:
                 plan_with_feedback = getattr(
@@ -838,6 +840,7 @@ class MultiAgentOrchestrator:
                     )
                 search_plan = search_outcome.value
                 search_attempts = search_outcome.attempts
+                search_repair_errors = list(search_outcome.errors)
                 expected_risk_types = {rule.id for rule in rules_requiring_planning}
                 if search_plan.role is not role:
                     raise ValueError("search plan role does not match assigned Agent")
@@ -859,6 +862,7 @@ class MultiAgentOrchestrator:
                     raise error.last_error
                 search_attempts = error.attempts
                 search_error = str(error.last_error)
+                search_repair_errors = [search_error] if search_error else []
                 _emit_progress(
                     progress_callback,
                     f"agent:{role.value}:search_fallback",
@@ -897,11 +901,7 @@ class MultiAgentOrchestrator:
                         },
                         "attempts": search_attempts,
                         "retries": max(0, search_attempts - 1),
-                        "repair_errors": (
-                            list(search_outcome.errors)
-                            if planned_queries
-                            else ([search_error] if search_error else [])
-                        ),
+                        "repair_errors": search_repair_errors,
                         "fallback_error": search_error,
                     },
                     status=ToolCallStatus.SUCCEEDED,
@@ -1070,10 +1070,25 @@ class MultiAgentOrchestrator:
                     None,
                 )
                 if callable(adjudicate_with_feedback):
+                    stream_marker = (
+                        f"[[batch:{batch_index}/{max(1, output_batch_count)}]]"
+                    )
+                    try:
+                        supports_stream_marker = (
+                            "stream_marker"
+                            in signature(adjudicate_with_feedback).parameters
+                        )
+                    except (TypeError, ValueError):
+                        supports_stream_marker = False
                     outcome = self._decision_retry_policy.run_with_feedback(
                         lambda correction_feedback: adjudicate_with_feedback(
                             decision_batch_proposals,
                             correction_feedback=correction_feedback,
+                            **(
+                                {"stream_marker": stream_marker}
+                                if supports_stream_marker
+                                else {}
+                            ),
                         )
                     )
                 else:

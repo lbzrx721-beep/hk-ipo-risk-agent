@@ -12,21 +12,74 @@ from pydantic import ValidationError
 
 
 T = TypeVar("T")
+RetryCallback = Callable[[Exception, int, float], None]
+
+
+_TRANSIENT_ERROR_NAMES = {
+    "APIConnectionError",
+    "APITimeoutError",
+    "ConnectError",
+    "ConnectTimeout",
+    "ConnectionError",
+    "InternalServerError",
+    "NetworkError",
+    "PoolTimeout",
+    "ProtocolError",
+    "RateLimitError",
+    "ReadError",
+    "ReadTimeout",
+    "RemoteProtocolError",
+    "WriteError",
+    "WriteTimeout",
+}
+_TRANSIENT_MESSAGE_MARKERS = (
+    "incomplete chunked read",
+    "peer closed connection",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "connection timed out",
+    "error code: 429",
+    "status code: 429",
+    "502 bad gateway",
+    "503 service unavailable",
+    "read timed out",
+    "server overloaded",
+    "service unavailable",
+    "too many requests",
+    "temporarily unavailable",
+    "upstream connect error",
+)
+
+
+def _exception_chain(error: Exception) -> tuple[Exception, ...]:
+    """返回异常及其cause/context，兼容SDK对底层httpx异常的包装。"""
+    values: list[Exception] = []
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while isinstance(current, Exception) and id(current) not in seen:
+        seen.add(id(current))
+        values.append(current)
+        current = current.__cause__ or current.__context__
+    return tuple(values)
 
 
 def retry_transient_api_error(error: Exception) -> bool:
     """只重试连接、超时、限流和服务端错误，跳过普通4xx。"""
-    status_code = getattr(error, "status_code", None)
-    if isinstance(status_code, int):
-        return status_code in {408, 409, 429} or status_code >= 500
-    if isinstance(error, (ConnectionError, TimeoutError, OSError)):
-        return True
-    return type(error).__name__ in {
-        "APIConnectionError",
-        "APITimeoutError",
-        "InternalServerError",
-        "RateLimitError",
-    }
+    for item in _exception_chain(error):
+        status_code = getattr(item, "status_code", None)
+        if isinstance(status_code, int):
+            if status_code in {408, 409, 429} or status_code >= 500:
+                return True
+            continue
+        if isinstance(item, (ConnectionError, TimeoutError, OSError)):
+            return True
+        if type(item).__name__ in _TRANSIENT_ERROR_NAMES:
+            return True
+        message = str(item).strip().lower()
+        if any(marker in message for marker in _TRANSIENT_MESSAGE_MARKERS):
+            return True
+    return False
 
 
 def retry_model_node_error(error: Exception) -> bool:
@@ -74,7 +127,12 @@ class RetryPolicy:
         if self.backoff_factor < 1:
             raise ValueError("retry backoff_factor must be at least 1")
 
-    def run(self, operation: Callable[[], T]) -> RetryResult[T]:
+    def run(
+        self,
+        operation: Callable[[], T],
+        *,
+        on_retry: RetryCallback | None = None,
+    ) -> RetryResult[T]:
         attempts = 0
         delay = self.initial_seconds
         errors: list[str] = []
@@ -91,12 +149,17 @@ class RetryPolicy:
                 retries_used = attempts - 1
                 if retries_used >= self.max_retries or not self.retry_if(error):
                     raise RetryExhaustedError(attempts, error) from error
-                self.sleep(min(delay, self.max_seconds))
+                wait_seconds = min(delay, self.max_seconds)
+                if on_retry is not None:
+                    on_retry(error, attempts + 1, wait_seconds)
+                self.sleep(wait_seconds)
                 delay = min(delay * self.backoff_factor, self.max_seconds)
 
     def run_with_feedback(
         self,
         operation: Callable[[str | None], T],
+        *,
+        on_retry: RetryCallback | None = None,
     ) -> RetryResult[T]:
         """重试模型结构错误时，把具体校验问题反馈给下一次生成。"""
         attempts = 0
@@ -122,7 +185,10 @@ class RetryPolicy:
                     if isinstance(error, (ValueError, ValidationError))
                     else None
                 )
-                self.sleep(min(delay, self.max_seconds))
+                wait_seconds = min(delay, self.max_seconds)
+                if on_retry is not None:
+                    on_retry(error, attempts + 1, wait_seconds)
+                self.sleep(wait_seconds)
                 delay = min(delay * self.backoff_factor, self.max_seconds)
 
 
@@ -159,6 +225,7 @@ def _model_validation_feedback(error: Exception) -> str:
 
 __all__ = [
     "RetryExhaustedError",
+    "RetryCallback",
     "RetryPolicy",
     "RetryResult",
     "_model_validation_feedback",

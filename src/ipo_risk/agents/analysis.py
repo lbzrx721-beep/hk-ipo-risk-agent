@@ -127,7 +127,12 @@ class OpenAICompatibleJsonChatProvider:
             request["response_format"] = {"type": "json_object"}
         if self._request_extra_body:
             request["extra_body"] = self._request_extra_body
-        if self._reasoning_effort is not None:
+        thinking = self._request_extra_body.get("thinking")
+        thinking_disabled = (
+            isinstance(thinking, Mapping)
+            and thinking.get("type") == "disabled"
+        )
+        if self._reasoning_effort is not None and not thinking_disabled:
             request["reasoning_effort"] = self._reasoning_effort
         completions: Any = self._client.chat.completions
         ledger = self._usage_ledger

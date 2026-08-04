@@ -20,7 +20,12 @@ from ipo_risk.agents.usage import ModelBudgetExceededError
 from ipo_risk.domain import AgentRole, RiskSeverity
 from ipo_risk.retrieval.chunker import DocumentChunk
 from ipo_risk.retrieval.search import RiskRule
-from ipo_risk.resilience import RetryExhaustedError, RetryPolicy, retry_model_node_error
+from ipo_risk.resilience import (
+    RetryExhaustedError,
+    RetryPolicy,
+    retry_model_node_error,
+    retry_transient_api_error,
+)
 
 
 ProgressCallback = Callable[[str, str], None]
@@ -35,6 +40,7 @@ class SpecialistStatus(StrEnum):
     SUBJECT_OR_PERIOD_MISMATCH = "subject_or_period_mismatch"
     DUPLICATE_MERGED = "duplicate_merged"
     CONFLICT = "conflict"
+    TECHNICAL_FAILURE = "technical_failure"
 
 
 @dataclass(frozen=True)
@@ -203,7 +209,17 @@ class DeepSeekSpecialistBatchAnalyzer:
                         partition_index=index,
                         partition_count=len(partitions),
                         correction_feedback=correction,
-                    )
+                    ),
+                    on_retry=(
+                        lambda error, attempt, wait: self._report_retry(
+                            role=role,
+                            partition_index=index,
+                            partition_count=len(partitions),
+                            attempt=attempt,
+                            wait_seconds=wait,
+                            error=error,
+                        )
+                    ),
                 )
             except RetryExhaustedError as error:
                 if isinstance(error.last_error, ModelBudgetExceededError):
@@ -213,7 +229,11 @@ class DeepSeekSpecialistBatchAnalyzer:
                     assessments.append(
                         SpecialistAssessment(
                             risk_type=task.rule.id,
-                            status=SpecialistStatus.EVIDENCE_INSUFFICIENT,
+                            status=(
+                                SpecialistStatus.TECHNICAL_FAILURE
+                                if retry_transient_api_error(error.last_error)
+                                else SpecialistStatus.EVIDENCE_INSUFFICIENT
+                            ),
                             severity=task.rule.severity,
                             confidence=0.0,
                             uncertainty=f"专业Agent批量核验失败，候选风险仍保留：{message}",
@@ -243,6 +263,27 @@ class DeepSeekSpecialistBatchAnalyzer:
             errors_by_risk=errors_by_risk,
         )
 
+    def _report_retry(
+        self,
+        *,
+        role: AgentRole,
+        partition_index: int,
+        partition_count: int,
+        attempt: int,
+        wait_seconds: float,
+        error: Exception,
+    ) -> None:
+        if self._progress_callback is None:
+            return
+        message = str(error).strip() or type(error).__name__
+        self._progress_callback(
+            f"agent:{role.value}:retrying",
+            (
+                f"[{partition_index}/{partition_count}] {_role_name(role)} Agent连接中断，"
+                f"{wait_seconds:g}秒后进行第{attempt}次尝试：{message[:180]}"
+            ),
+        )
+
     def _analyze_partition(
         self,
         tasks: Sequence[SpecialistTask],
@@ -264,7 +305,11 @@ class DeepSeekSpecialistBatchAnalyzer:
                     "return_every_risk_exactly_once": True,
                     "no_external_evidence": True,
                     "human_review_is_final_authority": True,
-                    "allowed_statuses": [status.value for status in SpecialistStatus],
+                    "allowed_statuses": [
+                        status.value
+                        for status in SpecialistStatus
+                        if status is not SpecialistStatus.TECHNICAL_FAILURE
+                    ],
                 },
                 "risks": [
                     {

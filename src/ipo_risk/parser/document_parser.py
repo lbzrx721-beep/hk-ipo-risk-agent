@@ -24,14 +24,18 @@ OCR 降级：
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Iterator
 
 import fitz  # PyMuPDF
 
 from ipo_risk.parser.ocr import ocr_page
-from ipo_risk.parser.tables import TableArtifact, extract_page_tables
+from ipo_risk.parser.tables import (
+    IsolatedTableExtractor,
+    TableArtifact,
+    extract_page_tables,
+)
 from ipo_risk.parser.visual import VisualRegion, detect_visual_regions
 
 
@@ -165,6 +169,7 @@ def parse_page(
     doc: fitz.Document,
     page_index: int,
     min_chars: int = 80,
+    table_extractor: IsolatedTableExtractor | None = None,
 ) -> PageResult:
     """解析 PDF 中的一页。
 
@@ -227,12 +232,28 @@ def parse_page(
         page_num=page_num,
         text_blocks=text_blocks,
     )
+    deferred_region_ids: set[str] = set()
     tables = extract_page_tables(
         page,
         page_num=page_num,
         text_blocks=text_blocks,
         visual_regions=visual_regions,
+        isolated_extractor=table_extractor,
+        deferred_region_ids=deferred_region_ids,
     )
+    if deferred_region_ids:
+        visual_regions = [
+            (
+                replace(
+                    region,
+                    requires_vision=True,
+                    reasons=(*region.reasons, "structured_table_extraction_deferred"),
+                )
+                if region.region_id in deferred_region_ids
+                else region
+            )
+            for region in visual_regions
+        ]
 
     return PageResult(
         page=page_num,
@@ -275,13 +296,20 @@ def parse_document(
             print(f"第 {page_result.page} 页: {page_result.char_count} 字符")
     """
     doc = fitz.open(str(pdf_path))
+    table_extractor = IsolatedTableExtractor(pdf_path)
     try:
         start = page_range[0] if page_range else 0
         end = page_range[1] if page_range else len(doc)
 
         for i in range(start, min(end, len(doc))):
-            yield parse_page(doc, i, min_chars=min_chars)
+            yield parse_page(
+                doc,
+                i,
+                min_chars=min_chars,
+                table_extractor=table_extractor,
+            )
     finally:
+        table_extractor.close()
         doc.close()
 
 

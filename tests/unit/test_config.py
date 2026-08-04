@@ -16,15 +16,37 @@ def test_vector_store_backend_rejects_typos(tmp_path: Path) -> None:
         load_config(base_path, tmp_path / "missing-providers.yaml")
 
 
-def test_hybrid_vector_backend_is_supported_for_fast_web_analysis(
+def test_numpy_vector_backend_is_supported_for_local_backup(
     tmp_path: Path,
 ) -> None:
     base_path = tmp_path / "base.yaml"
-    base_path.write_text("vector_store:\n  backend: hybrid", encoding="utf-8")
+    base_path.write_text("vector_store:\n  backend: numpy", encoding="utf-8")
 
     config = load_config(base_path, tmp_path / "missing-providers.yaml")
 
-    assert config.vector_store.backend == "hybrid"
+    assert config.vector_store.backend == "numpy"
+
+
+def test_pgvector_backend_reads_secret_dsn_from_deployment_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        "vector_store:\n  backend: pgvector\n  postgres_schema: ipo_risk",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv(
+        "IPO_RISK_POSTGRES_DSN",
+        "postgresql://appuser:secret@database.local:5432/ragdb",
+    )
+
+    config = load_config(base_path, tmp_path / "missing-providers.yaml")
+
+    assert config.vector_store.backend == "pgvector"
+    assert config.vector_store.postgres_schema == "ipo_risk"
+    assert "secret" not in repr(config)
+    assert config.vector_store.require_postgres_dsn().endswith("/ragdb")
 
 
 def test_provider_file_has_priority_and_environment_is_ignored(
@@ -102,6 +124,35 @@ embedding:
     assert config.embedding.require_api_key() == "ollama"
 
 
+def test_embedding_provider_performance_settings_are_loaded(
+    tmp_path: Path,
+) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        """
+embedding:
+  request_concurrency: 5
+  document_concurrency: 4
+  timeout_seconds: 90
+  max_retries: 3
+  retry_initial_seconds: 0.25
+  retry_backoff_factor: 1.5
+  retry_max_seconds: 4
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(base_path, tmp_path / "missing-providers.yaml")
+
+    assert config.embedding.request_concurrency == 5
+    assert config.embedding.document_concurrency == 4
+    assert config.embedding.timeout_seconds == 90
+    assert config.embedding.max_retries == 3
+    assert config.embedding.retry_initial_seconds == 0.25
+    assert config.embedding.retry_backoff_factor == 1.5
+    assert config.embedding.retry_max_seconds == 4
+
+
 def test_model_retry_policy_is_loaded_from_project_config(tmp_path: Path) -> None:
     base_path = tmp_path / "base.yaml"
     base_path.write_text(
@@ -151,3 +202,5 @@ def test_default_discovery_pack_is_small_enough_for_early_visible_results(
     )
     assert config.specialist_llm.model_name == "kimi-k3"
     assert config.specialist_llm.supports_json_object is False
+    assert config.specialist_llm.reasoning_effort is None
+    assert config.specialist_llm.disable_thinking is True

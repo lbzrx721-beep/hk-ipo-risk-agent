@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import date
 from pathlib import Path
 from types import SimpleNamespace
+from threading import Event, Lock
+from time import sleep
 
 import pytest
 
@@ -169,6 +171,58 @@ def test_openai_compatible_embedding_provider_batches_requests_in_order() -> Non
     assert [call["input"] for call in endpoint.calls] == [["甲", "乙乙"], ["丙丙丙"]]
 
 
+class ConcurrentEmbeddingEndpoint(FakeEmbeddingEndpoint):
+    def __init__(self) -> None:
+        super().__init__()
+        self._lock = Lock()
+        self._release = Event()
+        self.active = 0
+        self.max_active = 0
+
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        with self._lock:
+            self.calls.append(kwargs)
+            self.active += 1
+            self.max_active = max(self.max_active, self.active)
+            if self.max_active >= 2:
+                self._release.set()
+        self._release.wait(timeout=1)
+        inputs = kwargs["input"]
+        assert isinstance(inputs, list)
+        # 让较早批次更晚返回，验证最终结果不依赖响应完成顺序。
+        if inputs[0] == "甲":
+            sleep(0.02)
+        data = [
+            SimpleNamespace(index=index, embedding=[float(len(text)), 1.0])
+            for index, text in enumerate(inputs)
+        ]
+        with self._lock:
+            self.active -= 1
+        return SimpleNamespace(data=data)
+
+
+def test_embedding_provider_runs_batches_concurrently_and_preserves_order() -> None:
+    endpoint = ConcurrentEmbeddingEndpoint()
+    progress: list[tuple[int, int]] = []
+    provider = OpenAICompatibleEmbeddingProvider(
+        client=SimpleNamespace(embeddings=endpoint),
+        model_name="qwen3-embedding:4b",
+        dimensions=2,
+        batch_size=1,
+        request_concurrency=2,
+        progress_callback=lambda completed, total: progress.append((completed, total)),
+    )
+
+    vectors = provider.embed(["甲", "乙乙", "丙丙丙"])
+
+    assert endpoint.max_active == 2
+    assert vectors == [[1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]
+    assert progress[-1] == (3, 3)
+    assert [completed for completed, _ in progress] == sorted(
+        completed for completed, _ in progress
+    )
+
+
 def test_embedding_provider_preserves_ollama_model_tag() -> None:
     endpoint = FakeEmbeddingEndpoint()
     provider = OpenAICompatibleEmbeddingProvider(
@@ -242,3 +296,52 @@ def test_embedding_provider_does_not_retry_permanent_authentication_failure() ->
     assert len(endpoint.calls) == 1
     assert delays == []
     assert provider.retry_count == 0
+
+
+class SelectivelyFailingEmbeddingEndpoint(FakeEmbeddingEndpoint):
+    def __init__(self, failing_text: str | None) -> None:
+        super().__init__()
+        self.failing_text = failing_text
+
+    def create(self, **kwargs: object) -> SimpleNamespace:
+        inputs = kwargs["input"]
+        assert isinstance(inputs, list)
+        if self.failing_text in inputs:
+            self.calls.append(kwargs)
+            raise ConnectionError("temporary batch failure")
+        return super().create(**kwargs)
+
+
+def test_embedding_provider_resumes_from_completed_batch_checkpoints(
+    tmp_path: Path,
+) -> None:
+    texts = ["甲", "乙乙", "丙丙丙"]
+    first_endpoint = SelectivelyFailingEmbeddingEndpoint("乙乙")
+    first_provider = OpenAICompatibleEmbeddingProvider(
+        client=SimpleNamespace(embeddings=first_endpoint),
+        model_name="qwen3-embedding:4b",
+        dimensions=2,
+        batch_size=1,
+        request_concurrency=1,
+        batch_cache_dir=tmp_path,
+    )
+
+    with pytest.raises(ConnectionError, match="temporary batch failure"):
+        first_provider.embed(texts)
+
+    second_endpoint = SelectivelyFailingEmbeddingEndpoint(None)
+    second_provider = OpenAICompatibleEmbeddingProvider(
+        client=SimpleNamespace(embeddings=second_endpoint),
+        model_name="qwen3-embedding:4b",
+        dimensions=2,
+        batch_size=1,
+        request_concurrency=1,
+        batch_cache_dir=tmp_path,
+    )
+
+    vectors = second_provider.embed(texts)
+
+    assert vectors == [[1.0, 1.0], [2.0, 1.0], [3.0, 1.0]]
+    requested_texts = [text for call in second_endpoint.calls for text in call["input"]]
+    assert "甲" not in requested_texts
+    assert "乙乙" in requested_texts

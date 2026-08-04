@@ -240,6 +240,15 @@ class RiskFinding(ContractModel):
     created_by: AgentRole
     calculation: Calculation | None = None
     uncertainty: NonEmptyStr | None = None
+    specialist_status: Literal[
+        "supported",
+        "needs_more_evidence",
+        "evidence_insufficient",
+        "subject_or_period_mismatch",
+        "duplicate_merged",
+        "conflict",
+        "technical_failure",
+    ] | None = None
     created_at: datetime = Field(default_factory=utc_now)
 
     @field_validator("created_at")

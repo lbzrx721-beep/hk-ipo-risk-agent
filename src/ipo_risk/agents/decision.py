@@ -122,6 +122,7 @@ class DeepSeekDecisionAnalyzer:
         proposals: Sequence[Any],
         *,
         correction_feedback: str | None,
+        stream_marker: str = "",
     ) -> DecisionBatch:
         """整合当前决策批次，并支持把上一轮校验错误反馈给模型。"""
         if not proposals:
@@ -190,7 +191,7 @@ class DeepSeekDecisionAnalyzer:
         if progress_callback is not None:
 
             def report_delta(delta: str) -> None:
-                progress_callback("agent:decision:delta", delta)
+                progress_callback("agent:decision:delta", f"{stream_marker}{delta}")
 
             on_text_delta = report_delta
         request: dict[str, Any] = {

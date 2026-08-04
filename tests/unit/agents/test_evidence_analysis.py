@@ -248,6 +248,47 @@ def test_openai_compatible_chat_provider_enables_deepseek_json_output() -> None:
     assert completions.request["extra_body"] == {"thinking": {"type": "disabled"}}
 
 
+def test_openai_compatible_chat_provider_omits_reasoning_effort_when_thinking_disabled() -> None:
+    completions = FakeChatCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    provider = OpenAICompatibleJsonChatProvider(
+        client=client,
+        model_name="kimi-k3",
+        reasoning_effort="low",
+    )
+
+    provider.complete_json(
+        system_prompt="输出JSON",
+        user_prompt="批量核验候选风险",
+        temperature=0.1,
+        max_output_tokens=1024,
+    )
+
+    assert completions.request["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in completions.request
+
+
+def test_openai_compatible_chat_provider_keeps_reasoning_effort_when_thinking_enabled() -> None:
+    completions = FakeChatCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    provider = OpenAICompatibleJsonChatProvider(
+        client=client,
+        model_name="kimi-k3",
+        request_extra_body={},
+        reasoning_effort="low",
+    )
+
+    provider.complete_json(
+        system_prompt="输出JSON",
+        user_prompt="批量核验候选风险",
+        temperature=0.1,
+        max_output_tokens=1024,
+    )
+
+    assert "extra_body" not in completions.request
+    assert completions.request["reasoning_effort"] == "low"
+
+
 def test_openai_compatible_chat_provider_can_omit_unsupported_json_mode() -> None:
     completions = FakeChatCompletions()
     client = SimpleNamespace(chat=SimpleNamespace(completions=completions))

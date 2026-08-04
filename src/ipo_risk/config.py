@@ -3,17 +3,19 @@
 职责：
   1. 读取 configs/base.yaml 中的项目路径、解析器、检索、Agent、预测等配置。
   2. 读取 configs/providers.local.yaml 中的固定模型供应商与 API Key。
-  3. 将两者合并为一个类型安全的 AppConfig 对象，供其他所有模块使用。
+  3. 数据库连接串允许从项目.env或部署环境变量注入。
+  4. 将配置合并为类型安全的 AppConfig 对象，供其他所有模块使用。
 
 设计原则：
   - 其他模块不直接读 YAML，统一通过 load_config() 获取。
-  - 不读取 Windows 用户环境变量，保证实际运行配置只由项目文件决定。
+  - 模型密钥只读项目私有配置；数据库DSN允许标准部署环境变量覆盖。
   - API Key 在 Pydantic 对象中使用 SecretStr，避免日志和 repr 意外泄漏。
   - 所有路径都是相对项目根目录的，通过 resolve_path() 转为绝对路径。
 """
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Literal
 
@@ -72,13 +74,23 @@ class VectorStoreConfig(BaseModel):
 
     backend:
       - "numpy": 内存向量 + 磁盘缓存（单文档场景）。
-      - "chroma": ChromaDB 同步检索与持久化（兼容模式）。
-      - "hybrid": 内存立即检索，并异步把同一份向量写入 Chroma（默认）。
+      - "pgvector": PostgreSQL + pgvector 正式持久化与检索后端。
     """
 
-    backend: Literal["numpy", "chroma", "hybrid"] = "hybrid"
-    chroma_persist_dir: str = "data/vector_store_v1"
-    chroma_collection: str = "prospectus_chunks"
+    backend: Literal["numpy", "pgvector"] = "pgvector"
+    postgres_dsn: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    postgres_dsn_env: str = "IPO_RISK_POSTGRES_DSN"
+    postgres_schema: str = "ipo_risk"
+    postgres_connect_timeout_seconds: float = Field(default=30.0, gt=0.0)
+
+    def require_postgres_dsn(self) -> str:
+        """返回数据库连接串；只允许数据库客户端在连接时读取明文。"""
+        value = self.postgres_dsn.get_secret_value().strip()
+        if not value:
+            raise RuntimeError(
+                "pgvector连接未配置：请在项目.env中填写IPO_RISK_POSTGRES_DSN"
+            )
+        return value
 
 
 class EmbeddingConfig(BaseModel):
@@ -88,8 +100,15 @@ class EmbeddingConfig(BaseModel):
     api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
     base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     model_name: str = "embedding-3-pro"
-    dimensions: int = 1024
-    batch_size: int = 64
+    dimensions: int = Field(default=1024, ge=1)
+    batch_size: int = Field(default=64, ge=1)
+    request_concurrency: int = Field(default=1, ge=1, le=32)
+    document_concurrency: int = Field(default=1, ge=1, le=16)
+    timeout_seconds: float = Field(default=120.0, gt=0.0)
+    max_retries: int = Field(default=2, ge=0, le=10)
+    retry_initial_seconds: float = Field(default=1.0, ge=0.0)
+    retry_backoff_factor: float = Field(default=2.0, ge=1.0)
+    retry_max_seconds: float = Field(default=8.0, ge=0.0)
 
     @property
     def is_configured(self) -> bool:
@@ -158,6 +177,9 @@ class AgentsConfig(BaseModel):
     retry_initial_seconds: float = Field(default=1.0, ge=0.0, le=60.0)
     retry_backoff_factor: float = Field(default=2.0, ge=1.0, le=10.0)
     retry_max_seconds: float = Field(default=8.0, ge=0.0, le=300.0)
+    # 批量分析时允许同时推进的公司流水线数量。每家公司内部的专业 Agent
+    # 仍由 LangGraph 并行编排，因此这里必须保持受控，避免瞬时放大 API 请求。
+    company_concurrency: int = Field(default=2, ge=1, le=8)
     enable_open_discovery: bool = True
     # 风险发现先动态规划检索问题，再从向量索引取回原文和相邻上下文。
     discovery_retrieval_query_count: int = Field(default=16, ge=4, le=20)
@@ -252,6 +274,25 @@ def _read_yaml(path: Path) -> dict[str, Any]:
     return data
 
 
+def _read_project_env(path: Path) -> dict[str, str]:
+    """读取项目级.env；仅用于数据库等部署配置，不污染进程环境。"""
+    if not path.is_file():
+        return {}
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if value.startswith(("'", '"')) and value.endswith(value[:1]):
+            value = value[1:-1]
+        if key:
+            values[key] = value
+    return values
+
+
 def load_config(
     config_path: str | Path | None = None,
     providers_path: str | Path | None = None,
@@ -259,7 +300,7 @@ def load_config(
     """加载基础配置与项目内固定供应商配置。
 
     优先级：providers.local.yaml > base.yaml > 代码默认值。
-    函数有意不读取任何操作系统环境变量。
+    模型供应商仍固定读取项目配置；数据库DSN允许由项目.env或同名环境变量覆盖。
 
     参数:
         config_path: 可选的 YAML 路径，默认读 configs/base.yaml。
@@ -287,7 +328,19 @@ def load_config(
     paths = raw.get("paths", {})
     parser_cfg = raw.get("parser", {})
     retrieval_cfg = raw.get("retrieval", {})
-    vector_store_cfg = raw.get("vector_store", {})
+    vector_store_cfg = {
+        **raw.get("vector_store", {}),
+        **providers.get("vector_store", {}),
+    }
+    postgres_dsn_env = str(
+        vector_store_cfg.get("postgres_dsn_env") or "IPO_RISK_POSTGRES_DSN"
+    )
+    project_env = _read_project_env(_PROJECT_ROOT / ".env")
+    postgres_dsn = os.environ.get(postgres_dsn_env) or project_env.get(
+        postgres_dsn_env
+    )
+    if postgres_dsn:
+        vector_store_cfg["postgres_dsn"] = postgres_dsn
     embedding_cfg = {**raw.get("embedding", {}), **providers.get("embedding", {})}
     llm_cfg = {**raw.get("llm", {}), **providers.get("llm", {})}
     raw_discovery_llm = raw.get("discovery_llm")
