@@ -13,6 +13,7 @@ from ipo_risk.experiments import (
     run_agent_feature_experiment,
     select_pilot_companies,
 )
+from ipo_risk.experiments.agent_features import AGENT_FEATURE_SCHEMA_VERSION
 from ipo_risk.storage.files import write_json
 from ipo_risk.pipeline import AnalysisArtifacts
 from ipo_risk.reporting import AnalysisSummary, RiskAnalysisReport, SourceDocument
@@ -122,8 +123,43 @@ def test_historical_reports_are_normalized_without_model_calls(
             / "00001.json"
         ).read_text(encoding="utf-8")
     )
-    assert payload["feature_schema_version"] == 2
+    assert payload["feature_schema_version"] == AGENT_FEATURE_SCHEMA_VERSION
     assert payload["normalization"]["model_reinvoked"] is False
+
+
+def test_historical_normalization_keeps_report_without_base_features(
+    tmp_path: Path,
+) -> None:
+    modeling_dir = tmp_path / "data" / "processed" / "modeling"
+    modeling_dir.mkdir(parents=True)
+    artifacts = _analysis_artifacts(tmp_path, "00009")
+    report_path = (
+        tmp_path
+        / "artifacts"
+        / "analysis"
+        / "00009_公司9"
+        / "doc_00009"
+        / "risk_analysis.json"
+    )
+    write_json(artifacts.report.model_dump(mode="json"), report_path)
+    pd.DataFrame(
+        [
+            {
+                "company_id": "00001",
+                "prospectus_date": "2021-01-01",
+                "split": "train",
+            }
+        ]
+    ).to_csv(modeling_dir / "prelisting_feature_matrix.csv", index=False)
+
+    result = normalize_historical_agent_features(tmp_path)
+
+    matrix = pd.read_csv(result.agent_feature_matrix_path, dtype={"company_id": str})
+    assert matrix["company_id"].tolist() == ["00009"]
+    assert matrix["split"].tolist() == ["unassigned"]
+    assert result.augmented_feature_matrix_path is not None
+    augmented = pd.read_csv(result.augmented_feature_matrix_path)
+    assert augmented.empty
 
 
 def test_pilot_selection_is_deterministic_and_does_not_depend_on_label_values() -> None:

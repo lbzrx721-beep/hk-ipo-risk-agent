@@ -63,6 +63,39 @@ CREATE INDEX IF NOT EXISTS prospectus_chunks_kind_idx
     ON ipo_risk.prospectus_chunks (chunk_kind)
     WHERE chunk_kind = 'table';
 
+-- 历史IPO案例库与招股书原文库物理隔离。embedding仅由上市前特征摘要生成；
+-- 五日真实表现只作为检索完成后读取的元数据，避免未来数据泄漏。
+CREATE TABLE IF NOT EXISTS ipo_risk.historical_ipo_cases (
+    case_id text NOT NULL,
+    embedding_model text NOT NULL,
+    embedding_dimensions integer NOT NULL CHECK (embedding_dimensions = 1024),
+    feature_schema_version text NOT NULL,
+    company_id text NOT NULL,
+    company_name text NOT NULL,
+    prospectus_date date NOT NULL,
+    outcome_available_at date NOT NULL,
+    industry_raw text,
+    industry_level_1 text NOT NULL,
+    industry_level_2 text NOT NULL,
+    feature_payload jsonb NOT NULL,
+    case_summary_text text NOT NULL,
+    significant_drop_5d boolean NOT NULL,
+    return_vs_offer_5d_pct double precision,
+    embedding vector(1024) NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (case_id, embedding_model)
+);
+
+CREATE INDEX IF NOT EXISTS historical_cases_date_idx
+    ON ipo_risk.historical_ipo_cases (outcome_available_at, prospectus_date);
+CREATE INDEX IF NOT EXISTS historical_cases_industry_idx
+    ON ipo_risk.historical_ipo_cases (industry_level_1, industry_level_2);
+CREATE INDEX IF NOT EXISTS historical_cases_embedding_hnsw_idx
+    ON ipo_risk.historical_ipo_cases
+    USING hnsw (embedding vector_cosine_ops)
+    WITH (m = 16, ef_construction = 100);
+
 -- 兼容早期试运行创建的char(64)字段，便于驱动使用高吞吐二进制COPY。
 ALTER TABLE ipo_risk.vector_documents
     ALTER COLUMN source_hash TYPE text;

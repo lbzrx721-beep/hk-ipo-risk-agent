@@ -26,6 +26,12 @@ from ipo_risk.agents.intervention import RiskScopeReviewController
 from ipo_risk.config import AppConfig, load_config
 from ipo_risk.agents.usage import ModelBudgetExceededError
 from ipo_risk.modeling.features import build_agent_feature_snapshot
+from ipo_risk.modeling.agent_precision import AGENT_PRECISION_FEATURE_NAMES
+from ipo_risk.modeling.risk_semantics import (
+    RISK_SEMANTIC_SCHEMA_VERSION,
+    build_risk_semantic_feature_snapshot,
+    risk_semantic_catalog,
+)
 from ipo_risk.pipeline import (
     AnalysisArtifacts,
     analyze_company,
@@ -38,7 +44,7 @@ from ipo_risk.storage.files import read_json, write_json
 Analyzer = Callable[..., AnalysisArtifacts]
 CompanyPreparer = Callable[..., object]
 PreparationProgress = Callable[[int, int, str, str], None]
-AGENT_FEATURE_SCHEMA_VERSION = 2
+AGENT_FEATURE_SCHEMA_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -133,6 +139,7 @@ def normalize_historical_agent_features(
     status_path = experiment_dir / "status.json"
     summary_path = experiment_dir / "summary.json"
     agent_matrix_path = experiment_dir / "agent_feature_matrix.csv"
+    semantic_audit_path = experiment_dir / "risk_semantic_finding_audit.jsonl"
 
     reports_by_company: dict[str, tuple[RiskAnalysisReport, Path]] = {}
     report_root = root / "artifacts" / "analysis"
@@ -173,19 +180,16 @@ def normalize_historical_agent_features(
 
     selected: list[dict[str, Any]] = []
     status_companies: dict[str, dict[str, Any]] = {}
+    semantic_audits: list[dict[str, Any]] = []
     normalized_at = _now()
     for company_id, (report, report_path) in sorted(reports_by_company.items()):
-        base_row = base_by_id.get(company_id)
-        if base_row is None:
-            raise ValueError(
-                f"historical report company is missing from feature matrix: {company_id}"
-            )
+        base_row = base_by_id.get(company_id, {})
         existing = existing_payloads.get(report.run_id, {})
         company_folder = str(
             existing.get("company_folder")
             or report_path.parents[1].name
         )
-        split = str(base_row.get("split") or existing.get("split") or "")
+        split = str(base_row.get("split") or existing.get("split") or "unassigned")
         prospectus_date = str(
             base_row.get("prospectus_date")
             or report.source_document.available_at.isoformat()
@@ -205,6 +209,52 @@ def normalize_historical_agent_features(
             report,
             as_of_date=report.source_document.available_at,
         )
+        _, classifications = build_risk_semantic_feature_snapshot(
+            report.risk_findings,
+            report.evidences,
+            available_at=report.source_document.available_at,
+            source_ref=f"analysis:{report.run_id}",
+        )
+        findings_by_id = {
+            finding.finding_id: finding for finding in report.risk_findings
+        }
+        evidences_by_id = {
+            evidence.evidence_id: evidence for evidence in report.evidences
+        }
+        for classification in classifications:
+            finding = findings_by_id[classification.finding_id]
+            referenced_evidence = [
+                evidences_by_id[evidence_id]
+                for evidence_id in finding.evidence_ids
+                if evidence_id in evidences_by_id
+            ]
+            semantic_audits.append(
+                {
+                    "semantic_schema_version": RISK_SEMANTIC_SCHEMA_VERSION,
+                    "company_id": company_id,
+                    "company_name": report.company_name,
+                    "run_id": report.run_id,
+                    "finding_id": finding.finding_id,
+                    "original_risk_type": finding.risk_type,
+                    "title": finding.title,
+                    "claim": finding.claim,
+                    "owner": finding.created_by.value,
+                    "severity": finding.severity.value,
+                    "finding_confidence": finding.confidence,
+                    "specialist_status": finding.specialist_status,
+                    "primary_family": classification.primary_family,
+                    "primary_subtype": classification.primary_subtype,
+                    "primary_label_zh": classification.primary_label_zh,
+                    "secondary_subtypes": list(classification.secondary_subtypes),
+                    "mapping_method": classification.method,
+                    "mapping_confidence": classification.mapping_confidence,
+                    "matched_keywords": list(classification.matched_keywords),
+                    "evidence_ids": [item.evidence_id for item in referenced_evidence],
+                    "evidence_pages": sorted({item.page for item in referenced_evidence}),
+                    "evidence_count": len(referenced_evidence),
+                    "report_path": _portable(report_path, root),
+                }
+            )
         feature_path = company_dir / f"{company_id}.json"
         payload = {
             "schema_version": 1,
@@ -309,6 +359,28 @@ def normalize_historical_agent_features(
         str(split): int(count)
         for split, count in agent_matrix["split"].value_counts().sort_index().items()
     }
+    semantic_audit_path.write_text(
+        "".join(
+            json.dumps(row, ensure_ascii=False) + "\n"
+            for row in semantic_audits
+        ),
+        encoding="utf-8",
+    )
+    semantic_method_counts: dict[str, int] = {}
+    semantic_family_counts: dict[str, int] = {}
+    semantic_subtype_counts: dict[str, int] = {}
+    for row in semantic_audits:
+        method = str(row["mapping_method"])
+        family = str(row["primary_family"])
+        subtype = str(row["primary_subtype"])
+        semantic_method_counts[method] = semantic_method_counts.get(method, 0) + 1
+        semantic_family_counts[family] = semantic_family_counts.get(family, 0) + 1
+        semantic_subtype_counts[subtype] = semantic_subtype_counts.get(subtype, 0) + 1
+    specific_count = sum(
+        count
+        for method, count in semantic_method_counts.items()
+        if method != "agent_role_fallback"
+    )
     summary = {
         "schema_version": 1,
         "experiment_name": experiment_name,
@@ -330,6 +402,21 @@ def normalize_historical_agent_features(
         "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
         "agent_feature_count": len(feature_columns),
         "agent_feature_columns": feature_columns,
+        "risk_semantic_schema_version": RISK_SEMANTIC_SCHEMA_VERSION,
+        "risk_semantic_finding_count": len(semantic_audits),
+        "risk_semantic_specific_classified_count": specific_count,
+        "risk_semantic_specific_classified_share": (
+            round(specific_count / len(semantic_audits), 8)
+            if semantic_audits
+            else 0.0
+        ),
+        "risk_semantic_mapping_method_counts": dict(
+            sorted(semantic_method_counts.items())
+        ),
+        "risk_semantic_family_counts": dict(sorted(semantic_family_counts.items())),
+        "risk_semantic_subtype_counts": dict(sorted(semantic_subtype_counts.items())),
+        "risk_semantic_catalog": list(risk_semantic_catalog()),
+        "risk_semantic_audit_path": _portable(semantic_audit_path, root),
         "split_counts": split_counts,
         "models": normalization_fingerprint,
         "selection_path": _portable(selection_path, root),
@@ -968,7 +1055,12 @@ def _write_feature_matrices(
         agent_columns = [
             column for column in agent_frame.columns if column not in identity_columns
         ]
-        agent_frame[agent_columns] = agent_frame[agent_columns].fillna(0)
+        zero_fill_columns = [
+            column
+            for column in agent_columns
+            if column not in AGENT_PRECISION_FEATURE_NAMES
+        ]
+        agent_frame[zero_fill_columns] = agent_frame[zero_fill_columns].fillna(0)
         agent_frame.sort_values(["split", "prospectus_date", "company_id"], inplace=True)
     else:
         agent_frame = pd.DataFrame(columns=sorted(identity_columns))
@@ -996,7 +1088,9 @@ def _write_feature_matrices(
 def _experiment_fingerprint(project_root: Path, config: AppConfig) -> dict[str, Any]:
     prompt_files = sorted((project_root / "prompts").rglob("*.md"))
     prompt_hashes = {
-        path.relative_to(project_root).as_posix(): sha256(path.read_bytes()).hexdigest()
+        path.relative_to(project_root).as_posix(): sha256(
+            path.read_bytes().replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        ).hexdigest()
         for path in prompt_files
     }
     return {

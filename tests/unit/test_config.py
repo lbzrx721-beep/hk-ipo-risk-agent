@@ -200,7 +200,7 @@ def test_default_discovery_pack_is_small_enough_for_early_visible_results(
     assert config.specialist_llm.base_url == (
         "https://ark.cn-beijing.volces.com/api/plan/v3"
     )
-    assert config.specialist_llm.model_name == "kimi-k3"
+    assert config.specialist_llm.model_name == "deepseek-v4-flash"
     assert config.specialist_llm.supports_json_object is False
     assert config.specialist_llm.reasoning_effort is None
     assert config.specialist_llm.disable_thinking is True

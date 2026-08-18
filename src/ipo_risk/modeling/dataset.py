@@ -20,6 +20,9 @@ import pandas as pd
 from ipo_risk.domain import FeatureValue
 from ipo_risk.storage.files import write_json, write_jsonl
 
+from .structured_fundamentals import load_structured_feature_snapshots
+from .rag_fundamentals import load_rag_feature_snapshots
+
 
 DEFAULT_MARKET_WINDOWS = (5, 20, 60)
 IDENTITY_COLUMNS = (
@@ -170,6 +173,18 @@ def build_competition_modeling_dataset(
     )
     daily_market = pd.read_csv(daily_market_path)
     daily_market["trade_date"] = pd.to_datetime(daily_market["trade_date"]).dt.date
+    structured_audit_path = destination / "structured_fundamental_feature_audit.jsonl"
+    if not structured_audit_path.is_file():
+        structured_audit_path = (
+            root
+            / "data"
+            / "processed"
+            / "modeling"
+            / "structured_fundamental_feature_audit.jsonl"
+        )
+    structured_by_company = load_structured_feature_snapshots(structured_audit_path)
+    rag_audit_path = destination / "rag_fundamental_feature_audit.jsonl"
+    rag_by_company = load_rag_feature_snapshots(rag_audit_path)
 
     matrix_rows: list[dict[str, Any]] = []
     audit_rows: list[dict[str, Any]] = []
@@ -183,6 +198,8 @@ def build_competition_modeling_dataset(
         as_of_date = prospectus_date
         features: dict[str, FeatureValue] = {}
         features.update(_document_features(root, manifest_row, as_of_date))
+        features.update(structured_by_company.get(company_id, {}))
+        features.update(rag_by_company.get(company_id, {}))
         features.update(
             _market_features(
                 daily_market,
@@ -286,7 +303,19 @@ def build_competition_modeling_dataset(
             "labels": labels.relative_to(root).as_posix(),
             "full_market_eod": eod.relative_to(root).as_posix(),
             "daily_market_cache": daily_market_path.relative_to(root).as_posix(),
+            "structured_fundamentals": (
+                structured_audit_path.relative_to(root).as_posix()
+                if structured_audit_path.is_file()
+                else None
+            ),
+            "rag_fundamentals": (
+                rag_audit_path.relative_to(root).as_posix()
+                if rag_audit_path.is_file()
+                else None
+            ),
         },
+        "structured_feature_company_count": len(structured_by_company),
+        "rag_feature_company_count": len(rag_by_company),
     }
     summary_path = destination / "feature_matrix_summary.json"
     write_json(summary, summary_path)

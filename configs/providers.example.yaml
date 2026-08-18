@@ -19,13 +19,12 @@ llm:
   output_price_per_million_rmb: null
   cached_input_price_per_million_rmb: null
 
-# 可选：专业Agent复用ARK API，只把模型名切换为Kimi。
-# 未配置时自动复用上面的DeepSeek llm，不影响开发运行。
+# 可选：专业Agent复用ARK Agent Plan 的 DeepSeek。
 specialist_llm:
   provider: ark
   base_url: "https://ark.cn-beijing.volces.com/api/plan/v3"
-  # model_name: "deepseek-v4-flash"  # 旧专业 Agent 模型，保留但不启用
-  model_name: "kimi-k3"
+  model_name: "deepseek-v4-flash"
+  # model_name: "kimi-k3"  # 可选替换模型，默认不启用
   supports_json_object: false
   disable_thinking: true
   api_key: "填写火山方舟ARK-API-Key"

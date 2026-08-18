@@ -17,6 +17,8 @@ from ipo_risk.domain import (
     TraceStatus,
 )
 from ipo_risk.reporting import RiskAnalysisReport
+from ipo_risk.modeling.agent_precision import build_precision_agent_feature_snapshot
+from ipo_risk.modeling.risk_semantics import build_risk_semantic_feature_snapshot
 from ipo_risk.skills import (
     extract_cash_burn_features,
     extract_concentration_features,
@@ -78,6 +80,13 @@ def build_agent_feature_snapshot(
     findings = list(report.risk_findings)
     evidences = list(getattr(report, "evidences", ()))
     traces = list(getattr(report, "agent_traces", ()))
+    succeeded_agents = {
+        trace.agent for trace in traces if trace.status is TraceStatus.SUCCEEDED
+    }
+    redemption_assessed = {
+        AgentRole.DISCOVERY,
+        AgentRole.LEGAL,
+    }.issubset(succeeded_agents)
     severity_score = {
         RiskSeverity.LOW: 1,
         RiskSeverity.MEDIUM: 2,
@@ -180,7 +189,7 @@ def build_agent_feature_snapshot(
         )
         values[f"agent_risk_{risk_type}_evidence_count"] = len(referenced_evidence)
 
-    return {
+    features = {
         name: FeatureValue(
             value=value,
             available_at=available_at,
@@ -188,6 +197,24 @@ def build_agent_feature_snapshot(
         )
         for name, value in values.items()
     }
+    semantic_features, _ = build_risk_semantic_feature_snapshot(
+        findings,
+        evidences,
+        available_at=available_at,
+        source_ref=source_ref,
+    )
+    _merge_features(features, semantic_features)
+    _merge_features(
+        features,
+        build_precision_agent_feature_snapshot(
+            findings,
+            evidences,
+            available_at=available_at,
+            source_ref=source_ref,
+            redemption_assessed=redemption_assessed,
+        ),
+    )
+    return features
 
 
 def build_post_listing_metrics(

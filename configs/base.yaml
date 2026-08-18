@@ -56,14 +56,13 @@ llm:
   # ARK Agent Plan 当前会拒绝 json_object；仍由提示词、JSON解析和Pydantic严格校验。
   supports_json_object: false
 
-# 四个专业 Agent 与风险发现 Agent 复用同一套 ARK 兼容 API，
-# 只切换模型名；每个角色一次批量核验。
-# 原 DeepSeek 模型配置保留作回退参考，不再作为专业 Agent 的默认模型。
+# 专业 Agent 与RAG字段提取复用 ARK Agent Plan 的 DeepSeek；
+# Kimi 配置仅保留作可选替换参考。
 specialist_llm:
   provider: ark
   base_url: https://ark.cn-beijing.volces.com/api/plan/v3
-  # model_name: deepseek-v4-flash  # 旧专业 Agent 模型，保留但不启用
-  model_name: kimi-k3
+  model_name: deepseek-v4-flash
+  # model_name: kimi-k3  # 可选替换模型，默认不启用
   temperature: 0.1
   max_output_tokens: 16384
   # 与风险Agent使用同一ARK路由，先采用本地结构校验，避免服务端参数不兼容。

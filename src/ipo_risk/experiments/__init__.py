@@ -6,6 +6,10 @@ from .agent_features import (
     run_agent_feature_experiment,
     select_pilot_companies,
 )
+from .consolidation import (
+    ConsolidatedAgentDatasetResult,
+    build_consolidated_agent_dataset,
+)
 from .unattended import (
     active_agent_company_ids,
     completed_agent_company_ids,
@@ -16,8 +20,10 @@ from .unattended import (
 
 __all__ = [
     "AgentFeatureExperimentResult",
+    "ConsolidatedAgentDatasetResult",
     "active_agent_company_ids",
     "completed_agent_company_ids",
+    "build_consolidated_agent_dataset",
     "load_competition_manifest",
     "normalize_historical_agent_features",
     "run_agent_feature_experiment",
