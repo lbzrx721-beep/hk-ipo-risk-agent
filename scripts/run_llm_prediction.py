@@ -73,6 +73,7 @@ def main(
     if retrieval_mode == "hybrid":
         embedding_provider = OpenAICompatibleEmbeddingProvider(
             model_name=config.embedding.model_name,
+            api_model_name=config.embedding.request_model_name,
             dimensions=config.embedding.dimensions,
             batch_size=1,
             request_concurrency=1,

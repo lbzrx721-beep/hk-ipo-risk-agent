@@ -274,6 +274,20 @@ def test_verified_export_bundle_separates_pdf_report_and_full_audit(
     tmp_path: Path,
 ) -> None:
     service, _, finding = _prepared_run(tmp_path)
+    prediction_path = tmp_path / "artifacts" / "prediction_5d.json"
+    prediction_path.write_text(
+        json.dumps(
+            {
+                "probability": 0.72,
+                "decision": "high_risk",
+                "confidence": 0.72,
+                "feature_completeness": 0.875,
+                "disclaimer": "方向性风险预警，不构成投资建议。",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
     service.review_finding(
         run_id="RUN-TEST-001",
         finding_id=finding.finding_id,
@@ -294,11 +308,13 @@ def test_verified_export_bundle_separates_pdf_report_and_full_audit(
     assert audit["export_type"] == "analysis_audit_bundle"
     assert len(audit["candidate_report"]["agent_traces"]) == 1
     assert len(audit["reviews"]) == 1
+    assert audit["prediction"]["probability"] == 0.72
 
     document = fitz.open(bundle.pdf_path)
     pdf_text = "".join(page.get_text() for page in document)
     document.close()
     assert "客户集中度风险" in pdf_text
+    assert "上市后五日风险预警" in pdf_text
     assert finding.claim in pdf_text
     assert "Customer concentration remains material" in pdf_text
 
@@ -352,6 +368,10 @@ def test_saved_candidate_report_cannot_reset_a_completed_review(tmp_path: Path) 
 
 def test_review_workbench_lists_run_progress_and_finding_details(tmp_path: Path) -> None:
     service, _, finding = _prepared_run(tmp_path)
+    (tmp_path / "artifacts" / "prediction_5d.json").write_text(
+        json.dumps({"probability": 0.35}, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     runs = service.list_runs()
     detail = service.get_finding_detail("RUN-TEST-001", finding.finding_id)
@@ -363,11 +383,62 @@ def test_review_workbench_lists_run_progress_and_finding_details(tmp_path: Path)
     assert runs[0].pending_findings == 1
     assert runs[0].reviewed_findings == 0
     assert runs[0].complete is False
+    assert runs[0].prediction == {"probability": 0.35}
     assert detail.finding == finding
     assert detail.evidences[0].evidence_id == "E-TEST-0001"
     assert detail.verification.passed is True
     assert detail.reviews == ()
     assert detail.agent_traces[0].agent is AgentRole.ORCHESTRATOR
+
+
+def test_historical_run_can_rerun_prediction_from_saved_features(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, repository, _ = _prepared_run(tmp_path)
+    feature_path = tmp_path / "artifacts" / "prelisting_features.json"
+    feature_path.write_text(
+        json.dumps(
+            {
+                "run_id": "RUN-TEST-001",
+                "company_id": "TEST",
+                "prediction_as_of": "2025-01-01",
+                "features": {"agent_score": {"value": 2.0, "unit": "score"}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_prediction(**kwargs):
+        destination = kwargs["destination_path"]
+        payload = {
+            "prediction_type": "significant_drop_5d",
+            "prediction_variant": "agent_enhanced",
+            "run_id": "RUN-TEST-001",
+            "company_id": "TEST",
+            "model_name": "test-model",
+            "probability": 0.63,
+        }
+        destination.write_text(json.dumps(payload), encoding="utf-8")
+        return payload, destination
+
+    monkeypatch.setattr(
+        "ipo_risk.reviewing.generate_runtime_prediction_from_feature_file",
+        fake_prediction,
+    )
+
+    prediction, summary = service.rerun_prediction(
+        "RUN-TEST-001",
+        variant="agent_enhanced",
+    )
+
+    assert prediction["probability"] == 0.63
+    assert summary.agent_feature_available is True
+    assert summary.prediction == prediction
+    records = repository.list_predictions(run_id="RUN-TEST-001")
+    assert len(records) == 1
+    assert records[0].risk_probability == 0.63
 
 
 def test_delete_analysis_run_removes_derived_state_but_preserves_source(

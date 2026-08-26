@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,4 +28,12 @@ class CatalogBatchRequest(BaseModel):
     company_folders: tuple[str, ...] = Field(min_length=1, max_length=50)
 
 
-__all__ = ["CatalogBatchRequest", "UploadMetadata"]
+class PredictionRequest(BaseModel):
+    """选择基础预测、Agent增强预测或自动使用当前最完整输入。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    variant: Literal["auto", "base", "agent_enhanced"] = "auto"
+
+
+__all__ = ["CatalogBatchRequest", "PredictionRequest", "UploadMetadata"]

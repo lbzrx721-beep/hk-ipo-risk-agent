@@ -100,6 +100,7 @@ class EmbeddingConfig(BaseModel):
     api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
     base_url: str = "https://open.bigmodel.cn/api/paas/v4"
     model_name: str = "embedding-3-pro"
+    api_model_name: str | None = None
     dimensions: int = Field(default=1024, ge=1)
     batch_size: int = Field(default=64, ge=1)
     request_concurrency: int = Field(default=1, ge=1, le=32)
@@ -125,6 +126,11 @@ class EmbeddingConfig(BaseModel):
         if not value:
             raise RuntimeError("Embedding API Key 未配置：请检查 configs/providers.local.yaml")
         return value
+
+    @property
+    def request_model_name(self) -> str:
+        """供应商接口使用的模型名；未单独配置时沿用索引模型名。"""
+        return (self.api_model_name or self.model_name).strip()
 
 
 class LLMConfig(BaseModel):

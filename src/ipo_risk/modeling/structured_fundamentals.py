@@ -103,6 +103,15 @@ class StructuredFundamentalDatasetResult:
 
 
 @dataclass(frozen=True)
+class StructuredFundamentalSnapshot:
+    """单份招股书的结构化发行与财务候选特征。"""
+
+    features: dict[str, FeatureValue]
+    audit: dict[str, Any]
+    missing_reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class _NumericFact:
     value: float
     year: int | None
@@ -270,6 +279,40 @@ def load_structured_feature_snapshots(
             if name in STRUCTURED_FEATURE_NAMES and isinstance(feature, dict)
         }
     return snapshots
+
+
+def extract_structured_fundamental_snapshot(
+    project_root: Path | str,
+    *,
+    available_at: date,
+    table_path: Path | None,
+    chunk_path: Path | None,
+) -> StructuredFundamentalSnapshot:
+    """复用批量训练口径，为单份在线分析提取结构化候选特征。
+
+    该接口只读取已经落盘的文本切片和表格缓存，不重新解析PDF，
+    也不调用大模型。训练与在线运行因此共享同一套提取实现。
+    """
+
+    root = Path(project_root).resolve()
+    resolved_table = (
+        table_path.resolve() if table_path is not None and table_path.is_file() else None
+    )
+    resolved_chunks = (
+        chunk_path.resolve() if chunk_path is not None and chunk_path.is_file() else None
+    )
+    features, audit, missing = _extract_company_features(
+        root,
+        manifest_row={},
+        available_at=available_at,
+        table_path=resolved_table,
+        chunk_path=resolved_chunks,
+    )
+    return StructuredFundamentalSnapshot(
+        features=features,
+        audit=audit,
+        missing_reasons=tuple(missing),
+    )
 
 
 def _extract_company_features(
@@ -1035,6 +1078,8 @@ def _portable(path: Path | None, root: Path) -> str | None:
 __all__ = [
     "STRUCTURED_FEATURE_NAMES",
     "StructuredFundamentalDatasetResult",
+    "StructuredFundamentalSnapshot",
     "build_structured_fundamental_dataset",
+    "extract_structured_fundamental_snapshot",
     "load_structured_feature_snapshots",
 ]

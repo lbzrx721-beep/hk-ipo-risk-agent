@@ -47,6 +47,7 @@ def main(
     config = load_config(root / "configs" / "base.yaml")
     provider = OpenAICompatibleEmbeddingProvider(
         model_name=config.embedding.model_name,
+        api_model_name=config.embedding.request_model_name,
         dimensions=config.embedding.dimensions,
         batch_size=config.embedding.batch_size,
         request_concurrency=config.embedding.request_concurrency,

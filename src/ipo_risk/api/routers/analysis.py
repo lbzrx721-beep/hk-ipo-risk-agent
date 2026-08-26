@@ -13,9 +13,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import StreamingResponse
 from pydantic import TypeAdapter, ValidationError
 
-from ipo_risk.agents.intervention import RiskScopeReviewDecision
+from ipo_risk.agents.intervention import (
+    LlmFailureRecoveryDecision,
+    RiskScopeReviewDecision,
+)
 from ipo_risk.api.batch_service import BatchWorkspaceRegistry
-from ipo_risk.api.schemas import CatalogBatchRequest, UploadMetadata
+from ipo_risk.api.schemas import CatalogBatchRequest, PredictionRequest, UploadMetadata
 from ipo_risk.runtime.batch_analysis_job import BatchUploadSpec
 from ipo_risk.uploads import ProspectusUploadService
 
@@ -99,8 +102,7 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
             rows = tuple(
                 item
                 for item in rows
-                if query in item.company_id.lower()
-                or query in item.company_name.lower()
+                if query in item.company_id.lower() or query in item.company_name.lower()
             )
         return {
             "count": len(rows),
@@ -118,11 +120,9 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
             results: list[dict[str, Any]] = []
             for file_name, content in payloads:
                 suggestion = service.inspect(file_name=file_name, content=content)
-                completed_runs = (
-                    service.repository.list_analysis_runs_for_source_hash(
-                        suggestion.source_hash,
-                        status="succeeded",
-                    )
+                completed_runs = service.repository.list_analysis_runs_for_source_hash(
+                    suggestion.source_hash,
+                    status="succeeded",
                 )
                 latest = completed_runs[0] if completed_runs else None
                 results.append(
@@ -140,9 +140,7 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
                         "source_hash": suggestion.source_hash,
                         "existing_run_id": latest.run_id if latest else None,
                         "existing_completed_at": (
-                            (latest.ended_at or latest.created_at).isoformat()
-                            if latest
-                            else None
+                            (latest.ended_at or latest.created_at).isoformat() if latest else None
                         ),
                     }
                 )
@@ -234,6 +232,38 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
         except (KeyError, RuntimeError, ValueError) as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return workspace.snapshot_payload()
+
+    @router.post("/batches/{batch_id}/companies/{company_key}/llm-recovery")
+    def submit_llm_recovery(
+        batch_id: str,
+        company_key: str,
+        decision: LlmFailureRecoveryDecision,
+    ) -> dict[str, Any]:
+        workspace = registry.require(batch_id)
+        try:
+            workspace.submit_llm_failure_recovery(company_key, decision)
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return workspace.snapshot_payload()
+
+    @router.post("/batches/{batch_id}/companies/{company_key}/prediction")
+    def rerun_prediction(
+        batch_id: str,
+        company_key: str,
+        request: PredictionRequest,
+    ) -> dict[str, Any]:
+        workspace = registry.require(batch_id)
+        try:
+            prediction = workspace.rerun_prediction(
+                company_key,
+                variant=request.variant,
+            )
+        except (KeyError, RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {
+            "prediction": prediction,
+            "batch": workspace.snapshot_payload(),
+        }
 
     @router.get("/batches/{batch_id}/stream")
     async def batch_stream(batch_id: str, request: Request) -> StreamingResponse:

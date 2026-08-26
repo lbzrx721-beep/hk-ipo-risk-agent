@@ -1,7 +1,8 @@
 """赛事数据的 Point-in-Time 特征矩阵构建。
 
-预测时点固定为招股书发布日期。上市日期、发行价代理和上市后行情只用于标签，
-不会进入特征列。每个特征同时写出可用日期和来源，便于自动检查数据泄漏。
+招股书事实以招股书发布日期为可用时间；最终五日风险预测以上市日期为截止点，
+市场与历史 IPO 特征只使用上市日前已经发生的数据。上市日期仅作为时间边界，
+不会进入模型特征列。每个特征同时写出可用日期和来源，便于自动检查数据泄漏。
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ IDENTITY_COLUMNS = (
     "ticker",
     "company_name",
     "prospectus_date",
+    "listing_date",
     "as_of_date",
     "split",
 )
@@ -51,6 +53,55 @@ class ModelingDatasetResult:
     summary_path: Path
     row_count: int
     feature_columns: tuple[str, ...]
+
+
+def build_listing_pre_market_feature_snapshot(
+    daily_market_path: Path,
+    *,
+    listing_date: date,
+    windows: tuple[int, ...] = DEFAULT_MARKET_WINDOWS,
+) -> dict[str, FeatureValue]:
+    """按训练口径生成单家公司的上市日前市场候选特征。"""
+
+    if not windows or any(window < 2 for window in windows):
+        raise ValueError("windows must contain values greater than one")
+    source = daily_market_path.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    daily_market = pd.read_csv(source)
+    if "trade_date" not in daily_market:
+        raise ValueError("daily market sentiment is missing trade_date")
+    daily_market["trade_date"] = pd.to_datetime(
+        daily_market["trade_date"], errors="coerce"
+    ).dt.date
+    return _market_features(
+        daily_market,
+        listing_date,
+        windows=windows,
+        source_ref=source.as_posix(),
+    )
+
+
+def build_recent_ipo_feature_snapshot(
+    labels_path: Path,
+    *,
+    listing_date: date,
+    lookback_days: int = 180,
+) -> dict[str, FeatureValue]:
+    """只使用当前公司上市日前已经观察到的历史IPO结果。"""
+
+    if lookback_days < 30:
+        raise ValueError("lookback_days must be at least 30")
+    source = labels_path.resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    labels = _prepare_labels(pd.read_csv(source, dtype={"company_id": str}))
+    return _recent_ipo_features(
+        labels,
+        listing_date,
+        lookback_days=lookback_days,
+        source_ref=source.as_posix(),
+    )
 
 
 def build_daily_market_sentiment(
@@ -193,11 +244,17 @@ def build_competition_modeling_dataset(
         company_id = str(manifest_row.get("company_id") or "").zfill(5)
         target = target_by_company.get(company_id)
         prospectus_date = _date_value(manifest_row.get("prospectus_date"))
-        if target is None or prospectus_date is None:
+        listing_date = _date_value(target.get("listing_date")) if target is not None else None
+        if target is None or prospectus_date is None or listing_date is None:
             continue
-        as_of_date = prospectus_date
+        if listing_date < prospectus_date:
+            raise ValueError(
+                f"{company_id} listing date {listing_date} precedes prospectus date "
+                f"{prospectus_date}"
+            )
+        as_of_date = listing_date
         features: dict[str, FeatureValue] = {}
-        features.update(_document_features(root, manifest_row, as_of_date))
+        features.update(_document_features(root, manifest_row, prospectus_date))
         features.update(structured_by_company.get(company_id, {}))
         features.update(rag_by_company.get(company_id, {}))
         features.update(
@@ -223,7 +280,8 @@ def build_competition_modeling_dataset(
             "company_id": company_id,
             "ticker": manifest_row.get("ticker"),
             "company_name": manifest_row.get("company_name"),
-            "prospectus_date": as_of_date.isoformat(),
+            "prospectus_date": prospectus_date.isoformat(),
+            "listing_date": listing_date.isoformat(),
             "as_of_date": as_of_date.isoformat(),
             "split": manifest_row.get("split"),
             "target_significant_drop_5d": int(bool(target["significant_drop"])),
@@ -281,7 +339,7 @@ def build_competition_modeling_dataset(
     }
     summary = {
         "schema_version": 1,
-        "prediction_as_of": "prospectus_date",
+        "prediction_as_of": "listing_date",
         "row_count": len(matrix),
         "feature_count": len(feature_columns),
         "feature_columns": list(feature_columns),
@@ -295,6 +353,8 @@ def build_competition_modeling_dataset(
             "company_post_listing_market_used_as_feature": False,
             "offer_price_proxy_used_as_feature": False,
             "listing_date_used_as_feature": False,
+            "listing_date_used_as_point_in_time_cutoff": True,
+            "market_rows_on_or_after_listing_excluded": True,
             "feature_availability_checked": True,
             "target_columns_excluded_from_features": True,
         },
@@ -590,4 +650,6 @@ __all__ = [
     "ModelingDatasetResult",
     "build_competition_modeling_dataset",
     "build_daily_market_sentiment",
+    "build_listing_pre_market_feature_snapshot",
+    "build_recent_ipo_feature_snapshot",
 ]

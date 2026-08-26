@@ -124,6 +124,34 @@ embedding:
     assert config.embedding.require_api_key() == "ollama"
 
 
+def test_embedding_api_model_name_can_differ_from_index_name(tmp_path: Path) -> None:
+    base_path = tmp_path / "base.yaml"
+    base_path.write_text(
+        """
+embedding:
+  provider: siliconflow
+  base_url: https://api.siliconflow.cn/v1
+  model_name: qwen3-embedding:4b
+  api_model_name: Qwen/Qwen3-Embedding-4B
+  dimensions: 1024
+""".strip(),
+        encoding="utf-8",
+    )
+    providers_path = tmp_path / "providers.local.yaml"
+    providers_path.write_text(
+        """
+embedding:
+  api_key: test-key
+""".strip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(base_path, providers_path)
+
+    assert config.embedding.model_name == "qwen3-embedding:4b"
+    assert config.embedding.request_model_name == "Qwen/Qwen3-Embedding-4B"
+
+
 def test_embedding_provider_performance_settings_are_loaded(
     tmp_path: Path,
 ) -> None:

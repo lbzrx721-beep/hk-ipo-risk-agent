@@ -1,4 +1,5 @@
 import {
+  ChartNoAxesCombined,
   Database,
   FileCheck2,
   LayoutDashboard,
@@ -15,6 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { AnalysisWorkspace } from "@/features/workspace/analysis-workspace";
+import { PredictionsWorkspace } from "@/features/predictions/predictions-workspace";
 import { ReportsWorkspace } from "@/features/reports/reports-workspace";
 import { batchAction, checkApiHealth, connectBatchStream, getBatch } from "@/api";
 import { ACTIVE_BATCH_KEY, mergeAnalysisEvents, type AppView } from "@/lib/presentation";
@@ -136,6 +138,9 @@ function App() {
               <Button variant={view === "workspace" ? "secondary" : "ghost"} size="sm" onClick={() => setView("workspace")}>
                 <LayoutDashboard data-icon="inline-start" />分析工作台
               </Button>
+              <Button variant={view === "predictions" ? "secondary" : "ghost"} size="sm" onClick={() => setView("predictions")}>
+                <ChartNoAxesCombined data-icon="inline-start" />五日预测
+              </Button>
               <Button variant={view === "results" ? "secondary" : "ghost"} size="sm" onClick={() => setView("results")}>
                 <FileCheck2 data-icon="inline-start" />结果与复核
               </Button>
@@ -193,6 +198,20 @@ function App() {
               onSnapshot={acceptSnapshot}
               onSelectCompany={setSelectedKey}
               onAction={(kind) => void action(kind)}
+              onOpenPredictions={() => setView("predictions")}
+            />
+          ) : view === "predictions" ? (
+            <PredictionsWorkspace
+              batch={batch}
+              selected={selected}
+              selectedKey={selectedKey}
+              busy={busy}
+              serviceAvailable={serviceAvailable}
+              onSelectCompany={setSelectedKey}
+              onSnapshot={acceptSnapshot}
+              setBusy={setBusy}
+              setError={setError}
+              onOpenResults={() => setView("results")}
             />
           ) : (
             <div className="mx-auto w-full max-w-[1920px] px-4 py-6 lg:px-6 2xl:px-8">

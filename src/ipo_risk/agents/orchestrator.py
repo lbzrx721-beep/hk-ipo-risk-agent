@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
+from functools import partial
 from typing import Annotated, Any, NotRequired, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
@@ -22,11 +23,14 @@ from ipo_risk.agents.discovery import RiskDiscoverer
 from ipo_risk.agents.grounded import AnalyzedRisk, GroundedAnalysisEngine
 from ipo_risk.agents.intervention import (
     HumanAddedRisk,
+    LlmFailureRecoveryController,
+    LlmFailureRecoveryRequest,
     RiskScopeCandidate,
     RiskScopeFunnel,
     RiskScopeReviewController,
     RiskScopeReviewDecision,
     RiskScopeReviewRequest,
+    sanitize_llm_error,
 )
 from ipo_risk.agents.risk_scoping import RiskScopePlanner
 from ipo_risk.agents.search_planning import RoleSearchPlanner
@@ -127,6 +131,16 @@ class _DecisionExecution:
     trace: AgentTrace
 
 
+class _ManualBm25Fallback(RuntimeError):
+    """使用者明确选择以BM25目录检索替代本轮风险发现模型。"""
+
+    def __init__(self, reason: str, technical_detail: str, attempt: int) -> None:
+        super().__init__(technical_detail)
+        self.reason = reason
+        self.technical_detail = technical_detail
+        self.attempt = attempt
+
+
 class _ProfessionalGraphState(TypedDict):
     """LangGraph 专业 Agent 扇出/汇合阶段的共享状态。"""
 
@@ -212,6 +226,7 @@ class MultiAgentOrchestrator:
         risk_scope_planner: RiskScopePlanner | None = None,
         risk_scope_retry_policy: RetryPolicy | None = None,
         risk_scope_review_controller: RiskScopeReviewController | None = None,
+        llm_failure_recovery_controller: LlmFailureRecoveryController | None = None,
         decision_conflict_batch_size: int = 12,
     ) -> None:
         if decision_conflict_batch_size < 2:
@@ -223,6 +238,7 @@ class MultiAgentOrchestrator:
         self._risk_discoverer = risk_discoverer
         self._risk_scope_planner = risk_scope_planner
         self._risk_scope_review_controller = risk_scope_review_controller
+        self._llm_failure_recovery_controller = llm_failure_recovery_controller
         self._decision_conflict_batch_size = decision_conflict_batch_size
         self._risk_scope_retry_policy = risk_scope_retry_policy or RetryPolicy(
             retry_if=retry_model_node_error
@@ -234,6 +250,72 @@ class MultiAgentOrchestrator:
             retry_if=retry_model_node_error
         )
         self._professional_graph = self._build_professional_graph()
+
+    def _discover_with_recovery(
+        self,
+        invocation: Callable[[], Any],
+        *,
+        run_id: str,
+        discoverer: RiskDiscoverer,
+        progress_callback: ProgressCallback | None,
+    ) -> Any:
+        """模型彻底失败时等待用户选择；重试只重新执行风险发现调用。"""
+        controller = self._llm_failure_recovery_controller
+        if controller is None:
+            return invocation()
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                result = invocation()
+                failed_batches = len(result.batch_errors)
+                all_batches_failed = result.batch_count > 0 and failed_batches >= result.batch_count
+                if not all_batches_failed:
+                    return result
+                batch_label = (
+                    "风险原文包"
+                    if result.discovery_mode == "vector_guided_original_text"
+                    else "全文扫描批次"
+                )
+                last_error = (
+                    str(result.batch_errors[-1]) if result.batch_errors else "未返回错误明细"
+                )
+                failure: BaseException | str = (
+                    f"全部{result.batch_count}个{batch_label}失败；最后错误：{last_error}"
+                )
+            except ModelBudgetExceededError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - 转为页面可恢复状态
+                failure = exc
+
+            reason, technical_detail = sanitize_llm_error(failure)
+            request = LlmFailureRecoveryRequest(
+                run_id=run_id,
+                provider=getattr(discoverer, "provider_name", None),
+                model=getattr(discoverer, "model_name", None),
+                reason=reason,
+                technical_detail=technical_detail,
+                attempt=attempt,
+            )
+            _emit_progress(
+                progress_callback,
+                "llm_recovery_requested",
+                f"风险发现Agent调用失败，分析已暂停：{reason} 技术详情：{technical_detail}",
+            )
+            decision = controller.request_resolution(request)
+            if decision.action == "retry_llm":
+                _emit_progress(
+                    progress_callback,
+                    "llm_recovery_retry_selected",
+                    "已选择重试风险发现LLM；复用现有PDF解析与向量索引。",
+                )
+                continue
+            _emit_progress(
+                progress_callback,
+                "llm_recovery_bm25_selected",
+                "已选择降级使用BM25目录检索；不会再次调用风险发现LLM。",
+            )
+            raise _ManualBm25Fallback(reason, technical_detail, attempt)
 
     def _build_professional_graph(self) -> Any:
         """构建四路并行、统一汇合到决策 Agent 的 LangGraph。"""
@@ -1010,9 +1092,7 @@ class MultiAgentOrchestrator:
             and proposal.analyzed_risk.analysis.evidence_chunk_ids
         )
         unresolved_proposals = tuple(
-            proposal
-            for proposal in ordered_proposals
-            if proposal not in eligible_proposals
+            proposal for proposal in ordered_proposals if proposal not in eligible_proposals
         )
         _emit_progress(
             progress_callback,
@@ -1029,7 +1109,7 @@ class MultiAgentOrchestrator:
             json.dumps(
                 {
                     proposal.analyzed_risk.rule.id: proposal.analyzed_risk.rule.name
-                        for proposal in ordered_proposals
+                    for proposal in ordered_proposals
                 },
                 ensure_ascii=False,
             ),
@@ -1070,13 +1150,10 @@ class MultiAgentOrchestrator:
                     None,
                 )
                 if callable(adjudicate_with_feedback):
-                    stream_marker = (
-                        f"[[batch:{batch_index}/{max(1, output_batch_count)}]]"
-                    )
+                    stream_marker = f"[[batch:{batch_index}/{max(1, output_batch_count)}]]"
                     try:
                         supports_stream_marker = (
-                            "stream_marker"
-                            in signature(adjudicate_with_feedback).parameters
+                            "stream_marker" in signature(adjudicate_with_feedback).parameters
                         )
                     except (TypeError, ValueError):
                         supports_stream_marker = False
@@ -1084,11 +1161,7 @@ class MultiAgentOrchestrator:
                         lambda correction_feedback: adjudicate_with_feedback(
                             decision_batch_proposals,
                             correction_feedback=correction_feedback,
-                            **(
-                                {"stream_marker": stream_marker}
-                                if supports_stream_marker
-                                else {}
-                            ),
+                            **({"stream_marker": stream_marker} if supports_stream_marker else {}),
                         )
                     )
                 else:
@@ -1403,16 +1476,24 @@ class MultiAgentOrchestrator:
             tool_output: JsonValue | None
             try:
                 if guided_discover is not None:
-                    discovery_result = guided_discover(
+                    invocation = partial(
+                        guided_discover,
                         self._engine.chunks,
                         self._rules,
                         corpus_selector=self._engine.select_discovery_corpus,
                     )
                 else:
-                    discovery_result = discoverer.discover(
+                    invocation = partial(
+                        discoverer.discover,
                         self._engine.chunks,
                         self._rules,
                     )
+                discovery_result = self._discover_with_recovery(
+                    invocation,
+                    run_id=run_id,
+                    discoverer=discoverer,
+                    progress_callback=progress_callback,
+                )
                 discovered = tuple(discovery_result.risks)
                 discovery_seed_ids_by_risk = {
                     risk.risk_type: risk.evidence_chunk_ids for risk in discovered
@@ -1599,6 +1680,31 @@ class MultiAgentOrchestrator:
                 }
             except ModelBudgetExceededError:
                 raise
+            except _ManualBm25Fallback as exc:
+                discovery_error = exc.technical_detail
+                discovered = ()
+                active_rules = list(self._rules)
+                self._engine.enable_bm25_fallback(
+                    f"使用者在风险发现模型失败后选择BM25：{exc.reason}"
+                )
+                discovery_funnel = RiskScopeFunnel(
+                    catalog_added=len(active_rules),
+                    scoped_in=len(active_rules),
+                    consolidation_mode="manual_bm25_fallback",
+                    consolidation_error=discovery_error,
+                )
+                discovery_status = TraceStatus.FAILED
+                tool_status = ToolCallStatus.FAILED
+                tool_output = {
+                    "mode": "manual_bm25_fallback",
+                    "analysis_strategy": "fixed_catalog_bm25_fallback",
+                    "fallback_catalog_used": True,
+                    "recovery_action": "fallback_bm25",
+                    "recovery_attempt": exc.attempt,
+                    "failure_reason": exc.reason,
+                }
+                output_refs = ()
+                discovery_decision = "风险发现LLM失败；使用者明确选择BM25目录检索继续分析。"
             except Exception as exc:  # noqa: BLE001
                 discovery_error = str(exc).strip() or type(exc).__name__
                 discovered = ()

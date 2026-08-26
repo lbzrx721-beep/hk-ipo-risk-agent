@@ -55,6 +55,7 @@ def main() -> int:
         api_key=config.embedding.require_api_key(),
         base_url=config.embedding.base_url,
         model_name=config.embedding.model_name,
+        api_model_name=config.embedding.request_model_name,
         dimensions=config.embedding.dimensions,
         batch_size=config.embedding.batch_size,
         request_concurrency=1,

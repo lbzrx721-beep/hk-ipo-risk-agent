@@ -30,6 +30,79 @@ export type RiskScopeReview = {
   };
 };
 
+export type LlmFailureRecovery = {
+  request_id: string;
+  run_id: string;
+  stage: string;
+  agent: string;
+  provider?: string | null;
+  model?: string | null;
+  reason: string;
+  technical_detail: string;
+  attempt: number;
+  requested_at?: string;
+};
+
+export type PredictionKeyInput = {
+  feature: string;
+  label: string;
+  value: number | boolean | string | null;
+};
+
+export type RecallGuardSignal = {
+  feature: string;
+  label: string;
+  value: number | null;
+  historical_percentile: number | null;
+  risk_contribution: number;
+  available: boolean;
+};
+
+export type HighRiskRecallGuard = {
+  schema_version: string;
+  enabled: boolean;
+  policy_version?: string;
+  watchlist: boolean;
+  caught_beyond_primary_model: boolean;
+  score?: number;
+  threshold?: number;
+  available_feature_count?: number;
+  feature_count?: number;
+  reasons: string[];
+  feature_signals?: RecallGuardSignal[];
+  note: string;
+};
+
+export type RuntimePrediction = {
+  schema_version: string;
+  prediction_type: "significant_drop_5d";
+  prediction_variant?: "base" | "agent_enhanced" | string;
+  run_id: string;
+  company_id: string;
+  company_name: string;
+  generated_at: string;
+  model_name: string;
+  probability: number;
+  predicted_significant_drop_5d: boolean;
+  decision: "high_risk" | "low_risk" | "uncertain" | string;
+  requires_review: boolean;
+  risk_level: "low" | "medium" | "high" | string;
+  confidence: number;
+  feature_count: number;
+  available_feature_count: number;
+  feature_completeness: number;
+  candidate_feature_count?: number;
+  available_candidate_feature_count?: number;
+  feature_readiness?: "ready" | "review_required" | "blocked" | string;
+  feature_group_completeness?: Record<string, number>;
+  missing_model_features?: string[];
+  matched_reference_features: boolean;
+  key_inputs: PredictionKeyInput[];
+  recall_guard?: HighRiskRecallGuard;
+  warnings: string[];
+  disclaimer: string;
+};
+
 export type BatchCompany = {
   company_key: string;
   segment_id: string;
@@ -51,6 +124,17 @@ export type BatchCompany = {
   preparation_state?: string | null;
   preparation_error?: string | null;
   risk_scope_review?: RiskScopeReview | null;
+  llm_failure_recovery?: LlmFailureRecovery | null;
+  feature_path?: string | null;
+  base_feature_path?: string | null;
+  base_prediction?: RuntimePrediction | null;
+  base_prediction_path?: string | null;
+  base_prediction_status?: string | null;
+  base_prediction_error?: string | null;
+  prediction?: RuntimePrediction | null;
+  prediction_path?: string | null;
+  prediction_status?: string | null;
+  prediction_error?: string | null;
   progress?: CompanyProgress | null;
 };
 
@@ -140,6 +224,10 @@ export type ReviewRun = {
   complete: boolean;
   report_path?: string | null;
   verified_report_path?: string | null;
+  base_feature_available: boolean;
+  agent_feature_available: boolean;
+  base_prediction?: RuntimePrediction | null;
+  prediction?: RuntimePrediction | null;
 };
 
 export type StoredFinding = {

@@ -2,6 +2,9 @@
 # 程序固定读取项目内这个文件，不读取 Windows 用户环境变量。
 embedding:
   api_key: "填写智谱BigModel-API-Key"
+  # 可选：当供应商API模型名与本地缓存/pgvector索引名不同时单独填写。
+  # model_name: "qwen3-embedding:4b"
+  # api_model_name: "Qwen/Qwen3-Embedding-4B"
   # 向量供应商级性能参数，可按本地Ollama或云API能力独立调整。
   batch_size: 64
   request_concurrency: 4

@@ -1,6 +1,6 @@
 import type { AnalysisEvent, BatchCompany } from "@/types";
 
-export type AppView = "workspace" | "results";
+export type AppView = "workspace" | "predictions" | "results";
 export type FindingFilter = "all" | "pending" | "verified" | "rejected";
 
 export const ACTIVE_BATCH_KEY = "ipo-risk-active-batch";
@@ -9,6 +9,7 @@ export const stateLabel: Record<string, string> = {
   pending: "等待中",
   preparing: "解析与索引",
   ready: "等待 Agent",
+  awaiting_recovery: "等待处理模型异常",
   awaiting_review: "待确认风险",
   running: "分析中",
   pausing: "准备暂停",
@@ -97,6 +98,7 @@ export function statusProgress(company: BatchCompany): number {
     pending: 3,
     preparing: 18,
     ready: 28,
+    awaiting_recovery: 38,
     awaiting_review: 42,
     running: 68,
     pausing: 75,
@@ -118,7 +120,14 @@ function durableEvent(event: AnalysisEvent): boolean {
     "degraded",
     "failed",
     "skipped",
-  ].includes(action) || event.stage.startsWith("risk_scope_review_");
+  ].includes(action) || [
+    "features_completed",
+    "features_failed",
+    "prediction_started",
+    "prediction_completed",
+    "prediction_failed",
+    "features_started",
+  ].includes(event.stage) || event.stage.startsWith("risk_scope_review_");
 }
 
 function eventIdentity(event: AnalysisEvent): string {
@@ -179,12 +188,19 @@ export function batchProgress(companies: BatchCompany[]): number {
 }
 
 export function companyStage(company: BatchCompany, events: AnalysisEvent[]): number {
-  if (company.state === "completed") return 5;
+  if (company.state === "completed") return 8;
+  if (events.some((event) => event.stage === "completed")) return 8;
+  if (
+    company.prediction
+    || events.some((event) => ["prediction_started", "prediction_completed", "prediction_failed"].includes(event.stage))
+  ) return 7;
+  if (events.some((event) => ["features_started", "features_completed", "features_failed"].includes(event.stage))) return 6;
   const agents = company.progress?.agents;
   if (agents?.decision && agents.decision.state !== "pending") return 5;
   if (["finance", "legal", "business", "market"].some((role) => agents?.[role] && agents[role].state !== "pending")) return 4;
   if (events.some((event) => eventRole(event.stage) === "decision")) return 5;
   if (events.some((event) => ["finance", "legal", "business", "market"].includes(eventRole(event.stage) ?? ""))) return 4;
+  if (company.state === "awaiting_recovery") return 2;
   if (company.state === "awaiting_review") return 3;
   if (events.some((event) => eventRole(event.stage) === "discovery")) return 2;
   if (["ready", "running", "pausing", "paused"].includes(company.state)) return 2;

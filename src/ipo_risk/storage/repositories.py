@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+from uuid import uuid4
 
 from ipo_risk.domain import (
     CompanyRecord,
@@ -56,6 +57,22 @@ class AnalysisRunRecord:
     report_path: str | None
     verified_report_path: str | None
     error: str | None
+    created_at: datetime
+
+
+@dataclass(frozen=True)
+class PredictionRecord:
+    """一次可追溯的模型预测记录。"""
+
+    prediction_id: str
+    run_id: str | None
+    company_id: str
+    as_of_date: date
+    horizon: int
+    target: str
+    risk_probability: float
+    model_version: str
+    payload: dict[str, Any]
     created_at: datetime
 
 
@@ -610,6 +627,77 @@ class CatalogRepository:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(self._analysis_run_from_row(row) for row in rows)
 
+    def save_prediction(
+        self,
+        *,
+        run_id: str | None,
+        company_id: str,
+        as_of_date: date,
+        payload: dict[str, Any],
+    ) -> PredictionRecord:
+        """保存一次五日预测快照；重复重算会保留独立历史记录。"""
+
+        created_at = datetime.now(timezone.utc)
+        record = PredictionRecord(
+            prediction_id=f"PRED-{company_id}-{uuid4().hex[:16]}",
+            run_id=run_id,
+            company_id=company_id,
+            as_of_date=as_of_date,
+            horizon=5,
+            target=str(payload.get("prediction_type") or "significant_drop_5d"),
+            risk_probability=float(payload["probability"]),
+            model_version=str(payload.get("model_name") or "unknown"),
+            payload=dict(payload),
+            created_at=created_at,
+        )
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO predictions(
+                    prediction_id, run_id, company_id, as_of_date, horizon,
+                    target, risk_probability, model_version, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    record.prediction_id,
+                    record.run_id,
+                    record.company_id,
+                    record.as_of_date.isoformat(),
+                    record.horizon,
+                    record.target,
+                    record.risk_probability,
+                    record.model_version,
+                    _json_dumps(record.payload),
+                    record.created_at.isoformat(),
+                ),
+            )
+        return record
+
+    def list_predictions(self, *, run_id: str | None = None) -> tuple[PredictionRecord, ...]:
+        query = "SELECT * FROM predictions"
+        parameters: tuple[str, ...] = ()
+        if run_id is not None:
+            query += " WHERE run_id = ?"
+            parameters = (run_id,)
+        query += " ORDER BY created_at DESC, prediction_id DESC"
+        with self._connection() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return tuple(
+            PredictionRecord(
+                prediction_id=str(row["prediction_id"]),
+                run_id=str(row["run_id"]) if row["run_id"] is not None else None,
+                company_id=str(row["company_id"]),
+                as_of_date=date.fromisoformat(str(row["as_of_date"])),
+                horizon=int(row["horizon"]),
+                target=str(row["target"]),
+                risk_probability=float(row["risk_probability"]),
+                model_version=str(row["model_version"]),
+                payload=dict(_json_loads(str(row["payload_json"]))),
+                created_at=datetime.fromisoformat(str(row["created_at"])),
+            )
+            for row in rows
+        )
+
     def get_finding(self, run_id: str, finding_id: str) -> RiskFinding | None:
         with self._connection() as connection:
             row = connection.execute(
@@ -857,4 +945,9 @@ class CatalogRepository:
         )
 
 
-__all__ = ["AnalysisRunRecord", "CatalogCounts", "CatalogRepository"]
+__all__ = [
+    "AnalysisRunRecord",
+    "CatalogCounts",
+    "CatalogRepository",
+    "PredictionRecord",
+]

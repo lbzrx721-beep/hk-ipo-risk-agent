@@ -22,7 +22,10 @@ from ipo_risk.agents.analysis import (
 from ipo_risk.agents.decision import DecisionAnalyzer, DeepSeekDecisionAnalyzer
 from ipo_risk.agents.discovery import DeepSeekOpenRiskDiscoverer, RiskDiscoverer
 from ipo_risk.agents.grounded import EvidenceAnalyzer, GroundedAnalysisEngine
-from ipo_risk.agents.intervention import RiskScopeReviewController
+from ipo_risk.agents.intervention import (
+    LlmFailureRecoveryController,
+    RiskScopeReviewController,
+)
 from ipo_risk.agents.orchestrator import MultiAgentOrchestrator
 from ipo_risk.agents.specialist import (
     DeepSeekSpecialistBatchAnalyzer,
@@ -58,7 +61,10 @@ from ipo_risk.domain import (
 from ipo_risk.parser.document_parser import PageResult, parse_document
 from ipo_risk.parser.evidence_renderer import render_evidence_screenshot
 from ipo_risk.parser.layout import extract_printed_page_label
-from ipo_risk.modeling.features import build_prelisting_feature_snapshot
+from ipo_risk.modeling.prelisting import (
+    collect_prelisting_base_candidates,
+    collect_prelisting_candidates,
+)
 from ipo_risk.reporting import (
     AnalysisSummary,
     RiskAnalysisReport,
@@ -78,6 +84,10 @@ from ipo_risk.retrieval.semantic import (
 )
 from ipo_risk.retrieval.pgvector import PgVectorRetriever
 from ipo_risk.resilience import RetryPolicy, retry_model_node_error
+from ipo_risk.runtime.prediction import (
+    DEFAULT_BASE_MODEL_PATH,
+    generate_runtime_prediction,
+)
 from ipo_risk.storage.files import (
     read_json,
     read_jsonl,
@@ -85,13 +95,30 @@ from ipo_risk.storage.files import (
     write_json,
     write_jsonl,
 )
+
+
 from ipo_risk.storage.ingestion import register_company_sources
 from ipo_risk.storage.paths import DocumentPaths
 from ipo_risk.storage.repositories import CatalogRepository
 
 
+class _UnavailableRiskDiscoverer:
+    """把缺少模型配置也转换为可由页面处理的模型故障。"""
+
+    prompt_version = "document-first-risk-discovery-v6"
+
+    def __init__(self, *, provider_name: str, model_name: str, reason: str) -> None:
+        self.provider_name = provider_name
+        self.model_name = model_name
+        self._reason = reason
+
+    def discover(self, chunks: Any, known_rules: Any) -> Any:  # noqa: ARG002
+        raise RuntimeError(self._reason)
+
+
 _TO_SIMPLIFIED = OpenCC("t2s")
 ProgressCallback = Callable[[str, str], None]
+PreparationArtifactCallback = Callable[[Mapping[str, Any]], None]
 
 
 class _DeferredSemanticRetriever:
@@ -187,6 +214,7 @@ class AnalysisArtifacts:
     tables_path: Path | None = None
     embedding_dir: Path | None = None
     prelisting_features_path: Path | None = None
+    prediction_path: Path | None = None
     model_usage: ModelUsageSnapshot | None = None
 
 
@@ -367,6 +395,7 @@ def analyze_prospectus(
     risk_discoverer: RiskDiscoverer | None = None,
     risk_scope_planner: RiskScopePlanner | None = None,
     risk_scope_review_controller: RiskScopeReviewController | None = None,
+    llm_failure_recovery_controller: LlmFailureRecoveryController | None = None,
     decision_conflict_batch_size: int = 12,
     vector_store_backend: str = "numpy",
     postgres_dsn: str | None = None,
@@ -476,10 +505,7 @@ def analyze_prospectus(
         else None
     )
     semantic_retriever: (
-        SemanticRetriever
-        | PgVectorRetriever
-        | _DeferredSemanticRetriever
-        | None
+        SemanticRetriever | PgVectorRetriever | _DeferredSemanticRetriever | None
     ) = None
     vector_executor: ThreadPoolExecutor | None = None
     vector_future: Future[SemanticRetriever | PgVectorRetriever | None] | None = None
@@ -534,9 +560,7 @@ def analyze_prospectus(
                     )
                     retriever = memory_retriever
                 else:
-                    raise ValueError(
-                        "vector_store_backend must be numpy or pgvector"
-                    )
+                    raise ValueError("vector_store_backend must be numpy or pgvector")
                 _emit_progress(
                     progress_callback,
                     "embedding_completed",
@@ -597,6 +621,7 @@ def analyze_prospectus(
             risk_discoverer=risk_discoverer,
             risk_scope_planner=risk_scope_planner,
             risk_scope_review_controller=risk_scope_review_controller,
+            llm_failure_recovery_controller=llm_failure_recovery_controller,
             decision_conflict_batch_size=decision_conflict_batch_size,
             risk_scope_retry_policy=RetryPolicy(
                 max_retries=max_model_retries,
@@ -984,45 +1009,79 @@ def analyze_prospectus(
         evidence_display_zh_hans=evidence_display,
     )
     prelisting_features_path: Path | None = None
+    prelisting_feature_snapshot: Mapping[str, object] = {}
+    prelisting_feature_units: Mapping[str, str] = {}
+    prelisting_feature_formula_versions: Mapping[str, str] = {}
+    prediction_as_of: date | None = None
     if company_info is not None:
         try:
             raw_as_of = company_info.get("as_of_date")
-            feature_as_of: date | None = None
+            source_as_of: date | None = None
             if isinstance(raw_as_of, datetime):
-                feature_as_of = raw_as_of.date()
+                source_as_of = raw_as_of.date()
             elif isinstance(raw_as_of, date):
-                feature_as_of = raw_as_of
+                source_as_of = raw_as_of
             elif isinstance(raw_as_of, str):
                 try:
-                    feature_as_of = date.fromisoformat(raw_as_of.strip())
+                    source_as_of = date.fromisoformat(raw_as_of.strip())
                 except ValueError:
-                    feature_as_of = None
-            if feature_as_of is not None:
-                feature_snapshot = build_prelisting_feature_snapshot(
+                    source_as_of = None
+            raw_listing_date = company_info.get("listing_date")
+            listing_date: date | None = None
+            if isinstance(raw_listing_date, datetime):
+                listing_date = raw_listing_date.date()
+            elif isinstance(raw_listing_date, date):
+                listing_date = raw_listing_date
+            elif isinstance(raw_listing_date, str):
+                try:
+                    listing_date = date.fromisoformat(raw_listing_date.strip())
+                except ValueError:
+                    listing_date = None
+            candidate_as_of = listing_date or source_as_of
+            prediction_as_of = listing_date
+            if candidate_as_of is not None:
+                _emit_progress(
+                    progress_callback,
+                    "features_started",
+                    (
+                        "正在自动采集发行、财务、文档、上市前市场、近期IPO、"
+                        "Agent风险与数据质量候选特征。"
+                    ),
+                )
+                candidate_snapshot = collect_prelisting_candidates(
                     report,
+                    project_root=project_root,
                     company_info=dict(company_info),
-                    as_of_date=feature_as_of,
+                    prediction_as_of=candidate_as_of,
+                    tables_path=document_paths.tables_path,
+                    chunks_path=document_paths.chunks_path,
+                    listing_date=listing_date,
+                    progress_callback=lambda current, total, detail: _emit_progress(
+                        progress_callback,
+                        "features_progress",
+                        f"[{current}/{total}] {detail}",
+                    ),
                 )
                 write_json(
-                    {
-                        "schema_version": "1.0",
-                        "run_id": run_id,
-                        "company_id": company_id,
-                        "as_of_date": feature_as_of.isoformat(),
-                        "usage_scope": "pre_listing_prediction_only",
-                        "features": {
-                            name: value.model_dump(mode="json")
-                            for name, value in sorted(feature_snapshot.items())
-                        },
-                    },
+                    candidate_snapshot.to_payload(
+                        run_id=run_id,
+                        company_id=company_id,
+                    ),
                     document_paths.prelisting_features_path,
                     pretty=True,
                 )
                 prelisting_features_path = document_paths.prelisting_features_path
+                prelisting_feature_snapshot = candidate_snapshot.features
+                prelisting_feature_units = candidate_snapshot.feature_units
+                prelisting_feature_formula_versions = candidate_snapshot.feature_formula_versions
                 _emit_progress(
                     progress_callback,
                     "features_completed",
-                    f"上市前特征快照已生成：{len(feature_snapshot)}项。",
+                    (
+                        "上市前宽候选特征快照已生成："
+                        f"{len(candidate_snapshot.features)}项；"
+                        "预测时将按模型契约固定取值。"
+                    ),
                 )
         except Exception as exc:  # noqa: BLE001
             _logger.warning("上市前特征快照生成失败，不影响风险报告: %s", exc)
@@ -1032,6 +1091,40 @@ def analyze_prospectus(
                 f"风险报告已完成，但上市前特征快照生成失败：{exc}",
             )
     write_risk_report(report, document_paths.report_path)
+    prediction_path: Path | None = None
+    try:
+        _emit_progress(
+            progress_callback,
+            "prediction_started",
+            "正在合并上市前基础特征与最新Agent风险特征。",
+        )
+        prediction, prediction_path = generate_runtime_prediction(
+            project_root=project_root,
+            company_id=company_id,
+            company_name=company_name,
+            run_id=run_id,
+            features=prelisting_feature_snapshot,
+            report_path=document_paths.report_path,
+            prediction_as_of=prediction_as_of,
+            feature_units=prelisting_feature_units,
+            feature_formula_versions=prelisting_feature_formula_versions,
+        )
+        _emit_progress(
+            progress_callback,
+            "prediction_completed",
+            (
+                "五日显著下跌预测完成："
+                f"概率{prediction['probability']:.1%}，"
+                f"输入完整度{prediction['feature_completeness']:.0%}。"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - 风险报告不能因预测资源失败而丢失
+        _logger.warning("五日显著下跌预测失败，不影响风险报告: %s", exc)
+        _emit_progress(
+            progress_callback,
+            "prediction_failed",
+            f"风险与证据已保存，但五日显著下跌预测暂不可用：{exc}",
+        )
     _emit_progress(
         progress_callback,
         "completed",
@@ -1057,6 +1150,7 @@ def analyze_prospectus(
         tables_path=document_paths.tables_path,
         embedding_dir=embedding_dir,
         prelisting_features_path=prelisting_features_path,
+        prediction_path=prediction_path,
         model_usage=(model_usage_ledger.snapshot() if model_usage_ledger is not None else None),
     )
 
@@ -1068,6 +1162,7 @@ def analyze_company(
     document_id: str | None = None,
     min_findings: int = 1,
     risk_scope_review_controller: RiskScopeReviewController | None = None,
+    llm_failure_recovery_controller: LlmFailureRecoveryController | None = None,
     progress_callback: ProgressCallback | None = None,
 ) -> AnalysisArtifacts:
     """登记公司资料，并分析指定或最新的正式招股书版本。"""
@@ -1115,6 +1210,7 @@ def analyze_company(
             api_key=config.embedding.require_api_key(),
             base_url=config.embedding.base_url,
             model_name=config.embedding.model_name,
+            api_model_name=config.embedding.request_model_name,
             dimensions=config.embedding.dimensions,
             batch_size=config.embedding.batch_size,
             request_concurrency=config.embedding.request_concurrency,
@@ -1133,6 +1229,19 @@ def analyze_company(
     risk_discoverer: RiskDiscoverer | None = None
     risk_scope_planner: RiskScopePlanner | None = None
     model_usage_ledger: ModelUsageLedger | None = None
+    if (
+        config.agents.enable_open_discovery
+        and llm_failure_recovery_controller is not None
+        and not config.llm.is_configured
+    ):
+        risk_discoverer = _UnavailableRiskDiscoverer(
+            provider_name=config.llm.provider,
+            model_name=config.llm.model_name,
+            reason=(
+                f"{config.llm.provider} API Key 未配置，风险发现LLM无法启动；"
+                "请配置密钥并重启服务后重新分析，或选择BM25降级继续。"
+            ),
+        )
     if config.llm.is_configured:
         budget_config = config.agents.model_budget
         model_usage_ledger = ModelUsageLedger(
@@ -1326,6 +1435,7 @@ def analyze_company(
         risk_discoverer=risk_discoverer,
         risk_scope_planner=risk_scope_planner,
         risk_scope_review_controller=risk_scope_review_controller,
+        llm_failure_recovery_controller=llm_failure_recovery_controller,
         decision_conflict_batch_size=config.agents.decision_conflict_batch_size,
         vector_store_backend=config.vector_store.backend,
         postgres_dsn=(
@@ -1334,9 +1444,7 @@ def analyze_company(
             else None
         ),
         postgres_schema=config.vector_store.postgres_schema,
-        postgres_connect_timeout_seconds=(
-            config.vector_store.postgres_connect_timeout_seconds
-        ),
+        postgres_connect_timeout_seconds=(config.vector_store.postgres_connect_timeout_seconds),
         lexical_top_k=config.retrieval.lexical_top_k,
         semantic_top_k=config.retrieval.semantic_top_k,
         rerank_top_k=config.retrieval.rerank_top_k,
@@ -1351,10 +1459,7 @@ def analyze_company(
         artifacts.report,
         _portable_path(artifacts.report_path, root),
     )
-    if (
-        embedding_provider is not None
-        and artifacts.embedding_dir is not None
-    ):
+    if embedding_provider is not None and artifacts.embedding_dir is not None:
         index_suffix = sha256(
             f"{embedding_provider.model_name}:{embedding_provider.dimensions}".encode()
         ).hexdigest()[:12]
@@ -1397,6 +1502,11 @@ class CompanyPreparationResult:
     embedding_ready: bool
     embedding_cache_hit: bool
     parser_cache_hit: bool
+    base_feature_path: str | None = None
+    base_prediction: dict[str, Any] | None = None
+    base_prediction_path: str | None = None
+    base_prediction_status: str = "unavailable"
+    base_prediction_error: str | None = None
 
 
 def prepare_company_semantic_index(
@@ -1406,6 +1516,7 @@ def prepare_company_semantic_index(
     request_concurrency: int | None = None,
     embedding_provider: OpenAICompatibleEmbeddingProvider | None = None,
     progress_callback: ProgressCallback | None = None,
+    artifact_callback: PreparationArtifactCallback | None = None,
 ) -> CompanyPreparationResult:
     """只解析并向量化一家公司，不调用风险或专业Agent。"""
     config = load_config()
@@ -1444,6 +1555,98 @@ def prepare_company_semantic_index(
         min_text_chars_before_ocr=config.parser.min_text_chars_before_ocr,
         progress_callback=progress_callback,
     )
+    company_info = read_json(root / ingestion.company.metadata_file)
+    listing_date = ingestion.company.listing_date
+    candidate_as_of = listing_date or document.available_at
+    base_feature_path = prepared.paths.prelisting_features_path.with_name(
+        "prelisting_features_base.json"
+    )
+    base_prediction_path = prepared.paths.report_path.with_name("prediction_5d_base.json")
+    base_prediction: dict[str, Any] | None = None
+    base_prediction_status = "unavailable"
+    base_prediction_error: str | None = None
+    try:
+        _emit_progress(
+            progress_callback,
+            "base_features_started",
+            "PDF解析完成，正在采集基础发行、财务和上市前市场特征。",
+        )
+        base_snapshot = collect_prelisting_base_candidates(
+            project_root=root,
+            company_info=dict(company_info),
+            company_id=ingestion.company.company_id,
+            source_ref=document.local_file,
+            source_available_at=document.available_at,
+            page_count=len(prepared.pages),
+            chunk_count=len(prepared.chunks),
+            prediction_as_of=candidate_as_of,
+            tables_path=prepared.paths.tables_path,
+            chunks_path=prepared.paths.chunks_path,
+            listing_date=listing_date,
+        )
+        write_json(
+            base_snapshot.to_payload(
+                run_id=f"BASE-{document.document_id}",
+                company_id=ingestion.company.company_id,
+            ),
+            base_feature_path,
+            pretty=True,
+        )
+        _emit_progress(
+            progress_callback,
+            "base_prediction_started",
+            "基础特征已就绪，正在计算五日显著下跌快速预测。",
+        )
+        base_prediction, base_prediction_path = generate_runtime_prediction(
+            project_root=root,
+            company_id=ingestion.company.company_id,
+            company_name=ingestion.company.company_name_zh,
+            run_id=f"BASE-{document.document_id}",
+            features=base_snapshot.features,
+            report_path=prepared.paths.report_path,
+            prediction_as_of=listing_date or candidate_as_of,
+            feature_units=base_snapshot.feature_units,
+            feature_formula_versions=base_snapshot.feature_formula_versions,
+            model_path=DEFAULT_BASE_MODEL_PATH,
+            destination_path=base_prediction_path,
+            prediction_variant="base",
+        )
+        base_prediction_status = "completed"
+        _emit_progress(
+            progress_callback,
+            "base_prediction_completed",
+            (
+                "五日快速预测完成："
+                f"概率{base_prediction['probability']:.1%}，"
+                f"输入完整度{base_prediction['feature_completeness']:.0%}。"
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - 基础预测失败不能阻断文档索引
+        base_prediction_status = "failed"
+        base_prediction_error = f"{type(exc).__name__}: {exc}"
+        _emit_progress(
+            progress_callback,
+            "base_prediction_failed",
+            f"基础特征或快速预测暂不可用：{base_prediction_error}",
+        )
+    if artifact_callback is not None:
+        artifact_callback(
+            {
+                "base_feature_path": (
+                    _portable_path(base_feature_path, root)
+                    if base_feature_path.is_file()
+                    else None
+                ),
+                "base_prediction": base_prediction,
+                "base_prediction_path": (
+                    _portable_path(base_prediction_path, root)
+                    if base_prediction_path.is_file()
+                    else None
+                ),
+                "base_prediction_status": base_prediction_status,
+                "base_prediction_error": base_prediction_error,
+            }
+        )
     embedding_ready = False
     embedding_cache_hit = False
     if config.embedding.is_configured:
@@ -1454,6 +1657,7 @@ def prepare_company_semantic_index(
                 api_key=config.embedding.require_api_key(),
                 base_url=config.embedding.base_url,
                 model_name=config.embedding.model_name,
+                api_model_name=config.embedding.request_model_name,
                 dimensions=config.embedding.dimensions,
                 batch_size=config.embedding.batch_size,
                 request_concurrency=(
@@ -1507,12 +1711,24 @@ def prepare_company_semantic_index(
         embedding_ready=embedding_ready,
         embedding_cache_hit=embedding_cache_hit,
         parser_cache_hit=prepared.cache_hit,
+        base_feature_path=(
+            _portable_path(base_feature_path, root) if base_feature_path.is_file() else None
+        ),
+        base_prediction=base_prediction,
+        base_prediction_path=(
+            _portable_path(base_prediction_path, root)
+            if base_prediction_path.is_file()
+            else None
+        ),
+        base_prediction_status=base_prediction_status,
+        base_prediction_error=base_prediction_error,
     )
 
 
 __all__ = [
     "AnalysisArtifacts",
     "CompanyPreparationResult",
+    "PreparationArtifactCallback",
     "ProgressCallback",
     "analyze_company",
     "analyze_prospectus",

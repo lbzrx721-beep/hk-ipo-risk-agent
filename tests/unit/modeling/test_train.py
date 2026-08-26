@@ -28,6 +28,7 @@ def test_time_ordered_baselines_write_predictions_metrics_and_model(
                     "ticker": f"{company_number:05d}.HK",
                     "company_name": f"公司{company_number}",
                     "prospectus_date": prospectus_date,
+                    "listing_date": prospectus_date,
                     "as_of_date": prospectus_date,
                     "split": split,
                     "target_significant_drop_5d": target,

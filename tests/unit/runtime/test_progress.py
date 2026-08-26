@@ -118,9 +118,7 @@ def test_risk_catalog_is_kept_for_business_card_titles() -> None:
 
     snapshot = build_analysis_progress_snapshot(events, status="running")
 
-    assert snapshot["risk_titles"]["business"] == {
-        "open_123456789abc": "历史增长率不可持续风险"
-    }
+    assert snapshot["risk_titles"]["business"] == {"open_123456789abc": "历史增长率不可持续风险"}
 
 
 def test_failed_discovery_batches_keep_actionable_error_details() -> None:
@@ -138,9 +136,7 @@ def test_failed_discovery_batches_keep_actionable_error_details() -> None:
     snapshot = build_analysis_progress_snapshot(events, status="running")
 
     assert snapshot["agents"]["discovery"]["state"] == "degraded"
-    assert snapshot["discovery_failures"] == [
-        "章节包4/11扫描失败，已重试2次：JSON输出被截断"
-    ]
+    assert snapshot["discovery_failures"] == ["章节包4/11扫描失败，已重试2次：JSON输出被截断"]
 
 
 def test_progress_snapshot_is_monotonic_when_a_later_event_reports_less_progress() -> None:
@@ -209,6 +205,48 @@ def test_running_snapshot_reports_elapsed_time_without_unreliable_estimate() -> 
 
     assert snapshot["elapsed_seconds"] == 60
     assert "estimated_remaining_seconds" not in snapshot
+
+
+def test_prediction_steps_finish_before_overall_progress_reaches_100() -> None:
+    events = (
+        _event("agents_completed", "决策Agent已完成风险整合。"),
+        _event("features_started", "正在自动采集上市前候选特征。"),
+        _event("features_progress", "[3/6] 文档结构与证据统计已汇总"),
+        _event("features_completed", "上市前特征快照已生成。"),
+        _event("prediction_started", "正在预测五日显著下跌风险。"),
+    )
+
+    running = build_analysis_progress_snapshot(events, status="running")
+    predicted = build_analysis_progress_snapshot(
+        events + (_event("prediction_completed", "五日风险预测完成。"),),
+        status="running",
+    )
+    completed = build_analysis_progress_snapshot(
+        events
+        + (
+            _event("prediction_completed", "五日风险预测完成。"),
+            _event("completed", "分析完成。"),
+        ),
+        status="completed",
+    )
+
+    assert running["max_percent"] == 96
+    assert running["current_activity"].startswith("五日下跌预测")
+    assert predicted["max_percent"] == 99
+    assert completed["max_percent"] == 100
+
+
+def test_feature_collection_progress_is_projected_before_prediction() -> None:
+    snapshot = build_analysis_progress_snapshot(
+        (
+            _event("features_started", "正在自动采集上市前候选特征。"),
+            _event("features_progress", "[4/6] 上市前市场与近期IPO环境已汇总"),
+        ),
+        status="running",
+    )
+
+    assert snapshot["max_percent"] == 94
+    assert snapshot["current_activity"] == "上市前特征 · 上市前市场与近期IPO环境已汇总"
 
 
 def test_elapsed_time_pauses_during_human_scope_review_and_resumes_after_submit() -> None:

@@ -6,12 +6,15 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
-from typing import Any
+from typing import Any, Literal
 from uuid import uuid4
 
 from fastapi import HTTPException
 
-from ipo_risk.agents.intervention import RiskScopeReviewDecision
+from ipo_risk.agents.intervention import (
+    LlmFailureRecoveryDecision,
+    RiskScopeReviewDecision,
+)
 from ipo_risk.runtime.batch_analysis_job import (
     BatchAnalysisJob,
     BatchCompany,
@@ -119,13 +122,13 @@ class BatchWorkspace:
             for company in snapshot.companies:
                 events = segment.job.events_for(company.company_folder)
                 payload = asdict(company)
-                payload["company_key"] = (
-                    f"{segment.segment_id}:{company.company_id}"
-                )
+                payload["company_key"] = f"{segment.segment_id}:{company.company_id}"
                 payload["segment_id"] = segment.segment_id
                 review = company.risk_scope_review
-                payload["risk_scope_review"] = (
-                    review.model_dump(mode="json") if review else None
+                payload["risk_scope_review"] = review.model_dump(mode="json") if review else None
+                recovery = company.llm_failure_recovery
+                payload["llm_failure_recovery"] = (
+                    recovery.model_dump(mode="json") if recovery else None
                 )
                 progress = build_analysis_progress_snapshot(
                     events,
@@ -136,9 +139,7 @@ class BatchWorkspace:
                 progress_elapsed = progress.get("elapsed_seconds")
                 if events:
                     payload["duration_seconds"] = progress_elapsed
-                payload["duration_updated_at"] = (
-                    datetime.now().astimezone().isoformat()
-                )
+                payload["duration_updated_at"] = datetime.now().astimezone().isoformat()
                 payload["review_wait_seconds"] = progress.get(
                     "review_wait_seconds",
                     0,
@@ -203,6 +204,26 @@ class BatchWorkspace:
     ) -> None:
         segment, company = self._resolve_company(company_key)
         segment.job.submit_risk_scope_review(company.company_folder, decision)
+
+    def submit_llm_failure_recovery(
+        self,
+        company_key: str,
+        decision: LlmFailureRecoveryDecision,
+    ) -> None:
+        segment, company = self._resolve_company(company_key)
+        segment.job.submit_llm_failure_recovery(company.company_folder, decision)
+
+    def rerun_prediction(
+        self,
+        company_key: str,
+        *,
+        variant: Literal["auto", "base", "agent_enhanced"] = "auto",
+    ) -> dict[str, Any]:
+        segment, company = self._resolve_company(company_key)
+        return segment.job.rerun_prediction(
+            company.company_folder,
+            variant=variant,
+        )
 
     def _resolve_company(
         self,
@@ -300,6 +321,8 @@ def _progress_status(state: str, has_events: bool) -> str:
         return "paused"
     if state == "awaiting_review":
         return "awaiting_review"
+    if state == "awaiting_recovery":
+        return "awaiting_recovery"
     if has_events or state in {"preparing", "ready", "running"}:
         return "running"
     return "pending"
@@ -312,6 +335,21 @@ def _is_durable_agent_event(stage: str) -> bool:
             "risk_scoping_fallback",
             "risk_scope_review_requested",
             "risk_scope_review_completed",
+            "llm_recovery_requested",
+            "llm_recovery_retry_selected",
+            "llm_recovery_bm25_selected",
+            "base_features_started",
+            "base_features_completed",
+            "base_prediction_started",
+            "base_prediction_completed",
+            "base_prediction_failed",
+            "features_started",
+            "features_completed",
+            "features_failed",
+            "prediction_started",
+            "prediction_completed",
+            "prediction_failed",
+            "completed",
         }
     action = stage.rsplit(":", maxsplit=1)[-1]
     return action in {

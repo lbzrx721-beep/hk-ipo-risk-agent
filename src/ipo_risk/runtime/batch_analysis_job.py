@@ -11,12 +11,19 @@ from threading import Event, Lock, Thread
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from ipo_risk.agents.intervention import (
+    LlmFailureRecoveryController,
+    LlmFailureRecoveryDecision,
+    LlmFailureRecoveryRequest,
     RiskScopeReviewController,
     RiskScopeReviewDecision,
     RiskScopeReviewRequest,
 )
 from ipo_risk.storage.files import read_json, write_json
 from ipo_risk.runtime.analysis_job import AnalysisProgressEvent
+from ipo_risk.runtime.prediction import (
+    DEFAULT_BASE_MODEL_PATH,
+    generate_runtime_prediction,
+)
 
 if TYPE_CHECKING:
     from ipo_risk.experiments import AgentFeatureExperimentResult
@@ -69,10 +76,20 @@ class BatchCompanySnapshot:
     finding_count: int | None = None
     evidence_count: int | None = None
     feature_path: str | None = None
+    base_feature_path: str | None = None
+    base_prediction: dict[str, Any] | None = None
+    base_prediction_path: str | None = None
+    base_prediction_status: str | None = None
+    base_prediction_error: str | None = None
+    prediction: dict[str, Any] | None = None
+    prediction_path: str | None = None
+    prediction_status: str | None = None
+    prediction_error: str | None = None
     error: str | None = None
     preparation_state: str | None = None
     preparation_error: str | None = None
     risk_scope_review: RiskScopeReviewRequest | None = None
+    llm_failure_recovery: LlmFailureRecoveryRequest | None = None
 
 
 @dataclass(frozen=True)
@@ -92,7 +109,9 @@ class BatchAnalysisJobSnapshot:
             (
                 company.company_folder
                 for company in self.companies
-                if company.state in {
+                if company.state
+                in {
+                    "awaiting_recovery",
                     "awaiting_review",
                     "running",
                     "preparing",
@@ -140,21 +159,19 @@ class BatchAnalysisJob:
         self._error: str | None = None
         self._preparing = bool(uploads)
         self._prepared_uploads = not uploads
-        self._phase_detail: str | None = (
-            "等待后台登记上传文件。" if uploads else None
-        )
+        self._phase_detail: str | None = "等待后台登记上传文件。" if uploads else None
         self._company_rows: tuple[dict[str, Any], ...] = ()
         self._event_offsets: dict[str, int] = {}
         self._event_cache: dict[str, list[AnalysisProgressEvent]] = {}
         self._delta_indexes: dict[str, dict[str, int]] = {}
         self._risk_scope_review_controllers = {
-            company.company_folder: RiskScopeReviewController()
-            for company in companies
+            company.company_folder: RiskScopeReviewController() for company in companies
+        }
+        self._llm_failure_recovery_controllers = {
+            company.company_folder: LlmFailureRecoveryController() for company in companies
         }
         self._registration_states = (
-            {company.company_folder: "pending" for company in companies}
-            if uploads
-            else {}
+            {company.company_folder: "pending" for company in companies} if uploads else {}
         )
 
     @classmethod
@@ -189,12 +206,7 @@ class BatchAnalysisJob:
 
     @property
     def experiment_dir(self) -> Path:
-        return (
-            self.project_root
-            / "artifacts"
-            / "experiments"
-            / self.experiment_name
-        )
+        return self.project_root / "artifacts" / "experiments" / self.experiment_name
 
     @property
     def status_path(self) -> Path:
@@ -226,6 +238,17 @@ class BatchAnalysisJob:
     ) -> None:
         """提交一家公司的风险范围确认，不影响其他公司流水线。"""
         controller = self._risk_scope_review_controllers.get(company_folder)
+        if controller is None:
+            raise KeyError(f"unknown batch company: {company_folder}")
+        controller.submit(decision)
+
+    def submit_llm_failure_recovery(
+        self,
+        company_folder: str,
+        decision: LlmFailureRecoveryDecision,
+    ) -> None:
+        """提交一家公司的模型故障恢复选择，不影响其他公司。"""
+        controller = self._llm_failure_recovery_controllers.get(company_folder)
         if controller is None:
             raise KeyError(f"unknown batch company: {company_folder}")
         controller.submit(decision)
@@ -270,6 +293,7 @@ class BatchAnalysisJob:
             phase_detail = self._phase_detail
             companies = self.companies
             review_controllers = dict(self._risk_scope_review_controllers)
+            recovery_controllers = dict(self._llm_failure_recovery_controllers)
             registration_states = dict(self._registration_states)
         raw_status = read_json(self.status_path) if self.status_path.is_file() else {}
         raw_companies = raw_status.get("companies", {})
@@ -278,16 +302,17 @@ class BatchAnalysisJob:
             raw = raw_companies.get(company.company_folder, {})
             raw_state = str(raw.get("state", "pending"))
             preparation_state = _optional_text(
-                raw.get("preparation_state")
-                or registration_states.get(company.company_folder)
+                raw.get("preparation_state") or registration_states.get(company.company_folder)
             )
             scope_review = review_controllers.get(company.company_folder)
             pending_scope_review = (
-                scope_review.pending_request()
-                if scope_review is not None
-                else None
+                scope_review.pending_request() if scope_review is not None else None
             )
-            if raw_state == "running" and pending_scope_review is not None:
+            recovery = recovery_controllers.get(company.company_folder)
+            pending_recovery = recovery.pending_request() if recovery is not None else None
+            if raw_state == "running" and pending_recovery is not None:
+                company_state = "awaiting_recovery"
+            elif raw_state == "running" and pending_scope_review is not None:
                 company_state = "awaiting_review"
             elif raw_state == "pending" and preparation_state in {
                 "registering",
@@ -314,12 +339,26 @@ class BatchAnalysisJob:
                     finding_count=_optional_int(raw.get("finding_count")),
                     evidence_count=_optional_int(raw.get("evidence_count")),
                     feature_path=_optional_text(raw.get("feature_path")),
+                    base_feature_path=_optional_text(raw.get("base_feature_path")),
+                    base_prediction=(
+                        dict(raw["base_prediction"])
+                        if isinstance(raw.get("base_prediction"), dict)
+                        else None
+                    ),
+                    base_prediction_path=_optional_text(raw.get("base_prediction_path")),
+                    base_prediction_status=_optional_text(raw.get("base_prediction_status")),
+                    base_prediction_error=_optional_text(raw.get("base_prediction_error")),
+                    prediction=(
+                        dict(raw["prediction"]) if isinstance(raw.get("prediction"), dict) else None
+                    ),
+                    prediction_path=_optional_text(raw.get("prediction_path")),
+                    prediction_status=_optional_text(raw.get("prediction_status")),
+                    prediction_error=_optional_text(raw.get("prediction_error")),
                     error=_optional_text(raw.get("error")),
                     preparation_state=preparation_state,
-                    preparation_error=_optional_text(
-                        raw.get("preparation_error")
-                    ),
+                    preparation_error=_optional_text(raw.get("preparation_error")),
                     risk_scope_review=pending_scope_review,
+                    llm_failure_recovery=pending_recovery,
                 )
             )
         if active and self._pause_requested.is_set():
@@ -332,8 +371,7 @@ class BatchAnalysisJob:
             raw_state = str(raw_status.get("queue_state", "pending"))
             state = (
                 cast(BatchQueueState, raw_state)
-                if raw_state
-                in {"pending", "running", "paused", "completed", "failed"}
+                if raw_state in {"pending", "running", "paused", "completed", "failed"}
                 else "pending"
             )
         return BatchAnalysisJobSnapshot(
@@ -341,11 +379,7 @@ class BatchAnalysisJob:
             state=state,
             companies=tuple(snapshots),
             active=active,
-            phase=(
-                "preparing"
-                if preparing
-                else ("analyzing" if active else "finished")
-            ),
+            phase=("preparing" if preparing else ("analyzing" if active else "finished")),
             phase_detail=phase_detail,
             pause_reason=_optional_text(raw_status.get("pause_reason")),
             error=runtime_error,
@@ -353,11 +387,7 @@ class BatchAnalysisJob:
 
     def events_for(self, company_folder: str) -> tuple[AnalysisProgressEvent, ...]:
         company = next(
-            (
-                item
-                for item in self.companies
-                if item.company_folder == company_folder
-            ),
+            (item for item in self.companies if item.company_folder == company_folder),
             None,
         )
         if company is None:
@@ -377,9 +407,7 @@ class BatchAnalysisJob:
                         event = AnalysisProgressEvent(
                             stage=str(payload["stage"]),
                             detail=str(payload["detail"]),
-                            occurred_at=datetime.fromisoformat(
-                                str(payload["timestamp"])
-                            ),
+                            occurred_at=datetime.fromisoformat(str(payload["timestamp"])),
                         )
                     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
                         continue
@@ -390,6 +418,102 @@ class BatchAnalysisJob:
     def feature_payload(self, company_id: str) -> dict[str, Any] | None:
         path = self.experiment_dir / "companies" / f"{company_id}.json"
         return read_json(path) if path.is_file() else None
+
+    def rerun_prediction(
+        self,
+        company_folder: str,
+        *,
+        variant: Literal["auto", "base", "agent_enhanced"] = "auto",
+    ) -> dict[str, Any]:
+        """复用已保存特征重算预测，不重新解析PDF，也不重新调用Agent。"""
+
+        company = next(
+            (item for item in self.companies if item.company_folder == company_folder),
+            None,
+        )
+        if company is None:
+            raise KeyError(f"unknown batch company: {company_folder}")
+        if not self.status_path.is_file():
+            raise RuntimeError("公司特征尚未就绪。")
+        status = read_json(self.status_path)
+        current = status.get("companies", {}).get(company_folder)
+        if not isinstance(current, dict):
+            raise RuntimeError("公司状态不存在。")
+        effective_variant = variant
+        if effective_variant == "auto":
+            effective_variant = (
+                "agent_enhanced"
+                if current.get("prelisting_features_path")
+                else "base"
+            )
+        path_key = (
+            "prelisting_features_path"
+            if effective_variant == "agent_enhanced"
+            else "base_feature_path"
+        )
+        raw_feature_path = _optional_text(current.get(path_key))
+        if raw_feature_path is None:
+            raise RuntimeError(
+                "Agent增强特征尚未生成。"
+                if effective_variant == "agent_enhanced"
+                else "基础特征尚未生成，请等待PDF解析完成。"
+            )
+        feature_path = Path(raw_feature_path)
+        if not feature_path.is_absolute():
+            feature_path = self.project_root / feature_path
+        if not feature_path.is_file():
+            raise RuntimeError(f"预测特征文件不存在：{feature_path}")
+        feature_payload = read_json(feature_path)
+        raw_features = feature_payload.get("features")
+        if not isinstance(raw_features, dict):
+            raise RuntimeError("预测特征文件格式无效。")
+        prediction_as_of_text = _optional_text(feature_payload.get("prediction_as_of"))
+        prediction_as_of = (
+            date.fromisoformat(prediction_as_of_text)
+            if prediction_as_of_text is not None
+            else None
+        )
+        units = {
+            name: str(value.get("unit"))
+            for name, value in raw_features.items()
+            if isinstance(value, dict) and value.get("unit") is not None
+        }
+        formulas = {
+            name: str(value.get("formula_version"))
+            for name, value in raw_features.items()
+            if isinstance(value, dict) and value.get("formula_version") is not None
+        }
+        destination = feature_path.with_name(
+            "prediction_5d.json"
+            if effective_variant == "agent_enhanced"
+            else "prediction_5d_base.json"
+        )
+        prediction, prediction_path = generate_runtime_prediction(
+            project_root=self.project_root,
+            company_id=company.company_id,
+            company_name=company.company_name,
+            run_id=str(feature_payload.get("run_id") or f"BASE-{company.company_id}"),
+            features=raw_features,
+            report_path=destination.with_name("risk_analysis.json"),
+            prediction_as_of=prediction_as_of,
+            feature_units=units,
+            feature_formula_versions=formulas,
+            model_path=(
+                DEFAULT_BASE_MODEL_PATH if effective_variant == "base" else None
+            ),
+            destination_path=destination,
+            prediction_variant=effective_variant,
+        )
+        prefix = "base_" if effective_variant == "base" else ""
+        current[f"{prefix}prediction"] = prediction
+        current[f"{prefix}prediction_path"] = _portable_runtime_path(
+            prediction_path,
+            self.project_root,
+        )
+        current[f"{prefix}prediction_status"] = "completed"
+        current.pop(f"{prefix}prediction_error", None)
+        write_json(status, self.status_path)
+        return prediction
 
     def _run(self) -> None:
         try:
@@ -404,16 +528,13 @@ class BatchAnalysisJob:
             self._runner(
                 self.project_root,
                 experiment_name=self.experiment_name,
-                company_folders=tuple(
-                    company.company_folder for company in companies
-                ),
+                company_folders=tuple(company.company_folder for company in companies),
                 company_rows=company_rows,
                 continue_on_error=True,
                 pause_requested=self._pause_requested.is_set,
                 preparation_progress=self._on_preparation_progress,
-                risk_scope_review_controllers=(
-                    self._risk_scope_review_controllers
-                ),
+                risk_scope_review_controllers=(self._risk_scope_review_controllers),
+                llm_failure_recovery_controllers=(self._llm_failure_recovery_controllers),
             )
             with self._lock:
                 self._phase_detail = None
@@ -451,9 +572,7 @@ class BatchAnalysisJob:
             placeholder_folder = placeholder_companies[index - 1].company_folder
             with self._lock:
                 self._registration_states[placeholder_folder] = "registering"
-                self._phase_detail = (
-                    f"正在登记第{index}/{total}份：{upload.file_name}"
-                )
+                self._phase_detail = f"正在登记第{index}/{total}份：{upload.file_name}"
             registered = upload_service.register(
                 file_name=upload.file_name,
                 content=upload.content,
@@ -489,9 +608,12 @@ class BatchAnalysisJob:
                 company.company_folder: RiskScopeReviewController()
                 for company in prepared_companies
             }
-            self._registration_states = {
-                company.company_folder: "registered"
+            self._llm_failure_recovery_controllers = {
+                company.company_folder: LlmFailureRecoveryController()
                 for company in prepared_companies
+            }
+            self._registration_states = {
+                company.company_folder: "registered" for company in prepared_companies
             }
             self._prepared_uploads = True
             self._preparing = False
@@ -500,13 +622,7 @@ class BatchAnalysisJob:
 
 def load_batch_companies(project_root: Path) -> tuple[BatchCompany, ...]:
     """加载赛事清单中可分析的公司，不读取上市后标签值。"""
-    manifest_path = (
-        project_root
-        / "data"
-        / "processed"
-        / "competition"
-        / "company_manifest.jsonl"
-    )
+    manifest_path = project_root / "data" / "processed" / "competition" / "company_manifest.jsonl"
     if not manifest_path.is_file():
         return ()
     companies: list[BatchCompany] = []
@@ -591,6 +707,13 @@ def _optional_int(value: object) -> int | None:
 
 def _optional_float(value: object) -> float | None:
     return float(value) if isinstance(value, (int, float)) else None
+
+
+def _portable_runtime_path(path: Path, root: Path) -> str:
+    try:
+        return path.resolve().relative_to(root.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
 
 
 __all__ = [

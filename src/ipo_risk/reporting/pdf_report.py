@@ -6,7 +6,7 @@ from collections import Counter
 from html import escape
 from io import BytesIO
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
@@ -230,6 +230,7 @@ def write_verified_pdf_report(
     *,
     reviews: tuple[FindingReview, ...] = (),
     project_root: Path,
+    prediction: Mapping[str, Any] | None = None,
 ) -> Path:
     """Write a concise formal PDF without rewriting findings or evidence."""
     _register_fonts()
@@ -268,6 +269,14 @@ def write_verified_pdf_report(
         ["引用原文证据", str(report.summary.evidence_count)],
         ["生成时间", report.generated_at.isoformat()],
     ]
+    if prediction is not None:
+        cover_rows.insert(
+            4,
+            [
+                "五日显著下跌预警",
+                f"{float(prediction.get('probability', 0.0)):.1%}",
+            ],
+        )
     cover_table = Table(
         [
             [
@@ -303,9 +312,82 @@ def write_verified_pdf_report(
                 styles["disclaimer"],
             ),
             PageBreak(),
-            Paragraph("风险总览", styles["h1"]),
         ]
     )
+
+    if prediction is not None:
+        decision_labels = {
+            "high_risk": "高风险预警",
+            "low_risk": "低风险",
+            "uncertain": "不确定，建议人工研判",
+        }
+        probability = float(prediction.get("probability", 0.0))
+        confidence = float(prediction.get("confidence", 0.0))
+        completeness = float(prediction.get("feature_completeness", 0.0))
+        decision = str(prediction.get("decision", "uncertain"))
+        recall_guard = prediction.get("recall_guard")
+        if not isinstance(recall_guard, Mapping):
+            recall_guard = {}
+        watchlist = bool(recall_guard.get("watchlist", False))
+        guard_reasons = recall_guard.get("reasons")
+        if not isinstance(guard_reasons, list):
+            guard_reasons = []
+        prediction_rows = [
+            ["预测目标", "上市后5个交易日内显著下跌风险"],
+            ["风险概率", f"{probability:.1%}"],
+            ["方向判断", decision_labels.get(decision, decision)],
+            ["模型置信度", f"{confidence:.1%}"],
+            ["输入完整度", f"{completeness:.1%}"],
+        ]
+        if watchlist:
+            prediction_rows.extend(
+                [
+                    ["召回保护层", "风险观察名单"],
+                    [
+                        "保护层原因",
+                        "、".join(str(item) for item in guard_reasons)
+                        or "多项稳定风险因子叠加",
+                    ],
+                ]
+            )
+        prediction_table = Table(
+            [
+                [
+                    Paragraph(_markup(label), styles["small"]),
+                    Paragraph(_markup(value), styles["body"]),
+                ]
+                for label, value in prediction_rows
+            ],
+            colWidths=(42 * mm, 108 * mm),
+        )
+        prediction_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#E0F2FE")),
+                    ("BOX", (0, 0), (-1, -1), 0.6, colors.HexColor("#CBD5E1")),
+                    ("INNERGRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#E2E8F0")),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 8),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+                    ("TOPPADDING", (0, 0), (-1, -1), 7),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story.extend(
+            [
+                Paragraph("上市后五日风险预警", styles["h1"]),
+                prediction_table,
+                Spacer(1, 4 * mm),
+                Paragraph(
+                    _markup(str(prediction.get("disclaimer", "方向性风险预警，不构成投资建议。"))),
+                    styles["disclaimer"],
+                ),
+                Spacer(1, 8 * mm),
+            ]
+        )
+
+    story.append(Paragraph("风险总览", styles["h1"]))
 
     severity_counts = Counter(finding.severity for finding in report.risk_findings)
     summary_data = [

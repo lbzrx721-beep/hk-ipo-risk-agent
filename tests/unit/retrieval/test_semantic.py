@@ -239,6 +239,23 @@ def test_embedding_provider_preserves_ollama_model_tag() -> None:
     assert endpoint.calls[0]["encoding_format"] == "float"
 
 
+def test_embedding_provider_separates_api_model_from_index_name() -> None:
+    endpoint = FakeEmbeddingEndpoint()
+    provider = OpenAICompatibleEmbeddingProvider(
+        client=SimpleNamespace(embeddings=endpoint),
+        model_name="qwen3-embedding:4b",
+        api_model_name="Qwen/Qwen3-Embedding-4B",
+        dimensions=2,
+        batch_size=8,
+    )
+
+    provider.embed(["招股书文本"])
+
+    assert provider.model_name == "qwen3-embedding:4b"
+    assert provider.api_model_name == "Qwen/Qwen3-Embedding-4B"
+    assert endpoint.calls[0]["model"] == "Qwen/Qwen3-Embedding-4B"
+
+
 class FlakyEmbeddingEndpoint(FakeEmbeddingEndpoint):
     def create(self, **kwargs: object) -> SimpleNamespace:
         if len(self.calls) < 2:

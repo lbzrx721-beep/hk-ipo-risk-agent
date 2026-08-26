@@ -8,7 +8,7 @@ import pandas as pd
 from ipo_risk.modeling.dataset import build_competition_modeling_dataset
 
 
-def test_modeling_dataset_uses_only_information_visible_by_prospectus_date(
+def test_modeling_dataset_uses_only_information_visible_before_listing_date(
     tmp_path: Path,
 ) -> None:
     root = tmp_path
@@ -77,6 +77,17 @@ def test_modeling_dataset_uses_only_information_visible_by_prospectus_date(
                 "company_id": "00003",
                 "prospectus_date": "2024-01-01",
                 "listing_date": "2024-01-05",
+                "horizon": 1,
+                "observation_date": "2024-01-05",
+                "return_vs_offer_pct": -10.0,
+                "significant_drop": True,
+                "label_status": "complete",
+                "offer_price_source": "proxy",
+            },
+            {
+                "company_id": "00003",
+                "prospectus_date": "2024-01-01",
+                "listing_date": "2024-01-05",
                 "horizon": 5,
                 "observation_date": "2024-01-12",
                 "return_vs_offer_pct": -99.0,
@@ -110,6 +121,15 @@ def test_modeling_dataset_uses_only_information_visible_by_prospectus_date(
                 "market_turnover_hkd": 99999.0,
                 "median_security_turnover_hkd": 999.0,
                 "active_securities": 1000,
+            },
+            {
+                "trade_date": "2024-01-21",
+                "median_return_pct": 999.0,
+                "advance_ratio": 1.0,
+                "median_amplitude_pct": 999.0,
+                "market_turnover_hkd": 999999.0,
+                "median_security_turnover_hkd": 9999.0,
+                "active_securities": 1000,
             }
         ]
     )
@@ -126,9 +146,12 @@ def test_modeling_dataset_uses_only_information_visible_by_prospectus_date(
     matrix = pd.read_csv(result.feature_matrix_path)
     assert len(matrix) == 1
     assert matrix.loc[0, "target_significant_drop_5d"] == 1
-    assert matrix.loc[0, "market_return_5d_pct"] > 0
-    assert matrix.loc[0, "recent_ipo_count_90d"] == 0
-    assert matrix.loc[0, "recent_ipo_5d_observed_count_180d"] == 1
+    assert matrix.loc[0, "market_return_5d_pct"] < 0
+    assert matrix.loc[0, "recent_ipo_count_90d"] == 1
+    assert matrix.loc[0, "recent_ipo_5d_observed_count_180d"] == 2
+    assert matrix.loc[0, "prospectus_date"] == "2024-01-10"
+    assert matrix.loc[0, "listing_date"] == "2024-01-20"
+    assert matrix.loc[0, "as_of_date"] == "2024-01-20"
     assert not any("offer_price" in column for column in result.feature_columns)
     assert not any("listing_date" in column for column in result.feature_columns)
 

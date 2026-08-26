@@ -50,6 +50,7 @@ class OpenAICompatibleEmbeddingProvider:
         self,
         *,
         model_name: str,
+        api_model_name: str | None = None,
         dimensions: int,
         batch_size: int,
         request_concurrency: int = 1,
@@ -82,7 +83,10 @@ class OpenAICompatibleEmbeddingProvider:
                 max_retries=0,
                 timeout=timeout_seconds,
             )
+        # model_name是缓存与pgvector使用的稳定索引标识；api_model_name允许
+        # 兼容供应商使用不同的请求模型名，而不迫使已验证兼容的向量重新生成。
         self.model_name = model_name
+        self.api_model_name = (api_model_name or model_name).strip()
         self.dimensions = dimensions
         self._batch_size = batch_size
         self._request_concurrency = request_concurrency
@@ -272,7 +276,7 @@ class OpenAICompatibleEmbeddingProvider:
         try:
             outcome = self._retry_policy.run(
                 lambda: self._client.embeddings.create(
-                    model=self.model_name,
+                    model=self.api_model_name,
                     input=batch,
                     dimensions=self.dimensions,
                     encoding_format="float",

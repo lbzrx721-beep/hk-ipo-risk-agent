@@ -22,9 +22,12 @@ from typing import Any, cast
 
 import pandas as pd
 
-from ipo_risk.agents.intervention import RiskScopeReviewController
 from ipo_risk.config import AppConfig, load_config
 from ipo_risk.agents.usage import ModelBudgetExceededError
+from ipo_risk.agents.intervention import (
+    LlmFailureRecoveryController,
+    RiskScopeReviewController,
+)
 from ipo_risk.modeling.features import build_agent_feature_snapshot
 from ipo_risk.modeling.agent_precision import AGENT_PRECISION_FEATURE_NAMES
 from ipo_risk.modeling.risk_semantics import (
@@ -83,19 +86,13 @@ def select_pilot_companies(
     if sample_size > len(eligible):
         raise ValueError("sample_size exceeds eligible company count")
 
-    by_split = {
-        split: [row for row in eligible if row.get("split") == split]
-        for split in splits
-    }
+    by_split = {split: [row for row in eligible if row.get("split") == split] for split in splits}
     by_split = {split: rows for split, rows in by_split.items() if rows}
     if not by_split:
         raise ValueError("no eligible companies for requested splits")
 
     total = sum(len(rows) for rows in by_split.values())
-    exact = {
-        split: sample_size * len(rows) / total
-        for split, rows in by_split.items()
-    }
+    exact = {split: sample_size * len(rows) / total for split, rows in by_split.items()}
     quotas = {split: int(value) for split, value in exact.items()}
     remaining = sample_size - sum(quotas.values())
     residual_order = sorted(
@@ -110,9 +107,7 @@ def select_pilot_companies(
     for split, rows in by_split.items():
         ranked = sorted(
             rows,
-            key=lambda row: sha256(
-                f"{seed}:{row['source_hash']}".encode()
-            ).hexdigest(),
+            key=lambda row: sha256(f"{seed}:{row['source_hash']}".encode()).hexdigest(),
         )
         selected.extend(ranked[: quotas[split]])
     return sorted(
@@ -152,21 +147,12 @@ def normalize_historical_agent_features(
     if not reports_by_company:
         raise ValueError("no historical risk reports found")
 
-    base_path = (
-        root
-        / "data"
-        / "processed"
-        / "modeling"
-        / "prelisting_feature_matrix.csv"
-    )
+    base_path = root / "data" / "processed" / "modeling" / "prelisting_feature_matrix.csv"
     if not base_path.is_file():
         raise FileNotFoundError(f"missing prelisting feature matrix: {base_path}")
     base = pd.read_csv(base_path, dtype={"company_id": str})
     base["company_id"] = base["company_id"].astype(str).str.zfill(5)
-    base_by_id = {
-        str(row["company_id"]): row
-        for row in base.to_dict(orient="records")
-    }
+    base_by_id = {str(row["company_id"]): row for row in base.to_dict(orient="records")}
 
     existing_payloads: dict[str, dict[str, Any]] = {}
     experiments_root = root / "artifacts" / "experiments"
@@ -185,14 +171,10 @@ def normalize_historical_agent_features(
     for company_id, (report, report_path) in sorted(reports_by_company.items()):
         base_row = base_by_id.get(company_id, {})
         existing = existing_payloads.get(report.run_id, {})
-        company_folder = str(
-            existing.get("company_folder")
-            or report_path.parents[1].name
-        )
+        company_folder = str(existing.get("company_folder") or report_path.parents[1].name)
         split = str(base_row.get("split") or existing.get("split") or "unassigned")
         prospectus_date = str(
-            base_row.get("prospectus_date")
-            or report.source_document.available_at.isoformat()
+            base_row.get("prospectus_date") or report.source_document.available_at.isoformat()
         )
         row = {
             "company_id": company_id,
@@ -215,12 +197,8 @@ def normalize_historical_agent_features(
             available_at=report.source_document.available_at,
             source_ref=f"analysis:{report.run_id}",
         )
-        findings_by_id = {
-            finding.finding_id: finding for finding in report.risk_findings
-        }
-        evidences_by_id = {
-            evidence.evidence_id: evidence for evidence in report.evidences
-        }
+        findings_by_id = {finding.finding_id: finding for finding in report.risk_findings}
+        evidences_by_id = {evidence.evidence_id: evidence for evidence in report.evidences}
         for classification in classifications:
             finding = findings_by_id[classification.finding_id]
             referenced_evidence = [
@@ -260,14 +238,17 @@ def normalize_historical_agent_features(
             "schema_version": 1,
             "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
             "experiment_name": experiment_name,
-            **{key: row[key] for key in (
-                "company_id",
-                "company_folder",
-                "company_name",
-                "split",
-                "prospectus_date",
-                "source_hash",
-            )},
+            **{
+                key: row[key]
+                for key in (
+                    "company_id",
+                    "company_folder",
+                    "company_name",
+                    "split",
+                    "prospectus_date",
+                    "source_hash",
+                )
+            },
             "run_id": report.run_id,
             "started_at": existing.get("started_at"),
             "ended_at": existing.get("ended_at") or report.generated_at.isoformat(),
@@ -278,8 +259,7 @@ def normalize_historical_agent_features(
             "report_path": _portable(report_path, root),
             "embedding_dir": existing.get("embedding_dir"),
             "features": {
-                name: feature.model_dump(mode="json")
-                for name, feature in sorted(snapshot.items())
+                name: feature.model_dump(mode="json") for name, feature in sorted(snapshot.items())
             },
             "model_fingerprint": existing.get("model_fingerprint"),
             "normalization": {
@@ -360,10 +340,7 @@ def normalize_historical_agent_features(
         for split, count in agent_matrix["split"].value_counts().sort_index().items()
     }
     semantic_audit_path.write_text(
-        "".join(
-            json.dumps(row, ensure_ascii=False) + "\n"
-            for row in semantic_audits
-        ),
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in semantic_audits),
         encoding="utf-8",
     )
     semantic_method_counts: dict[str, int] = {}
@@ -377,9 +354,7 @@ def normalize_historical_agent_features(
         semantic_family_counts[family] = semantic_family_counts.get(family, 0) + 1
         semantic_subtype_counts[subtype] = semantic_subtype_counts.get(subtype, 0) + 1
     specific_count = sum(
-        count
-        for method, count in semantic_method_counts.items()
-        if method != "agent_role_fallback"
+        count for method, count in semantic_method_counts.items() if method != "agent_role_fallback"
     )
     summary = {
         "schema_version": 1,
@@ -392,12 +367,10 @@ def normalize_historical_agent_features(
         "failed_count": 0,
         "pending_count": 0,
         "total_findings": sum(
-            report.summary.finding_count
-            for report, _path in reports_by_company.values()
+            report.summary.finding_count for report, _path in reports_by_company.values()
         ),
         "total_evidences": sum(
-            report.summary.evidence_count
-            for report, _path in reports_by_company.values()
+            report.summary.evidence_count for report, _path in reports_by_company.values()
         ),
         "feature_schema_version": AGENT_FEATURE_SCHEMA_VERSION,
         "agent_feature_count": len(feature_columns),
@@ -406,13 +379,9 @@ def normalize_historical_agent_features(
         "risk_semantic_finding_count": len(semantic_audits),
         "risk_semantic_specific_classified_count": specific_count,
         "risk_semantic_specific_classified_share": (
-            round(specific_count / len(semantic_audits), 8)
-            if semantic_audits
-            else 0.0
+            round(specific_count / len(semantic_audits), 8) if semantic_audits else 0.0
         ),
-        "risk_semantic_mapping_method_counts": dict(
-            sorted(semantic_method_counts.items())
-        ),
+        "risk_semantic_mapping_method_counts": dict(sorted(semantic_method_counts.items())),
         "risk_semantic_family_counts": dict(sorted(semantic_family_counts.items())),
         "risk_semantic_subtype_counts": dict(sorted(semantic_subtype_counts.items())),
         "risk_semantic_catalog": list(risk_semantic_catalog()),
@@ -423,9 +392,7 @@ def normalize_historical_agent_features(
         "status_path": _portable(status_path, root),
         "agent_feature_matrix_path": _portable(agent_matrix_path, root),
         "augmented_feature_matrix_path": (
-            _portable(augmented_matrix_path, root)
-            if augmented_matrix_path is not None
-            else None
+            _portable(augmented_matrix_path, root) if augmented_matrix_path is not None else None
         ),
         "failed_companies": [],
     }
@@ -457,9 +424,8 @@ def run_agent_feature_experiment(
     analyzer: Analyzer = analyze_company,
     preparer: CompanyPreparer | None = None,
     preparation_progress: PreparationProgress | None = None,
-    risk_scope_review_controllers: (
-        Mapping[str, RiskScopeReviewController] | None
-    ) = None,
+    risk_scope_review_controllers: (Mapping[str, RiskScopeReviewController] | None) = None,
+    llm_failure_recovery_controllers: (Mapping[str, LlmFailureRecoveryController] | None) = None,
     agent_company_concurrency: int | None = None,
 ) -> AgentFeatureExperimentResult:
     """并行预处理文档并受控并行运行公司Agent；每家公司独立落盘。"""
@@ -474,13 +440,9 @@ def run_agent_feature_experiment(
     status_path = experiment_dir / "status.json"
     summary_path = experiment_dir / "summary.json"
 
-    manifest_path = (
-        root / "data" / "processed" / "competition" / "company_manifest.jsonl"
-    )
+    manifest_path = root / "data" / "processed" / "competition" / "company_manifest.jsonl"
     manifest_rows = (
-        [dict(row) for row in company_rows]
-        if company_rows
-        else _read_jsonl(manifest_path)
+        [dict(row) for row in company_rows] if company_rows else _read_jsonl(manifest_path)
     )
     fingerprint = _experiment_fingerprint(root, config)
     selected = _load_or_create_selection(
@@ -496,9 +458,7 @@ def run_agent_feature_experiment(
     status["pause_reason"] = None
     status_lock = Lock()
 
-    selected_by_folder = {
-        str(row["company_folder"]): row for row in selected
-    }
+    selected_by_folder = {str(row["company_folder"]): row for row in selected}
     effective_preparer = (
         prepare_company_semantic_index
         if preparer is None and analyzer is analyze_company
@@ -529,9 +489,7 @@ def run_agent_feature_experiment(
                 "completed": 0,
                 "total": len(pending_folders),
                 "document_concurrency": worker_count,
-                "request_concurrency_per_document": (
-                    per_document_request_concurrency
-                ),
+                "request_concurrency_per_document": (per_document_request_concurrency),
             }
             write_json(status, status_path)
             with ThreadPoolExecutor(
@@ -540,42 +498,61 @@ def run_agent_feature_experiment(
             ) as executor:
                 futures = {}
                 for company_folder in pending_folders:
-                    company_id = str(
-                        selected_by_folder[company_folder]["company_id"]
-                    ).zfill(5)
+                    company_id = str(selected_by_folder[company_folder]["company_id"]).zfill(5)
                     events = _EventLogger(event_dir / f"{company_id}.jsonl")
                     current = status["companies"][company_folder]
                     current["preparation_state"] = "running"
+                    prepare_kwargs: dict[str, Any] = {
+                        "project_root": root,
+                        "request_concurrency": per_document_request_concurrency,
+                        "progress_callback": events,
+                    }
+                    if effective_preparer is prepare_company_semantic_index:
+                        def persist_preparation_artifact(
+                            payload: Mapping[str, Any],
+                            *,
+                            target_folder: str = company_folder,
+                        ) -> None:
+                            with status_lock:
+                                target = status["companies"][target_folder]
+                                target.update(dict(payload))
+                                write_json(status, status_path)
+
+                        prepare_kwargs["artifact_callback"] = persist_preparation_artifact
                     futures[
                         executor.submit(
                             effective_preparer,
                             company_folder,
-                            project_root=root,
-                            request_concurrency=(
-                                per_document_request_concurrency
-                            ),
-                            progress_callback=events,
+                            **prepare_kwargs,
                         )
                     ] = company_folder
-                write_json(status, status_path)
+                with status_lock:
+                    write_json(status, status_path)
                 completed_preparations = 0
                 for future in as_completed(futures):
                     company_folder = futures[future]
-                    current = status["companies"][company_folder]
-                    try:
-                        future.result()
-                        current["preparation_state"] = "completed"
-                        preparation_state = "completed"
-                    except Exception as exc:  # noqa: BLE001
-                        # 预处理失败不直接淘汰公司；正式分析仍会重试并可降级BM25。
-                        current["preparation_state"] = "failed"
-                        current["preparation_error"] = (
-                            f"{type(exc).__name__}: {exc}"
-                        )
-                        preparation_state = "failed"
-                    completed_preparations += 1
-                    status["preparation"]["completed"] = completed_preparations
-                    write_json(status, status_path)
+                    with status_lock:
+                        current = status["companies"][company_folder]
+                        try:
+                            preparation = future.result()
+                            current["preparation_state"] = "completed"
+                            for key in (
+                                "base_feature_path",
+                                "base_prediction",
+                                "base_prediction_path",
+                                "base_prediction_status",
+                                "base_prediction_error",
+                            ):
+                                current[key] = getattr(preparation, key, None)
+                            preparation_state = "completed"
+                        except Exception as exc:  # noqa: BLE001
+                            # 预处理失败不直接淘汰公司；正式分析仍会重试并可降级BM25。
+                            current["preparation_state"] = "failed"
+                            current["preparation_error"] = f"{type(exc).__name__}: {exc}"
+                            preparation_state = "failed"
+                        completed_preparations += 1
+                        status["preparation"]["completed"] = completed_preparations
+                        write_json(status, status_path)
                     if preparation_progress is not None:
                         preparation_progress(
                             completed_preparations,
@@ -583,8 +560,9 @@ def run_agent_feature_experiment(
                             company_folder,
                             preparation_state,
                         )
-            status["preparation"]["state"] = "completed"
-            write_json(status, status_path)
+            with status_lock:
+                status["preparation"]["state"] = "completed"
+                write_json(status, status_path)
 
     def analyze_one_company(
         company_folder: str,
@@ -630,9 +608,12 @@ def run_agent_feature_experiment(
             if risk_scope_review_controllers is not None
             else None
         )
-        review_wait_before = (
-            controller.wait_seconds() if controller is not None else 0.0
+        recovery_controller = (
+            llm_failure_recovery_controllers.get(company_folder)
+            if llm_failure_recovery_controllers is not None
+            else None
         )
+        review_wait_before = controller.wait_seconds() if controller is not None else 0.0
         try:
             analyzer_kwargs: dict[str, Any] = {
                 "project_root": root,
@@ -641,6 +622,8 @@ def run_agent_feature_experiment(
             }
             if controller is not None:
                 analyzer_kwargs["risk_scope_review_controller"] = controller
+            if recovery_controller is not None:
+                analyzer_kwargs["llm_failure_recovery_controller"] = recovery_controller
             artifacts = analyzer(company_folder, **analyzer_kwargs)
             report = artifacts.report
             as_of_date = report.source_document.available_at
@@ -676,6 +659,11 @@ def run_agent_feature_experiment(
                 "evidence_count": report.summary.evidence_count,
                 "trace_count": len(report.agent_traces),
                 "report_path": _portable(artifacts.report_path, root),
+                "prelisting_features_path": (
+                    _portable(artifacts.prelisting_features_path, root)
+                    if artifacts.prelisting_features_path is not None
+                    else None
+                ),
                 "embedding_dir": (
                     _portable(artifacts.embedding_dir, root)
                     if artifacts.embedding_dir is not None
@@ -687,6 +675,17 @@ def run_agent_feature_experiment(
                 },
                 "model_fingerprint": fingerprint,
             }
+            prediction = (
+                read_json(artifacts.prediction_path)
+                if artifacts.prediction_path is not None and artifacts.prediction_path.is_file()
+                else None
+            )
+            payload["prediction"] = prediction
+            payload["prediction_path"] = (
+                _portable(artifacts.prediction_path, root)
+                if artifacts.prediction_path is not None
+                else None
+            )
             write_json(payload, feature_path)
             with status_lock:
                 current.update(
@@ -698,6 +697,12 @@ def run_agent_feature_experiment(
                         "finding_count": report.summary.finding_count,
                         "evidence_count": report.summary.evidence_count,
                         "feature_path": _portable(feature_path, root),
+                        "prelisting_features_path": payload["prelisting_features_path"],
+                        "prediction": prediction,
+                        "prediction_path": payload["prediction_path"],
+                        "prediction_status": (
+                            "completed" if prediction is not None else "unavailable"
+                        ),
                     }
                 )
                 write_json(status, status_path)
@@ -718,9 +723,7 @@ def run_agent_feature_experiment(
                         "duration_seconds": round(
                             max(
                                 0.0,
-                                perf_counter()
-                                - started_clock
-                                - review_wait_seconds,
+                                perf_counter() - started_clock - review_wait_seconds,
                             ),
                             3,
                         ),
@@ -795,16 +798,11 @@ def run_agent_feature_experiment(
                 active_futures.pop(company_future)
                 failure_key, budget_pause = company_future.result()
                 if failure_key is not None:
-                    failure_counts[failure_key] = (
-                        failure_counts.get(failure_key, 0) + 1
-                    )
+                    failure_counts[failure_key] = failure_counts.get(failure_key, 0) + 1
                     if budget_pause:
                         circuit_reason = failure_key.split(":", maxsplit=1)[-1]
                     elif failure_counts[failure_key] >= 2:
-                        circuit_reason = (
-                            "两家公司出现相同失败，队列已安全暂停："
-                            f"{failure_key}"
-                        )
+                        circuit_reason = f"两家公司出现相同失败，队列已安全暂停：{failure_key}"
             while len(active_futures) < company_worker_count and can_submit():
                 company_folder, manifest_row = pending_items[next_item]
                 next_item += 1
@@ -824,9 +822,7 @@ def run_agent_feature_experiment(
         item.get("state") in {"pending", "running", "paused"}
         for item in status["companies"].values()
     )
-    if circuit_reason is not None or (
-        pause_was_requested and has_unfinished_company
-    ):
+    if circuit_reason is not None or (pause_was_requested and has_unfinished_company):
         status["queue_state"] = "paused"
         status["pause_reason"] = (
             circuit_reason
@@ -839,8 +835,7 @@ def run_agent_feature_experiment(
 
     unfinished_states = {"pending", "running", "paused"}
     if status.get("queue_state") != "paused" and not any(
-        item.get("state") in unfinished_states
-        for item in status["companies"].values()
+        item.get("state") in unfinished_states for item in status["companies"].values()
     ):
         status["queue_state"] = "completed"
         status["pause_reason"] = None
@@ -853,16 +848,8 @@ def run_agent_feature_experiment(
         agent_matrix_path=agent_matrix_path,
         selected=selected,
     )
-    completed = [
-        item
-        for item in status["companies"].values()
-        if item.get("state") == "completed"
-    ]
-    failed = [
-        item
-        for item in status["companies"].values()
-        if item.get("state") == "failed"
-    ]
+    completed = [item for item in status["companies"].values() if item.get("state") == "completed"]
+    failed = [item for item in status["companies"].values() if item.get("state") == "failed"]
     summary = {
         "schema_version": 1,
         "experiment_name": experiment_name,
@@ -887,9 +874,7 @@ def run_agent_feature_experiment(
         "status_path": _portable(status_path, root),
         "agent_feature_matrix_path": _portable(agent_matrix_path, root),
         "augmented_feature_matrix_path": (
-            _portable(augmented_matrix_path, root)
-            if augmented_matrix_path is not None
-            else None
+            _portable(augmented_matrix_path, root) if augmented_matrix_path is not None else None
         ),
         "failed_companies": [
             {
@@ -942,15 +927,11 @@ def _load_or_create_selection(
     if path.is_file():
         existing = read_json(path)
         if existing.get("model_fingerprint") != fingerprint:
-            raise ValueError(
-                "experiment model or prompts changed; use a new experiment_name"
-            )
+            raise ValueError("experiment model or prompts changed; use a new experiment_name")
         return list(existing["companies"])
 
     if company_folders:
-        by_folder = {
-            str(row.get("company_folder")): row for row in manifest_rows
-        }
+        by_folder = {str(row.get("company_folder")): row for row in manifest_rows}
         missing = sorted(set(company_folders).difference(by_folder))
         if missing:
             raise ValueError(f"unknown company folders: {', '.join(missing)}")
@@ -965,9 +946,7 @@ def _load_or_create_selection(
         "schema_version": 1,
         "created_at": _now(),
         "selection_policy": (
-            "explicit_company_folders"
-            if company_folders
-            else "split_proportional_document_hash"
+            "explicit_company_folders" if company_folders else "split_proportional_document_hash"
         ),
         "requested_sample_size": sample_size,
         "requested_splits": list(splits),
@@ -1017,9 +996,7 @@ def _write_feature_matrices(
     selected: Sequence[dict[str, Any]],
 ) -> Path | None:
     records: list[dict[str, Any]] = []
-    selected_by_id = {
-        str(row["company_id"]).zfill(5): row for row in selected
-    }
+    selected_by_id = {str(row["company_id"]).zfill(5): row for row in selected}
     for feature_path in sorted(company_dir.glob("*.json")):
         payload = read_json(feature_path)
         company_id = str(payload["company_id"]).zfill(5)
@@ -1034,12 +1011,7 @@ def _write_feature_matrices(
             "run_id": payload.get("run_id"),
             "duration_seconds": payload.get("duration_seconds"),
         }
-        record.update(
-            {
-                name: feature["value"]
-                for name, feature in payload["features"].items()
-            }
-        )
+        record.update({name: feature["value"] for name, feature in payload["features"].items()})
         records.append(record)
     identity_columns = {
         "company_id",
@@ -1052,13 +1024,9 @@ def _write_feature_matrices(
     }
     if records:
         agent_frame = pd.DataFrame(records)
-        agent_columns = [
-            column for column in agent_frame.columns if column not in identity_columns
-        ]
+        agent_columns = [column for column in agent_frame.columns if column not in identity_columns]
         zero_fill_columns = [
-            column
-            for column in agent_columns
-            if column not in AGENT_PRECISION_FEATURE_NAMES
+            column for column in agent_columns if column not in AGENT_PRECISION_FEATURE_NAMES
         ]
         agent_frame[zero_fill_columns] = agent_frame[zero_fill_columns].fillna(0)
         agent_frame.sort_values(["split", "prospectus_date", "company_id"], inplace=True)
@@ -1067,13 +1035,7 @@ def _write_feature_matrices(
         agent_columns = []
     agent_frame.to_csv(agent_matrix_path, index=False, encoding="utf-8-sig")
 
-    base_path = (
-        project_root
-        / "data"
-        / "processed"
-        / "modeling"
-        / "prelisting_feature_matrix.csv"
-    )
+    base_path = project_root / "data" / "processed" / "modeling" / "prelisting_feature_matrix.csv"
     if not records or not base_path.is_file():
         return None
     base = pd.read_csv(base_path, dtype={"company_id": str})
@@ -1114,9 +1076,7 @@ def _experiment_fingerprint(project_root: Path, config: AppConfig) -> dict[str, 
         "discovery_batch_chars": config.agents.discovery_batch_chars,
         "specialist_batch_size": config.agents.specialist_batch_size,
         "specialist_followup_rounds": config.agents.specialist_followup_rounds,
-        "decision_conflict_batch_size": (
-            config.agents.decision_conflict_batch_size
-        ),
+        "decision_conflict_batch_size": (config.agents.decision_conflict_batch_size),
         "prompt_hashes": prompt_hashes,
     }
 

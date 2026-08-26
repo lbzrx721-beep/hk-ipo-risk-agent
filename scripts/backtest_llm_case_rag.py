@@ -71,6 +71,10 @@ def main(
         None,
         help="排除另一份backtest.json中的样本，用于不重叠留出验证",
     ),
+    company_ids: str | None = typer.Option(
+        None,
+        help="逗号分隔的公司代码；设置后精确回测这些公司，不再随机抽样",
+    ),
 ) -> None:
     root = project_root.resolve()
     matrix = (
@@ -90,12 +94,18 @@ def main(
     selection_frame = frame.loc[
         ~frame["company_id"].astype(str).str.zfill(5).isin(excluded_ids)
     ]
-    selected = select_balanced_pilot(
-        selection_frame,
-        split=split,
-        sample_size=sample_size,
-        random_state=random_state,
+    explicit_ids = _parse_company_ids(company_ids)
+    selected = (
+        _select_explicit_companies(selection_frame, split=split, company_ids=explicit_ids)
+        if explicit_ids
+        else select_balanced_pilot(
+            selection_frame,
+            split=split,
+            sample_size=sample_size,
+            random_state=random_state,
+        )
     )
+    effective_sample_size = len(selected)
     config = load_config(root / "configs" / "base.yaml")
     if not config.llm.is_configured:
         raise RuntimeError("LLM未配置，请检查configs/providers.local.yaml")
@@ -145,7 +155,7 @@ def main(
             "alert_threshold": alert_threshold,
             "excluded_company_ids": sorted(excluded_ids),
             "split": split,
-            "sample_size": sample_size,
+            "sample_size": effective_sample_size,
             "random_state": random_state,
             "top_k": top_k,
             "temperature": 0.0,
@@ -165,7 +175,7 @@ def main(
     for index, (_, row) in enumerate(selected.iterrows(), start=1):
         company_id = str(row["company_id"]).zfill(5)
         typer.echo(
-            f"[{index}/{sample_size}] {company_id} · {row['company_name']} · "
+            f"[{index}/{effective_sample_size}] {company_id} · {row['company_name']} · "
             f"真实标签={int(row['target_significant_drop_5d'])}"
         )
         if all((company_id, arm_name) in completed_keys for arm_name in run_arms):
@@ -308,6 +318,61 @@ def _load_excluded_ids(path: Path | None) -> set[str]:
     }
 
 
+def _parse_company_ids(value: str | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    normalized = tuple(
+        dict.fromkeys(
+            item.strip().removesuffix(".HK").zfill(5)
+            for item in value.split(",")
+            if item.strip()
+        )
+    )
+    return normalized
+
+
+def _select_explicit_companies(
+    frame: pd.DataFrame,
+    *,
+    split: str,
+    company_ids: tuple[str, ...],
+) -> pd.DataFrame:
+    """按固定公司清单回测；真实标签只用于事后评分，不参与选择。"""
+    required = {
+        "company_id",
+        "company_name",
+        "prospectus_date",
+        "split",
+        "target_significant_drop_5d",
+    }
+    missing = required - set(frame.columns)
+    if missing:
+        raise ValueError(f"feature matrix is missing columns: {sorted(missing)}")
+    ids = frame["company_id"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(5)
+    candidates = frame.loc[(frame["split"].astype(str) == split) & ids.isin(company_ids)].copy()
+    candidates["company_id"] = (
+        candidates["company_id"]
+        .astype(str)
+        .str.replace(r"\.0$", "", regex=True)
+        .str.zfill(5)
+    )
+    found = set(candidates["company_id"])
+    absent = [company_id for company_id in company_ids if company_id not in found]
+    if absent:
+        raise ValueError(f"split {split!r} is missing requested companies: {absent}")
+    duplicated = candidates["company_id"].duplicated(keep=False)
+    if duplicated.any():
+        duplicate_ids = sorted(candidates.loc[duplicated, "company_id"].unique())
+        raise ValueError(f"requested companies have duplicate rows: {duplicate_ids}")
+    labels = pd.to_numeric(candidates["target_significant_drop_5d"], errors="coerce")
+    if not labels.isin((0, 1)).all():
+        invalid_ids = candidates.loc[~labels.isin((0, 1)), "company_id"].tolist()
+        raise ValueError(f"requested companies have invalid labels: {invalid_ids}")
+    order = {company_id: index for index, company_id in enumerate(company_ids)}
+    candidates["_selection_order"] = candidates["company_id"].map(order)
+    return candidates.sort_values("_selection_order").drop(columns="_selection_order").reset_index(drop=True)
+
+
 def _select_hybrid_cases(
     frame: pd.DataFrame,
     company_id: str,
@@ -317,6 +382,7 @@ def _select_hybrid_cases(
 ) -> tuple[Any, ...]:
     embedding_provider = OpenAICompatibleEmbeddingProvider(
         model_name=config.embedding.model_name,
+        api_model_name=config.embedding.request_model_name,
         dimensions=config.embedding.dimensions,
         batch_size=1,
         request_concurrency=1,

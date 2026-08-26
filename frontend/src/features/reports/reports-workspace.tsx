@@ -201,12 +201,52 @@ function FindingItem({ finding, index, retry, selected, onSelect }: {
   );
 }
 
-function SummaryCard({ label, value }: { label: string; value: number }) {
+function SummaryCard({ label, value, suffix = "" }: { label: string; value: number; suffix?: string }) {
   return (
     <div className="rounded-xl border bg-muted/15 px-3 py-2">
       <span className="text-xs text-muted-foreground">{label}</span>
-      <strong className="mt-1 block text-xl tabular-nums">{value}</strong>
+      <strong className="mt-1 block text-xl tabular-nums">{value}{suffix}</strong>
     </div>
+  );
+}
+
+function PredictionSummary({ run }: { run: ReviewRun }) {
+  const prediction = run.prediction;
+  if (!prediction) return null;
+  const decisionLabel = prediction.decision === "high_risk"
+    ? "高风险预警"
+    : prediction.recall_guard?.watchlist
+      ? "风险观察名单"
+    : prediction.decision === "low_risk"
+      ? "低风险"
+      : "不确定 · 待研判";
+  return (
+    <Card className="border-primary/25 bg-primary/5">
+      <CardHeader className="border-b border-border/60">
+        <CardTitle>上市后五日显著下跌预测</CardTitle>
+        <CardDescription>这是决策Agent之后生成的方向性预测；人工复核用于确认风险证据，不会倒推修改本次预测。</CardDescription>
+        <CardAction>
+          <Badge variant={prediction.decision === "high_risk" ? "destructive" : prediction.decision === "low_risk" ? "secondary" : "outline"}>
+            {decisionLabel}
+          </Badge>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="grid gap-3 sm:grid-cols-3">
+        <SummaryCard label="下跌风险概率" value={Math.round(prediction.probability * 100)} suffix="%" />
+        <SummaryCard label="模型置信度" value={Math.round(prediction.confidence * 100)} suffix="%" />
+        <SummaryCard label="输入完整度" value={Math.round(prediction.feature_completeness * 100)} suffix="%" />
+        {prediction.recall_guard?.watchlist && (
+          <Alert className="border-amber-500/35 bg-amber-500/10 sm:col-span-3">
+            <ShieldAlert />
+            <AlertTitle>高风险召回保护层已命中</AlertTitle>
+            <AlertDescription>
+              {prediction.recall_guard.reasons.join("、") || "多项稳定风险因子叠加"}。该标记用于减少漏报，不会覆盖主模型概率。
+            </AlertDescription>
+          </Alert>
+        )}
+        <p className="text-xs text-muted-foreground sm:col-span-3">{prediction.disclaimer}</p>
+      </CardContent>
+    </Card>
   );
 }
 
@@ -561,14 +601,10 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
               重试本公司 {technicalFailureCount} 条技术失败
             </Button>
           )}
-          {selectedRun?.complete && (
-            <Button disabled={!serviceAvailable || submitting} onClick={() => void handleExport()}>
-              {submitting ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
-              导出正式报告
-            </Button>
-          )}
         </div>
       </section>
+
+      {selectedRun && <PredictionSummary run={selectedRun} />}
 
       <div className="grid min-w-0 gap-4 2xl:grid-cols-[280px_390px_minmax(520px,1fr)]">
         <Card className="min-w-0 bg-card/75">
@@ -830,6 +866,34 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
           </CardContent>
         </Card>
       </div>
+
+      {selectedRun && (
+        <Card className="border-primary/25 bg-card/75">
+          <CardHeader className="border-b border-border/60">
+            <CardTitle>最终报告交付</CardTitle>
+            <CardDescription>只有全部风险完成确认或驳回后，才生成正式PDF、精简JSON与完整审计包。</CardDescription>
+            <CardAction>
+              <Badge variant={selectedRun.complete ? "secondary" : "outline"}>
+                {selectedRun.complete ? "复核完成" : `还需处理 ${selectedRun.pending_findings} 条`}
+              </Badge>
+            </CardAction>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            <Progress value={selectedRun.total_findings ? (selectedRun.reviewed_findings / selectedRun.total_findings) * 100 : 0} />
+            <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+              <p className="text-sm text-muted-foreground">
+                {selectedRun.complete
+                  ? "人工复核已闭环，报告将包含五日风险预测、最终风险结论、原文证据和审计引用。"
+                  : "请先处理风险清单中的待复核项；预测结果已经生成，无需等待复核才能查看。"}
+              </p>
+              <Button disabled={!serviceAvailable || submitting || !selectedRun.complete} onClick={() => void handleExport()}>
+                {submitting ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                导出正式报告
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }

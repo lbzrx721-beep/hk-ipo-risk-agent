@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from ipo_risk.agents.intervention import (
+    LlmFailureRecoveryRequest,
     RiskScopeCandidate,
     RiskScopeReviewRequest,
 )
@@ -34,13 +35,7 @@ def _company(company_id: str = "00001") -> BatchCompany:
 def test_load_batch_companies_uses_manifest_identity_without_market_label_values(
     tmp_path: Path,
 ) -> None:
-    manifest = (
-        tmp_path
-        / "data"
-        / "processed"
-        / "competition"
-        / "company_manifest.jsonl"
-    )
+    manifest = tmp_path / "data" / "processed" / "competition" / "company_manifest.jsonl"
     manifest.parent.mkdir(parents=True)
     manifest.write_text(
         json.dumps(
@@ -111,9 +106,7 @@ def test_batch_job_coalesces_incremental_model_stream_events(
     second = job.events_for("00001_测试公司")
 
     assert len(first) == 1
-    assert first[0].detail == (
-        '[[batch:1/1]]{"assessments":[{"risk_type":"cash"}]}'
-    )
+    assert first[0].detail == ('[[batch:1/1]]{"assessments":[{"risk_type":"cash"}]}')
     assert second == first
 
 
@@ -280,6 +273,45 @@ def test_batch_company_enters_its_own_risk_scope_review_state(
 
     assert snapshot.companies[0].state == "awaiting_review"
     assert snapshot.companies[0].risk_scope_review == request
+
+
+def test_batch_company_enters_llm_failure_recovery_state(tmp_path: Path) -> None:
+    company = _company()
+    job = BatchAnalysisJob(
+        project_root=tmp_path,
+        experiment_name="company-recovery-test",
+        companies=(company,),
+    )
+    write_json(
+        {
+            "schema_version": 1,
+            "companies": {
+                company.company_folder: {
+                    "company_id": company.company_id,
+                    "company_folder": company.company_folder,
+                    "split": company.split,
+                    "state": "running",
+                }
+            },
+            "queue_state": "running",
+            "pause_reason": None,
+        },
+        job.status_path,
+    )
+    request = LlmFailureRecoveryRequest(
+        run_id="RUN-BATCH-RECOVERY",
+        reason="模型认证失败。",
+        technical_detail="401 Unauthorized",
+    )
+    controller = job._llm_failure_recovery_controllers[company.company_folder]
+    waiter = Thread(target=controller.request_resolution, args=(request,), daemon=True)
+    waiter.start()
+    assert controller.wait_for_request(timeout=1)
+
+    snapshot = job.snapshot()
+
+    assert snapshot.companies[0].state == "awaiting_recovery"
+    assert snapshot.companies[0].llm_failure_recovery == request
 
 
 def test_uploaded_batch_prepares_documents_before_running_experiment(

@@ -145,6 +145,40 @@ export async function submitRiskScope(
   );
 }
 
+export async function resolveLlmFailure(
+  batchId: string,
+  companyKey: string,
+  payload: {
+    request_id: string;
+    run_id: string;
+    action: "retry_llm" | "fallback_bm25";
+  },
+): Promise<BatchSnapshot> {
+  return requestJson<BatchSnapshot>(
+    `/batches/${batchId}/companies/${encodeURIComponent(companyKey)}/llm-recovery`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    },
+  );
+}
+
+export async function rerunPrediction(
+  batchId: string,
+  companyKey: string,
+  variant: "auto" | "base" | "agent_enhanced" = "auto",
+): Promise<{ prediction: import("./types").RuntimePrediction; batch: BatchSnapshot }> {
+  return requestJson(
+    `/batches/${batchId}/companies/${encodeURIComponent(companyKey)}/prediction`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ variant }),
+    },
+  );
+}
+
 export function connectBatchStream(
   batchId: string,
   onSnapshot: (snapshot: BatchSnapshot) => void,
@@ -177,6 +211,17 @@ export function connectBatchStream(
 export async function listReviewRuns(): Promise<ReviewRun[]> {
   const payload = await requestJson<{ runs: ReviewRun[] }>("/reports/runs");
   return payload.runs;
+}
+
+export async function rerunStoredPrediction(
+  runId: string,
+  variant: "auto" | "base" | "agent_enhanced" = "auto",
+): Promise<{ prediction: import("./types").RuntimePrediction; run: ReviewRun }> {
+  return requestJson(`/reports/runs/${encodeURIComponent(runId)}/prediction`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ variant }),
+  });
 }
 
 export async function listRunFindings(runId: string): Promise<StoredFinding[]> {

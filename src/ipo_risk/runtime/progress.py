@@ -58,11 +58,19 @@ _STAGE_LABELS = {
     "risk_scoping_fallback": "风险范围识别降级",
     "risk_scope_review_requested": "人工确认风险范围",
     "risk_scope_review_completed": "人工确认风险范围",
+    "llm_recovery_requested": "模型故障等待处理",
+    "llm_recovery_retry_selected": "模型故障恢复",
+    "llm_recovery_bm25_selected": "BM25降级确认",
     "agents_completed": "风险整合",
     "calculation_skipped": "数值复算",
     "evidence_started": "证据报告",
+    "features_started": "上市前特征",
+    "features_progress": "上市前特征",
     "features_completed": "上市前特征",
     "features_failed": "上市前特征",
+    "prediction_started": "五日下跌预测",
+    "prediction_completed": "五日下跌预测",
+    "prediction_failed": "五日下跌预测",
     "model_budget_paused": "模型预算安全暂停",
     "coverage_warning": "风险覆盖提醒",
     "completed": "分析完成",
@@ -87,14 +95,10 @@ _DISCOVERY_BATCH_PATTERN = re.compile(
     r"(?:本批|章节包\d+|风险原文包\d+)新增"
     r"(?P<new>\d+)条，累计(?P<raw>\d+)条风险候选"
 )
-_SCOPING_PATTERN = re.compile(
-    r"保留(?P<included>\d+)条.+排除(?P<excluded>\d+)条"
-)
+_SCOPING_PATTERN = re.compile(r"保留(?P<included>\d+)条.+排除(?P<excluded>\d+)条")
 _HUMAN_SCOPE_PATTERN = re.compile(r"保留及新增(?P<selected>\d+)条")
 _ROLE_ASSIGNMENT_PATTERN = re.compile(r"开始分析(?P<count>\d+)类风险")
-_FINAL_ACCEPTED_PATTERN = re.compile(
-    r"(?:接受|形成|进入人工复核，?)(?P<count>\d+)条"
-)
+_FINAL_ACCEPTED_PATTERN = re.compile(r"(?:接受|形成|进入人工复核，?)(?P<count>\d+)条")
 _AGENT_OVERALL_RANGES = {
     "discovery": (30, 53),
     "decision": (83, 88),
@@ -106,10 +110,7 @@ _PARALLEL_AGENT_OVERALL_RANGE = (58, 83)
 def _parallel_agent_overall(progress_by_role: dict[str, int]) -> int:
     """按四条并行分支的平均完成度映射专业 Agent 总进度。"""
     start, end = _PARALLEL_AGENT_OVERALL_RANGE
-    total = sum(
-        max(0, min(progress_by_role.get(role, 0), 100))
-        for role in _PARALLEL_AGENT_ROLES
-    )
+    total = sum(max(0, min(progress_by_role.get(role, 0), 100)) for role in _PARALLEL_AGENT_ROLES)
     fraction = total / (len(_PARALLEL_AGENT_ROLES) * 100)
     return round(start + (end - start) * fraction)
 
@@ -130,6 +131,7 @@ class ProgressEvent(Protocol):
 AnalysisStatus = Literal[
     "pending",
     "running",
+    "awaiting_recovery",
     "awaiting_review",
     "completed",
     "paused",
@@ -186,9 +188,7 @@ class AnalysisProgressState:
         self._role_batch_outputs: dict[str, dict[str, str]] = {
             role: {} for role in _AGENT_SPECS if role != "discovery"
         }
-        self._risk_titles: dict[str, dict[str, str]] = {
-            role: {} for role in _AGENT_SPECS
-        }
+        self._risk_titles: dict[str, dict[str, str]] = {role: {} for role in _AGENT_SPECS}
         self._discovery_failures: list[str] = []
         self._funnel: dict[str, object] = {
             "document_batches": 0,
@@ -197,9 +197,7 @@ class AnalysisProgressState:
             "scoped_in": 0,
             "scoped_out": 0,
             "human_selected": 0,
-            "role_assignments": {
-                role: 0 for role in _PARALLEL_AGENT_ROLES
-            },
+            "role_assignments": {role: 0 for role in _PARALLEL_AGENT_ROLES},
             "final_accepted": 0,
         }
 
@@ -289,14 +287,10 @@ class AnalysisProgressState:
             if delta_match is None:
                 self._outputs[role] += detail
             elif role == "discovery":
-                stream_key = (
-                    f"{delta_match.group('kind')}:"
-                    f"{delta_match.group('current')}"
-                )
-                self._discovery_outputs[stream_key] = (
-                    self._discovery_outputs.get(stream_key, "")
-                    + delta_match.group("delta")
-                )
+                stream_key = f"{delta_match.group('kind')}:{delta_match.group('current')}"
+                self._discovery_outputs[stream_key] = self._discovery_outputs.get(
+                    stream_key, ""
+                ) + delta_match.group("delta")
                 self._outputs[role] = _OUTPUT_SEPARATOR.join(
                     content
                     for _stream_key, content in sorted(
@@ -308,22 +302,16 @@ class AnalysisProgressState:
                     )
                 )
             else:
-                stream_key = (
-                    f"{delta_match.group('kind')}:"
-                    f"{delta_match.group('current')}"
-                )
+                stream_key = f"{delta_match.group('kind')}:{delta_match.group('current')}"
                 role_outputs = self._role_batch_outputs[role]
-                role_outputs[stream_key] = (
-                    role_outputs.get(stream_key, "")
-                    + delta_match.group("delta")
+                role_outputs[stream_key] = role_outputs.get(stream_key, "") + delta_match.group(
+                    "delta"
                 )
                 self._outputs[role] = _OUTPUT_SEPARATOR.join(
                     content
                     for _key, content in sorted(
                         role_outputs.items(),
-                        key=lambda item: int(
-                            item[0].split(":", maxsplit=1)[1]
-                        ),
+                        key=lambda item: int(item[0].split(":", maxsplit=1)[1]),
                     )
                 )
         elif action == "structured":
@@ -333,13 +321,8 @@ class AnalysisProgressState:
             if structured_match is None:
                 self._outputs[role] = detail
             elif role == "discovery":
-                stream_key = (
-                    f"{structured_match.group('kind')}:"
-                    f"{structured_match.group('current')}"
-                )
-                self._discovery_outputs[stream_key] = (
-                    structured_match.group("delta")
-                )
+                stream_key = f"{structured_match.group('kind')}:{structured_match.group('current')}"
+                self._discovery_outputs[stream_key] = structured_match.group("delta")
                 self._outputs[role] = _OUTPUT_SEPARATOR.join(
                     content
                     for _stream_key, content in sorted(
@@ -351,19 +334,14 @@ class AnalysisProgressState:
                     )
                 )
             else:
-                stream_key = (
-                    f"{structured_match.group('kind')}:"
-                    f"{structured_match.group('current')}"
-                )
+                stream_key = f"{structured_match.group('kind')}:{structured_match.group('current')}"
                 role_outputs = self._role_batch_outputs[role]
                 role_outputs[stream_key] = structured_match.group("delta")
                 self._outputs[role] = _OUTPUT_SEPARATOR.join(
                     content
                     for _key, content in sorted(
                         role_outputs.items(),
-                        key=lambda item: int(
-                            item[0].split(":", maxsplit=1)[1]
-                        ),
+                        key=lambda item: int(item[0].split(":", maxsplit=1)[1]),
                     )
                 )
         elif action == "progress":
@@ -423,11 +401,7 @@ class AnalysisProgressState:
             self._set_agent_progress(
                 role,
                 100,
-                (
-                    "跳过全文动态发现"
-                    if role == "discovery"
-                    else "本次未分配风险"
-                ),
+                ("跳过全文动态发现" if role == "discovery" else "本次未分配风险"),
             )
         if action not in {"delta", "structured"}:
             agent["message"] = detail
@@ -438,9 +412,7 @@ class AnalysisProgressState:
         raw_match = _DISCOVERY_RAW_PATTERN.search(detail)
         if raw_match is not None:
             batch_count = (
-                raw_match.group("full_batches")
-                or raw_match.group("retrieved_batches")
-                or "0"
+                raw_match.group("full_batches") or raw_match.group("retrieved_batches") or "0"
             )
             self._funnel["document_batches"] = int(batch_count)
             self._funnel["raw_candidates"] = int(raw_match.group("raw"))
@@ -452,12 +424,8 @@ class AnalysisProgressState:
 
         consolidated_match = _DISCOVERY_CONSOLIDATED_PATTERN.search(detail)
         if consolidated_match is not None:
-            self._funnel["raw_candidates"] = int(
-                consolidated_match.group("raw")
-            )
-            self._funnel["consolidated_candidates"] = int(
-                consolidated_match.group("consolidated")
-            )
+            self._funnel["raw_candidates"] = int(consolidated_match.group("raw"))
+            self._funnel["consolidated_candidates"] = int(consolidated_match.group("consolidated"))
 
         if stage == "risk_scoping_completed":
             scope_match = _SCOPING_PATTERN.search(detail)
@@ -468,9 +436,7 @@ class AnalysisProgressState:
         if stage == "risk_scope_review_completed":
             human_match = _HUMAN_SCOPE_PATTERN.search(detail)
             if human_match is not None:
-                self._funnel["human_selected"] = int(
-                    human_match.group("selected")
-                )
+                self._funnel["human_selected"] = int(human_match.group("selected"))
 
         parts = stage.split(":")
         if (
@@ -488,28 +454,27 @@ class AnalysisProgressState:
         if stage == "agent:decision:completed":
             decision_match = _FINAL_ACCEPTED_PATTERN.search(detail)
             if decision_match is not None:
-                self._funnel["final_accepted"] = int(
-                    decision_match.group("count")
-                )
+                self._funnel["final_accepted"] = int(decision_match.group("count"))
 
     def emit(self, stage: str, detail: str, *, occurred_at: datetime) -> None:
         """把单个事件折叠进当前状态，不产生页面增量指令。"""
         if self._started_at is None:
             self._started_at = occurred_at
         self._last_event_at = occurred_at
-        if stage == "risk_scope_review_requested":
+        if stage in {"risk_scope_review_requested", "llm_recovery_requested"}:
             self._review_pause_started_at = occurred_at
         elif (
-            stage == "risk_scope_review_completed"
+            stage
+            in {
+                "risk_scope_review_completed",
+                "llm_recovery_retry_selected",
+                "llm_recovery_bm25_selected",
+            }
             and self._review_pause_started_at is not None
         ):
             self._review_wait_seconds += max(
                 0,
-                round(
-                    (
-                        occurred_at - self._review_pause_started_at
-                    ).total_seconds()
-                ),
+                round((occurred_at - self._review_pause_started_at).total_seconds()),
             )
             self._review_pause_started_at = None
         parts = stage.split(":")
@@ -575,11 +540,7 @@ class AnalysisProgressState:
             activity_detail = (
                 "模型正在流式生成"
                 if action == "delta"
-                else (
-                    "本批结构化风险卡片已更新"
-                    if action == "structured"
-                    else detail
-                )
+                else ("本批结构化风险卡片已更新" if action == "structured" else detail)
             )
             self._current_activity = f"{label} · {activity_detail}"
             self._update_agent(role, action, detail)
@@ -594,9 +555,7 @@ class AnalysisProgressState:
             if role in _PARALLEL_AGENT_ROLES:
                 percent = _parallel_agent_overall(
                     {
-                        item_role: _as_int(
-                            self._agents[item_role]["progress"]
-                        )
+                        item_role: _as_int(self._agents[item_role]["progress"])
                         for item_role in _PARALLEL_AGENT_ROLES
                     }
                 )
@@ -622,25 +581,24 @@ class AnalysisProgressState:
                 if action == "progress":
                     step_match = _PROGRESS_PATTERN.search(detail)
                     if step_match is not None:
-                        step = (
-                            f"风险任务 {step_match.group('current')}"
-                            f"/{step_match.group('total')}"
-                        )
+                        step = f"风险任务 {step_match.group('current')}/{step_match.group('total')}"
                 self._set_overall(percent, f"{label} · {step}")
-        elif stage == "parsing_progress":
-            label = _STAGE_LABELS.get(stage, "PDF解析")
+        elif stage in {"parsing_progress", "features_progress"}:
+            fallback_label = "PDF解析" if stage == "parsing_progress" else "上市前特征"
+            label = _STAGE_LABELS.get(stage, fallback_label)
             match = _PROGRESS_PATTERN.search(detail)
             if match is not None:
-                fraction = int(match.group("current")) / max(
-                    1, int(match.group("total"))
-                )
-                self._current_activity = (
-                    f"{label} · {match.group('current')}/{match.group('total')}页"
-                )
-                self._set_overall(
-                    round(12 + 13 * fraction),
-                    self._current_activity,
-                )
+                fraction = int(match.group("current")) / max(1, int(match.group("total")))
+                if stage == "parsing_progress":
+                    self._current_activity = (
+                        f"{label} · {match.group('current')}/{match.group('total')}页"
+                    )
+                    percent = round(12 + 13 * fraction)
+                else:
+                    progress_detail = detail[match.end() :].strip()
+                    self._current_activity = f"{label} · {progress_detail}"
+                    percent = round(93 + fraction)
+                self._set_overall(percent, self._current_activity)
         else:
             label = _STAGE_LABELS.get(stage, stage)
             self._current_activity = f"{label} · {detail}"
@@ -657,8 +615,17 @@ class AnalysisProgressState:
             "risk_scoping_fallback": 58,
             "risk_scope_review_requested": 58,
             "risk_scope_review_completed": 58,
+            "llm_recovery_requested": 45,
+            "llm_recovery_retry_selected": 45,
+            "llm_recovery_bm25_selected": 45,
             "agents_completed": 88,
             "evidence_started": 92,
+            "features_started": 93,
+            "features_completed": 94,
+            "features_failed": 94,
+            "prediction_started": 96,
+            "prediction_completed": 99,
+            "prediction_failed": 99,
             "completed": 100,
         }.get(stage)
         if overall_progress is not None:
@@ -687,14 +654,10 @@ class AnalysisProgressState:
     ) -> dict[str, Any]:
         assignments = self._funnel["role_assignments"]
         effective_now = now or datetime.now().astimezone()
-        end = (
-            self._last_event_at
-            if status in {"completed", "failed"}
-            else effective_now
-        )
+        end = self._last_event_at if status in {"completed", "failed"} else effective_now
         elapsed_seconds = 0
         review_wait_seconds = self._review_wait_seconds
-        if self._review_pause_started_at is not None:
+        if self._review_pause_started_at is not None and end is not None:
             review_wait_seconds += max(
                 0,
                 round((end - self._review_pause_started_at).total_seconds()),
@@ -702,34 +665,23 @@ class AnalysisProgressState:
         if self._started_at is not None and end is not None:
             elapsed_seconds = max(
                 0,
-                round((end - self._started_at).total_seconds())
-                - review_wait_seconds,
+                round((end - self._started_at).total_seconds()) - review_wait_seconds,
             )
         return {
             "events": list(self._events),
             "max_percent": self._max_percent,
             "overall_text": self._overall_text,
             "current_activity": self._current_activity,
-            "agents": {
-                role: dict(agent) for role, agent in self._agents.items()
-            },
+            "agents": {role: dict(agent) for role, agent in self._agents.items()},
             "outputs": dict(self._outputs),
-            "risk_titles": {
-                role: dict(titles)
-                for role, titles in self._risk_titles.items()
-            },
+            "risk_titles": {role: dict(titles) for role, titles in self._risk_titles.items()},
             "discovery_failures": list(self._discovery_failures),
-            "background_tasks": {
-                key: dict(value)
-                for key, value in self._background_tasks.items()
-            },
+            "background_tasks": {key: dict(value) for key, value in self._background_tasks.items()},
             "elapsed_seconds": elapsed_seconds,
             "review_wait_seconds": review_wait_seconds,
             "funnel": {
                 **self._funnel,
-                "role_assignments": (
-                    dict(assignments) if isinstance(assignments, dict) else {}
-                ),
+                "role_assignments": (dict(assignments) if isinstance(assignments, dict) else {}),
             },
         }
 
@@ -765,7 +717,6 @@ def build_analysis_progress_snapshot(
     if not include_outputs:
         snapshot.pop("outputs", None)
     return snapshot
-
 
 
 __all__ = [

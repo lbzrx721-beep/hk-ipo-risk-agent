@@ -6,6 +6,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 from ipo_risk.agents.verifier import verify_finding as run_verification
@@ -20,9 +21,14 @@ from ipo_risk.domain import (
 )
 from ipo_risk.reporting import AnalysisSummary, RiskAnalysisReport, write_risk_report
 from ipo_risk.reporting import write_verified_pdf_report
+from ipo_risk.runtime.prediction import (
+    DEFAULT_BASE_MODEL_PATH,
+    RuntimePredictionUnavailable,
+    generate_runtime_prediction_from_feature_file,
+)
 from ipo_risk.storage.files import read_json, write_json
 from ipo_risk.storage.paths import safe_path_segment
-from ipo_risk.storage.repositories import CatalogRepository
+from ipo_risk.storage.repositories import AnalysisRunRecord, CatalogRepository
 
 
 class ReviewBlockedError(ValueError):
@@ -63,6 +69,10 @@ class ReviewRunSummary:
     complete: bool
     report_path: str | None
     verified_report_path: str | None
+    base_feature_available: bool
+    agent_feature_available: bool
+    base_prediction: dict[str, Any] | None
+    prediction: dict[str, Any] | None
 
 
 @dataclass(frozen=True)
@@ -108,40 +118,150 @@ class ReviewService:
         self.repository = repository
         self.project_root = project_root.resolve()
 
+    def _prediction_for_report(
+        self,
+        report_reference: str | None,
+        *,
+        variant: str = "agent_enhanced",
+    ) -> dict[str, Any] | None:
+        prediction_path = self._artifact_for_report(
+            report_reference,
+            "prediction_5d_base.json" if variant == "base" else "prediction_5d.json",
+        )
+        if prediction_path is None or not prediction_path.is_file():
+            return None
+        payload = read_json(prediction_path)
+        return payload if isinstance(payload, dict) else None
+
+    def _artifact_for_report(
+        self,
+        report_reference: str | None,
+        artifact_name: str,
+    ) -> Path | None:
+        if not report_reference:
+            return None
+        report_path = Path(report_reference)
+        if not report_path.is_absolute():
+            report_path = self.project_root / report_path
+        resolved = report_path.resolve().with_name(artifact_name)
+        try:
+            resolved.relative_to(self.project_root)
+        except ValueError:
+            return None
+        return resolved
+
+    def _summarize_run(self, run: AnalysisRunRecord) -> ReviewRunSummary | None:
+        findings = self.repository.list_findings(run.run_id)
+        if not findings:
+            return None
+        company = self.repository.get_company(run.company_id)
+        pending = sum(
+            finding.status
+            in {
+                VerificationStatus.PROPOSED,
+                VerificationStatus.PENDING_VERIFICATION,
+            }
+            for finding in findings
+        )
+        verified = sum(finding.status is VerificationStatus.VERIFIED for finding in findings)
+        rejected = sum(finding.status is VerificationStatus.REJECTED for finding in findings)
+        base_feature = self._artifact_for_report(
+            run.report_path,
+            "prelisting_features_base.json",
+        )
+        agent_feature = self._artifact_for_report(
+            run.report_path,
+            "prelisting_features.json",
+        )
+        return ReviewRunSummary(
+            run_id=run.run_id,
+            company_id=run.company_id,
+            company_name=(company.company_name_zh if company else run.company_id),
+            as_of_date=run.as_of_date.isoformat(),
+            total_findings=len(findings),
+            pending_findings=pending,
+            verified_findings=verified,
+            rejected_findings=rejected,
+            reviewed_findings=verified + rejected,
+            complete=pending == 0,
+            report_path=run.report_path,
+            verified_report_path=run.verified_report_path,
+            base_feature_available=bool(base_feature and base_feature.is_file()),
+            agent_feature_available=bool(agent_feature and agent_feature.is_file()),
+            base_prediction=self._prediction_for_report(run.report_path, variant="base"),
+            prediction=self._prediction_for_report(run.report_path),
+        )
+
     def list_runs(self) -> tuple[ReviewRunSummary, ...]:
         summaries: list[ReviewRunSummary] = []
         for run in self.repository.list_analysis_runs(status="succeeded"):
-            findings = self.repository.list_findings(run.run_id)
-            if not findings:
-                continue
-            company = self.repository.get_company(run.company_id)
-            pending = sum(
-                finding.status
-                in {
-                    VerificationStatus.PROPOSED,
-                    VerificationStatus.PENDING_VERIFICATION,
-                }
-                for finding in findings
-            )
-            verified = sum(finding.status is VerificationStatus.VERIFIED for finding in findings)
-            rejected = sum(finding.status is VerificationStatus.REJECTED for finding in findings)
-            summaries.append(
-                ReviewRunSummary(
-                    run_id=run.run_id,
-                    company_id=run.company_id,
-                    company_name=(company.company_name_zh if company else run.company_id),
-                    as_of_date=run.as_of_date.isoformat(),
-                    total_findings=len(findings),
-                    pending_findings=pending,
-                    verified_findings=verified,
-                    rejected_findings=rejected,
-                    reviewed_findings=verified + rejected,
-                    complete=pending == 0,
-                    report_path=run.report_path,
-                    verified_report_path=run.verified_report_path,
-                )
-            )
+            summary = self._summarize_run(run)
+            if summary is not None:
+                summaries.append(summary)
         return tuple(summaries)
+
+    def rerun_prediction(
+        self,
+        run_id: str,
+        *,
+        variant: str = "auto",
+    ) -> tuple[dict[str, Any], ReviewRunSummary]:
+        """基于历史运行的已保存特征独立重算预测。"""
+
+        run = self.repository.get_analysis_run(run_id)
+        if run is None or run.status != "succeeded":
+            raise KeyError(f"analysis run does not exist: {run_id}")
+        company = self.repository.get_company(run.company_id)
+        company_name = company.company_name_zh if company else run.company_id
+        agent_feature = self._artifact_for_report(run.report_path, "prelisting_features.json")
+        base_feature = self._artifact_for_report(
+            run.report_path,
+            "prelisting_features_base.json",
+        )
+        effective_variant = variant
+        if effective_variant == "auto":
+            effective_variant = (
+                "agent_enhanced"
+                if agent_feature is not None and agent_feature.is_file()
+                else "base"
+            )
+        if effective_variant not in {"base", "agent_enhanced"}:
+            raise ValueError("未知的预测版本。")
+        feature_path = agent_feature if effective_variant == "agent_enhanced" else base_feature
+        if feature_path is None or not feature_path.is_file():
+            raise RuntimePredictionUnavailable(
+                "Agent增强特征尚未生成。"
+                if effective_variant == "agent_enhanced"
+                else "基础特征尚未生成。"
+            )
+        report_path = self._artifact_for_report(run.report_path, "risk_analysis.json")
+        if report_path is None:
+            raise RuntimePredictionUnavailable("分析结果路径无效。")
+        destination = report_path.with_name(
+            "prediction_5d.json"
+            if effective_variant == "agent_enhanced"
+            else "prediction_5d_base.json"
+        )
+        prediction, _ = generate_runtime_prediction_from_feature_file(
+            project_root=self.project_root,
+            company_id=run.company_id,
+            company_name=company_name,
+            feature_path=feature_path,
+            report_path=report_path,
+            prediction_variant=effective_variant,
+            model_path=(DEFAULT_BASE_MODEL_PATH if effective_variant == "base" else None),
+            destination_path=destination,
+        )
+        self.repository.save_prediction(
+            run_id=run.run_id,
+            company_id=run.company_id,
+            as_of_date=run.as_of_date,
+            payload=prediction,
+        )
+        summary = self._summarize_run(run)
+        if summary is None:
+            raise RuntimePredictionUnavailable("该运行没有可展示的风险结论。")
+        return prediction, summary
 
     def list_findings(self, run_id: str) -> tuple[RiskFinding, ...]:
         return self.repository.list_findings(run_id)
@@ -468,6 +588,7 @@ class ReviewService:
         candidate_report = RiskAnalysisReport.model_validate(read_json(candidate_path))
         stored_findings = self.repository.list_findings(run_id)
         reviews = self.repository.list_reviews(run_id)
+        prediction = self._prediction_for_report(candidate_reference)
 
         audit_path = directory / "analysis_audit_bundle.json"
         write_json(
@@ -479,6 +600,7 @@ class ReviewService:
                 "candidate_report": candidate_report.model_dump(mode="json"),
                 "final_findings": [finding.model_dump(mode="json") for finding in stored_findings],
                 "reviews": [review.model_dump(mode="json") for review in reviews],
+                "prediction": prediction,
             },
             audit_path,
         )
@@ -489,6 +611,7 @@ class ReviewService:
             pdf_path,
             reviews=reviews,
             project_root=self.project_root,
+            prediction=prediction,
         )
         return VerifiedExportBundle(
             pdf_path=pdf_path,

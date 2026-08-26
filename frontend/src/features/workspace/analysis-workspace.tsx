@@ -1,6 +1,7 @@
 import {
   Activity,
   Bot,
+  ChartNoAxesCombined,
   Check,
   ChevronRight,
   CirclePause,
@@ -13,7 +14,7 @@ import {
 } from "lucide-react";
 import { memo, startTransition, useEffect, useMemo, useState } from "react";
 
-import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -56,6 +57,7 @@ import type {
   BatchSnapshot,
   PendingUpload,
 } from "@/types";
+import { LlmRecoveryPanel } from "./llm-recovery-panel";
 import { RiskScopePanel } from "./risk-scope-panel";
 import { UploadPanel } from "./upload-panel";
 
@@ -74,6 +76,7 @@ type AnalysisWorkspaceProps = {
   onSnapshot: (snapshot: BatchSnapshot) => void;
   onSelectCompany: (companyKey: string) => void;
   onAction: (kind: "pause" | "resume") => void;
+  onOpenPredictions: () => void;
 };
 
 const agentStateLabel: Record<string, string> = {
@@ -128,6 +131,7 @@ function badgeVariant(state: string): "default" | "secondary" | "destructive" | 
   if (state === "failed") return "destructive";
   if (["running", "preparing", "pausing"].includes(state)) return "default";
   if (["completed", "awaiting_review"].includes(state)) return "secondary";
+  if (state === "awaiting_recovery") return "destructive";
   return "outline";
 }
 
@@ -440,7 +444,10 @@ function StageNotice({ company, events }: { company: BatchCompany; events: Analy
   let title = "";
   let detail = "";
 
-  if (company.state === "awaiting_review" || company.risk_scope_review) {
+  if (company.state === "awaiting_recovery" || company.llm_failure_recovery) {
+    title = "风险发现模型异常，等待选择恢复方式";
+    detail = "当前公司已暂停；可重试同一模型阶段，或明确降级为BM25目录检索。";
+  } else if (company.state === "awaiting_review" || company.risk_scope_review) {
     title = "风险发现与全局合并已完成，等待人工确认";
     detail = "专业Agent尚未启动是正常状态。请在下方确认风险范围，提交后财务、法律、业务和市场Agent会并行运行。";
   } else if (agents.discovery?.state === "running" && (agents.discovery.progress ?? 0) >= 92) {
@@ -467,6 +474,202 @@ function StageNotice({ company, events }: { company: BatchCompany; events: Analy
   );
 }
 
+type AutomaticStageState = "waiting" | "running" | "complete" | "failed";
+
+const automaticStageLabel: Record<AutomaticStageState, string> = {
+  waiting: "等待上游",
+  running: "自动执行中",
+  complete: "已完成",
+  failed: "未完成",
+};
+
+function latestEvent(events: AnalysisEvent[], stages: string[]): AnalysisEvent | undefined {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    if (stages.includes(events[index].stage)) return events[index];
+  }
+  return undefined;
+}
+
+function progressMarker(detail: string | undefined): { current: number; total: number; detail: string } | null {
+  const match = /^\[(\d+)\/(\d+)]\s*(.*)$/.exec(detail?.trim() ?? "");
+  if (!match) return null;
+  return {
+    current: Number(match[1]),
+    total: Math.max(1, Number(match[2])),
+    detail: match[3] || "正在处理",
+  };
+}
+
+function candidateCount(detail: string | undefined): number | null {
+  const match = /快照已生成：(\d+)项/.exec(detail ?? "");
+  return match ? Number(match[1]) : null;
+}
+
+function AutomaticStageCard({
+  kind,
+  title,
+  description,
+  state,
+  progress,
+  progressText,
+  detail,
+  metrics,
+}: {
+  kind: "features" | "prediction";
+  title: string;
+  description: string;
+  state: AutomaticStageState;
+  progress: number;
+  progressText: string;
+  detail: string;
+  metrics: string[];
+}) {
+  const Icon = kind === "features" ? ListTree : ShieldCheck;
+  return (
+    <Card size="sm" className={cn("bg-card/75", state === "running" && "border-primary/35 bg-primary/[0.035]")}>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <span className="grid size-7 place-items-center rounded-lg bg-primary/10 text-primary"><Icon /></span>
+          {title}
+        </CardTitle>
+        <CardDescription>{description}</CardDescription>
+        <CardAction>
+          <Badge variant={state === "failed" ? "destructive" : state === "complete" ? "secondary" : state === "running" ? "default" : "outline"}>
+            {state === "running" && <Spinner data-icon="inline-start" />}
+            {automaticStageLabel[state]}
+          </Badge>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-3">
+        <LabeledProgress value={progress} label={progressText} ariaLabel={`${title}进度`} />
+        <p className="min-h-10 text-xs leading-relaxed text-muted-foreground">{detail}</p>
+        {metrics.length > 0 && (
+          <div className="flex flex-wrap gap-1.5">
+            {metrics.map((metric) => <Badge key={metric} variant="outline">{metric}</Badge>)}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+function FeaturePredictionPanel({
+  company,
+  events,
+  onOpenPredictions,
+}: {
+  company: BatchCompany;
+  events: AnalysisEvent[];
+  onOpenPredictions: () => void;
+}) {
+  const prediction = company.prediction;
+  const decisionState = company.progress?.agents?.decision?.state;
+  const featureStarted = latestEvent(events, ["features_started"]);
+  const featureProgressEvent = latestEvent(events, ["features_progress"]);
+  const featureTerminal = latestEvent(events, ["features_completed", "features_failed"]);
+  const featureCompleted = featureTerminal?.stage === "features_completed" ? featureTerminal : undefined;
+  const featureFailed = featureTerminal?.stage === "features_failed" ? featureTerminal : undefined;
+  const predictionStarted = latestEvent(events, ["prediction_started"]);
+  const predictionTerminal = latestEvent(events, ["prediction_completed", "prediction_failed"]);
+  const predictionCompleted = predictionTerminal?.stage === "prediction_completed" ? predictionTerminal : undefined;
+  const predictionFailed = predictionTerminal?.stage === "prediction_failed" ? predictionTerminal : undefined;
+  const visible = Boolean(
+    prediction
+    || featureStarted
+    || featureCompleted
+    || featureFailed
+    || predictionStarted
+    || ["complete", "degraded"].includes(decisionState ?? ""),
+  );
+  if (!visible) return null;
+
+  const marker = progressMarker(featureProgressEvent?.detail);
+  const featuresState: AutomaticStageState = featureFailed && !prediction
+    ? "failed"
+    : featureCompleted || predictionStarted || prediction
+      ? "complete"
+      : featureStarted
+        ? "running"
+        : "waiting";
+  const predictionState: AutomaticStageState = predictionFailed
+    ? "failed"
+    : prediction || predictionCompleted
+      ? "complete"
+      : predictionStarted
+        ? "running"
+        : "waiting";
+  const featurePercent = featuresState === "complete" || featuresState === "failed"
+    ? 100
+    : marker
+      ? marker.current / marker.total * 100
+      : featuresState === "running" ? 5 : 0;
+  const predictionPercent = predictionState === "complete" || predictionState === "failed"
+    ? 100
+    : predictionState === "running" ? 55 : 0;
+  const collectedCount = prediction?.candidate_feature_count
+    ?? candidateCount(featureCompleted?.detail);
+  const availableCandidateCount = prediction?.available_candidate_feature_count;
+  const readinessLabel = prediction?.feature_readiness === "ready"
+    ? "输入就绪"
+    : prediction?.feature_readiness === "review_required"
+      ? "需要复核"
+      : prediction?.feature_readiness === "blocked"
+        ? "输入阻断"
+        : null;
+
+  return (
+    <div className="flex flex-col gap-4">
+      <Card className="bg-card/75">
+        <CardHeader className="border-b border-border/60">
+          <CardTitle>上市前特征与五日预测</CardTitle>
+          <CardDescription>决策Agent结束后自动执行，无需人工点击；所有输入严格截止到上市日前。</CardDescription>
+          <CardAction><Badge variant="outline">自动流程</Badge></CardAction>
+        </CardHeader>
+        <CardContent className="grid gap-3 lg:grid-cols-2">
+          <AutomaticStageCard
+            kind="features"
+            title="采集上市前宽候选特征"
+            description="发行、财务、文档、市场、近期IPO与Agent风险"
+            state={featuresState}
+            progress={featurePercent}
+            progressText={marker ? `${marker.current}/${marker.total} · ${marker.detail}` : automaticStageLabel[featuresState]}
+            detail={featureFailed?.detail ?? featureCompleted?.detail ?? featureStarted?.detail ?? "等待决策Agent完成后自动开始。"}
+            metrics={[
+              collectedCount != null ? `候选特征 ${collectedCount} 项` : "",
+              availableCandidateCount != null ? `可用 ${availableCandidateCount} 项` : "",
+            ].filter(Boolean)}
+          />
+          <AutomaticStageCard
+            kind="prediction"
+            title="模型输入校验与五日预测"
+            description="按冻结契约取值，检查单位、公式、时点和完整度"
+            state={predictionState}
+            progress={predictionPercent}
+            progressText={predictionState === "running" ? "正在校验并计算" : automaticStageLabel[predictionState]}
+            detail={predictionFailed?.detail ?? predictionCompleted?.detail ?? predictionStarted?.detail ?? "候选特征完成后自动校验当前模型输入。"}
+            metrics={prediction ? [
+              `模型输入 ${prediction.available_feature_count}/${prediction.feature_count}`,
+              `完整度 ${Math.round(prediction.feature_completeness * 100)}%`,
+              readinessLabel ?? "",
+            ].filter(Boolean) : []}
+          />
+        </CardContent>
+      </Card>
+
+      {(company.base_prediction || prediction) && (
+        <Alert>
+          <ChartNoAxesCombined />
+          <AlertTitle>五日预测已有可用结果</AlertTitle>
+          <AlertDescription>概率、置信度、输入完整度和两阶段对照已移至独立预测页。</AlertDescription>
+          <AlertAction>
+            <Button variant="outline" size="sm" onClick={onOpenPredictions}>查看五日预测</Button>
+          </AlertAction>
+        </Alert>
+      )}
+    </div>
+  );
+}
+
 function CompanyDetail({
   batch,
   company,
@@ -476,6 +679,7 @@ function CompanyDetail({
   serviceAvailable,
   onSnapshot,
   setError,
+  onOpenPredictions,
 }: {
   batch: BatchSnapshot;
   company: BatchCompany;
@@ -485,9 +689,10 @@ function CompanyDetail({
   serviceAvailable: boolean;
   onSnapshot: (snapshot: BatchSnapshot) => void;
   setError: (value: string | null) => void;
+  onOpenPredictions: () => void;
 }) {
   const currentStage = companyStage(company, events);
-  const pipeline = ["文档登记", "解析与索引", "风险发现", "范围确认", "专业核验", "决策整合"];
+  const pipeline = ["文档登记", "解析与索引", "风险发现", "范围确认", "专业核验", "决策整合", "特征生成", "五日预测", "完成"];
   const percent = statusProgress(company);
   const elapsed = elapsedSeconds(company, nowMs);
 
@@ -519,7 +724,7 @@ function CompanyDetail({
       </Card>
 
       <Card size="sm" className="overflow-x-auto bg-card/70">
-        <CardContent className="flex min-w-[760px] items-center gap-2">
+        <CardContent className="flex min-w-[1120px] items-center gap-2">
           {pipeline.map((label, index) => (
             <div key={label} className="flex min-w-0 flex-1 items-center gap-2">
               <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -544,7 +749,18 @@ function CompanyDetail({
         </Card>
       )}
 
+      <LlmRecoveryPanel
+        key={company.llm_failure_recovery?.request_id ?? `${company.company_key}-llm-recovery`}
+        batch={batch}
+        company={company}
+        serviceAvailable={serviceAvailable}
+        onSnapshot={onSnapshot}
+        setError={setError}
+      />
+
       <StageNotice company={company} events={events} />
+
+      <FeaturePredictionPanel company={company} events={events} onOpenPredictions={onOpenPredictions} />
 
       <RiskScopePanel
         key={company.company_key}
@@ -643,6 +859,7 @@ export function AnalysisWorkspace({
   onSnapshot,
   onSelectCompany,
   onAction,
+  onOpenPredictions,
 }: AnalysisWorkspaceProps) {
   const clockActive = Boolean(batch?.companies.some((company) =>
     ["running", "preparing", "ready", "pausing"].includes(company.state),
@@ -689,10 +906,11 @@ export function AnalysisWorkspace({
 
       {batch ? (
         <>
-          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-5">
+          <section className="grid gap-3 sm:grid-cols-2 xl:grid-cols-6">
             <MetricCard label="公司总数" value={batch.company_count} helper="当前工作区" />
             <MetricCard label="分析中" value={(batch.counts.running ?? 0) + (batch.counts.preparing ?? 0)} helper="独立实时更新" />
             <MetricCard label="待确认风险" value={batch.counts.awaiting_review ?? 0} helper="可逐公司放行" />
+            <MetricCard label="待处理异常" value={batch.counts.awaiting_recovery ?? 0} helper="重试或BM25降级" />
             <MetricCard label="已完成" value={batch.counts.completed ?? 0} helper="结果持续保留" />
             <MetricCard label="异常" value={batch.counts.failed ?? 0} helper="支持恢复" />
           </section>
@@ -746,6 +964,7 @@ export function AnalysisWorkspace({
                 serviceAvailable={serviceAvailable}
                 onSnapshot={onSnapshot}
                 setError={setError}
+                onOpenPredictions={onOpenPredictions}
               />
             ) : (
               <Empty className="min-h-[460px] border bg-card/60">

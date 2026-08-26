@@ -28,6 +28,10 @@ class FindingReviewRequest(BaseModel):
     confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
 
+class HistoricalPredictionRequest(BaseModel):
+    variant: Literal["auto", "base", "agent_enhanced"] = "auto"
+
+
 def _model_payload(value: object) -> object:
     model_dump = getattr(value, "model_dump", None)
     return model_dump(mode="json") if callable(model_dump) else value
@@ -49,6 +53,22 @@ def create_reports_router(
     @router.get("/runs")
     def list_runs() -> dict[str, object]:
         return {"runs": [summary.__dict__ for summary in service.list_runs()]}
+
+    @router.post("/runs/{run_id}/prediction")
+    def rerun_historical_prediction(
+        run_id: str,
+        request: HistoricalPredictionRequest,
+    ) -> dict[str, object]:
+        try:
+            prediction, summary = service.rerun_prediction(
+                run_id,
+                variant=request.variant,
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except (RuntimeError, ValueError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        return {"prediction": prediction, "run": summary.__dict__}
 
     @router.get("/runs/{run_id}/findings")
     def list_findings(run_id: str) -> dict[str, object]:
@@ -229,4 +249,8 @@ def create_reports_router(
     return router
 
 
-__all__ = ["FindingReviewRequest", "create_reports_router"]
+__all__ = [
+    "FindingReviewRequest",
+    "HistoricalPredictionRequest",
+    "create_reports_router",
+]

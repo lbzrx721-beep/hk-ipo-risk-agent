@@ -181,9 +181,7 @@ class GroundedAnalysisEngine:
         self._rules = list(rules)
         self._chunks = tuple(chunks)
         self._chunk_by_id = {chunk.chunk_id: chunk for chunk in chunks}
-        self._chunk_index = {
-            chunk.chunk_id: index for index, chunk in enumerate(self._chunks)
-        }
+        self._chunk_index = {chunk.chunk_id: index for index, chunk in enumerate(self._chunks)}
         self._lexical = BM25Retriever(chunks)
         self._semantic: SemanticSearcher | None = None
         self._hybrid: HybridRetriever | None = None
@@ -227,6 +225,12 @@ class GroundedAnalysisEngine:
     def chunks(self) -> tuple[DocumentChunk, ...]:
         """返回本次分析的不可变全文切片，供开放式发现 Agent 扫描。"""
         return self._chunks
+
+    def enable_bm25_fallback(self, reason: str) -> None:
+        """按使用者选择关闭本公司的语义通道，后续证据召回只走BM25。"""
+        self._semantic = None
+        self._hybrid = None
+        self._retrieval_error = reason
 
     def select_discovery_corpus(
         self,
@@ -334,9 +338,7 @@ class GroundedAnalysisEngine:
         if len(selected_ids) < minimum_corpus_size:
             denominator = max(1, minimum_corpus_size - 1)
             for sample_index in range(minimum_corpus_size):
-                chunk_index = round(
-                    sample_index * (len(self._chunks) - 1) / denominator
-                )
+                chunk_index = round(sample_index * (len(self._chunks) - 1) / denominator)
                 chunk_id = self._chunks[chunk_index].chunk_id
                 if chunk_id not in selected_seen:
                     selected_seen.add(chunk_id)
@@ -688,17 +690,13 @@ class GroundedAnalysisEngine:
                     candidates=merged_candidates,
                     retrieval_mode=f"{original.retrieval_mode}+agent_followup",
                     search_queries=tuple(
-                        dict.fromkeys(
-                            (*original.search_queries, *assessment.followup_queries)
-                        )
+                        dict.fromkeys((*original.search_queries, *assessment.followup_queries))
                     ),
                 )
                 followup_tasks.append(
                     SpecialistTask(
                         rule=original.rule,
-                        candidates=tuple(
-                            candidate.chunk for candidate in merged_candidates
-                        ),
+                        candidates=tuple(candidate.chunk for candidate in merged_candidates),
                     )
                 )
             followup_result = analyzer.analyze_batch(followup_tasks)
@@ -722,18 +720,13 @@ class GroundedAnalysisEngine:
                 claim=assessment.claim if supported else "",
                 severity=assessment.severity,
                 confidence=assessment.confidence,
-                evidence_chunk_ids=(
-                    assessment.evidence_chunk_ids if supported else ()
-                ),
+                evidence_chunk_ids=(assessment.evidence_chunk_ids if supported else ()),
                 uncertainty=assessment.uncertainty,
             )
             chunk_by_id = {
-                candidate.chunk.chunk_id: candidate.chunk
-                for candidate in base.candidates
+                candidate.chunk.chunk_id: candidate.chunk for candidate in base.candidates
             }
-            selected = tuple(
-                chunk_by_id[chunk_id] for chunk_id in analysis.evidence_chunk_ids
-            )
+            selected = tuple(chunk_by_id[chunk_id] for chunk_id in analysis.evidence_chunk_ids)
             audit = analyzer.prompt_audit(rule.owner)
             retry_errors = errors_by_risk.get(rule.id, ())
             analyzed.append(
@@ -742,16 +735,13 @@ class GroundedAnalysisEngine:
                     analysis=analysis,
                     selected_chunks=selected,
                     analysis_mode=(
-                        f"{analyzer.provider_name}_batch"
-                        if base.candidates
-                        else "no_candidate"
+                        f"{analyzer.provider_name}_batch" if base.candidates else "no_candidate"
                     ),
                     analysis_attempts=attempts_by_risk.get(rule.id, 0),
                     analysis_error=(
                         retry_errors[-1]
                         if retry_errors
-                        and assessment.status
-                        is SpecialistStatus.EVIDENCE_INSUFFICIENT
+                        and assessment.status is SpecialistStatus.EVIDENCE_INSUFFICIENT
                         else None
                     ),
                     prompt_version=audit.get("prompt_version"),
