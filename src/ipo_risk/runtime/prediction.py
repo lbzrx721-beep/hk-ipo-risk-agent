@@ -27,7 +27,7 @@ from ipo_risk.storage.files import read_json, write_json
 
 
 DEFAULT_MODEL_PATH = Path(
-    "artifacts/models/enhanced_blend4_rf_v4_listing/model.joblib"
+    "artifacts/models/unified_all_2020_2025_v1/model.joblib"
 )
 DEFAULT_BASE_MODEL_PATH = Path(
     "artifacts/models/day5_business_base_v1/business_base_ensemble.joblib"

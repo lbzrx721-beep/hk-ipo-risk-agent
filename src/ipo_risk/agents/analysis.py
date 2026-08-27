@@ -333,7 +333,6 @@ class DeepSeekEvidenceAnalyzer:
                 },
                 "constraints": {
                     "allowed_evidence_chunk_ids": [chunk.chunk_id for chunk in candidates],
-                    "max_evidence": rule.max_evidence,
                     "must_consider_counterevidence": True,
                     "claim_must_be_derived_from_evidence": True,
                     "review_question_is_not_a_company_fact": True,
@@ -387,8 +386,6 @@ class DeepSeekEvidenceAnalyzer:
         unknown = set(result.evidence_chunk_ids) - allowed
         if unknown:
             raise ValueError(f"analysis cited unknown evidence chunks: {sorted(unknown)}")
-        if len(result.evidence_chunk_ids) > rule.max_evidence:
-            raise ValueError("analysis cited more evidence than the risk rule allows")
         return result
 
 

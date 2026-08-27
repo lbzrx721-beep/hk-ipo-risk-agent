@@ -319,11 +319,10 @@ def write_verified_pdf_report(
         decision_labels = {
             "high_risk": "高风险预警",
             "low_risk": "低风险",
-            "uncertain": "不确定，建议人工研判",
+            "uncertain": "边界信号，暂不作高风险预警",
         }
         probability = float(prediction.get("probability", 0.0))
         confidence = float(prediction.get("confidence", 0.0))
-        completeness = float(prediction.get("feature_completeness", 0.0))
         decision = str(prediction.get("decision", "uncertain"))
         recall_guard = prediction.get("recall_guard")
         if not isinstance(recall_guard, Mapping):
@@ -337,7 +336,6 @@ def write_verified_pdf_report(
             ["风险概率", f"{probability:.1%}"],
             ["方向判断", decision_labels.get(decision, decision)],
             ["模型置信度", f"{confidence:.1%}"],
-            ["输入完整度", f"{completeness:.1%}"],
         ]
         if watchlist:
             prediction_rows.extend(
@@ -487,7 +485,7 @@ def write_verified_pdf_report(
         if finding.uncertainty:
             story.extend(
                 [
-                    Paragraph("剩余不确定性", styles["h2"]),
+                    Paragraph("证据边界", styles["h2"]),
                     Paragraph(_markup(finding.uncertainty), styles["body"]),
                 ]
             )

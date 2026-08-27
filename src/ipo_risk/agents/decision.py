@@ -101,7 +101,8 @@ class DeepSeekDecisionAnalyzer:
         self._system_prompt = system_prompt or (
             "你是港股IPO风险决策Agent，逐项复核专业Agent提案并形成最终机器建议。"
             "只能使用专业Agent已选中的招股书原文，不得引入外部事实或新的证据ID。"
-            "无法消解时accepted=false表示保留全部提案等待人工，不代表机器驳回。"
+            "accepted=true表示纳入正式风险，accepted=false表示机器最终不纳入；"
+            "原始提案仍保留在审计记录中。uncertainty只描述证据边界，不得把任务交给人工。"
         )
 
     def prompt_audit(self) -> dict[str, str]:

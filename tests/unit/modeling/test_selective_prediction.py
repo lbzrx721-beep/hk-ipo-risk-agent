@@ -103,3 +103,24 @@ def test_legacy_base_ensemble_averages_model_probabilities() -> None:
 
     assert np.isclose(result["predicted_probability"].iloc[0], 0.40)
     assert result["predicted_significant_drop_5d"].tolist() == [0]
+
+
+def test_multi_seed_bundle_can_apply_percentile_score() -> None:
+    bundle = {
+        "features": ["x"],
+        "models": [
+            _ProbabilityModel([0.30]),
+            _ProbabilityModel([0.70]),
+        ],
+        "threshold": 0.50,
+        "score_mode": "percentile",
+        "reference_probabilities": [
+            np.array([0.10, 0.20, 0.30, 0.40]),
+            np.array([0.50, 0.60, 0.70, 0.80]),
+        ],
+    }
+
+    result = predict_feature_rows(bundle, pd.DataFrame({"x": [1.0]}))
+
+    assert np.isclose(result["predicted_probability"].iloc[0], 0.75)
+    assert result["predicted_significant_drop_5d"].tolist() == [1]

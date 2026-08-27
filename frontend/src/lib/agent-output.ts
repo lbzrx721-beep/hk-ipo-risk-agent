@@ -20,6 +20,8 @@ export type AgentOutputCard = {
 
 export type AgentOutputPresentation = {
   cards: AgentOutputCard[];
+  rawCount: number;
+  consolidatedCount: number;
   incomplete: boolean;
 };
 
@@ -199,11 +201,17 @@ export function parseAgentOutput(
   }
 
   const deduplicated = new Map<string, AgentOutputCard>();
-  cards.forEach((card, index) => {
-    const identity = `${card.kind}:${card.riskType ?? `${card.title}:${index}`}`;
+  cards.forEach((card) => {
+    const identity = `${card.kind}:${card.riskType ?? `${card.title}:${card.owner ?? ""}:${card.evidenceIds.join(",")}`}`;
     deduplicated.set(identity, card);
   });
-  return { cards: [...deduplicated.values()], incomplete };
+  const allCards = [...deduplicated.values()];
+  const rawCount = allCards.filter((card) => card.kind === "discovery").length;
+  const consolidatedCount = allCards.filter((card) => card.kind === "consolidated").length;
+  const visibleCards = role === "discovery" && consolidatedCount > 0
+    ? allCards.filter((card) => card.kind === "consolidated")
+    : allCards;
+  return { cards: visibleCards, rawCount, consolidatedCount, incomplete };
 }
 
 export function parseAgentCards(

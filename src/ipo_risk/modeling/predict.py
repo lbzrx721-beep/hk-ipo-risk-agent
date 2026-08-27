@@ -82,10 +82,25 @@ def predict_feature_rows(
     elif bundle.get("lgb_models") is not None:
         probabilities = _predict_blend3(bundle, frame, feature_columns)
     elif isinstance(bundle.get("models"), list):
-        probabilities = np.mean(
-            [model.predict_proba(frame[feature_columns])[:, 1] for model in bundle["models"]],
-            axis=0,
-        )
+        per_model = [
+            model.predict_proba(frame[feature_columns])[:, 1]
+            for model in bundle["models"]
+        ]
+        if bundle.get("score_mode") == "percentile":
+            references = bundle.get("reference_probabilities")
+            if not (
+                isinstance(references, list)
+                and len(references) == len(per_model)
+                and all(len(np.asarray(reference).reshape(-1)) for reference in references)
+            ):
+                raise ValueError(
+                    "percentile model bundle does not contain valid reference_probabilities"
+                )
+            per_model = [
+                _percentile_score(reference, values)
+                for reference, values in zip(references, per_model, strict=True)
+            ]
+        probabilities = np.mean(per_model, axis=0)
     elif isinstance(bundle.get("pipeline"), Pipeline):
         probabilities = bundle["pipeline"].predict_proba(frame[feature_columns])[:, 1]
     else:
@@ -246,6 +261,15 @@ def _prepare_derived_features(frame: pd.DataFrame, *, required_features: set[str
     )
 
     return add_derived_prediction_features(frame)
+
+
+def _percentile_score(reference: Any, values: np.ndarray) -> np.ndarray:
+    """将原始概率映射为训练参考分布中的风险分位。"""
+
+    ordered = np.sort(np.asarray(reference, dtype=float).reshape(-1))
+    if not len(ordered):
+        raise ValueError("percentile reference cannot be empty")
+    return np.searchsorted(ordered, values, side="right") / len(ordered)
 
 
 __all__ = [

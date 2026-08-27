@@ -540,7 +540,8 @@ class _CorrectingDiscoveryProvider(_DiscoveryProvider):
         result = super().complete_json(**request)
         if self.discovery_calls == 1:
             result["candidates"][0]["evidence_chunk_ids"] = [
-                f"C-OPEN-{index}" for index in range(1, 10)
+                "C-OPEN-1",
+                "C-OPEN-1",
             ]
         else:
             self.correction = payload.get("correction")
@@ -567,7 +568,10 @@ def test_discovery_retry_receives_validation_feedback_and_corrects_output() -> N
     assert provider.discovery_calls == 2
     assert result.raw_candidate_count == 1
     assert isinstance(provider.correction, dict)
-    assert "at most 8" in json.dumps(provider.correction, ensure_ascii=False)
+    assert "must not contain duplicates" in json.dumps(
+        provider.correction,
+        ensure_ascii=False,
+    )
 
 
 class _LaterHighConfidenceProvider(_RepeatedRiskProvider):

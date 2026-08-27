@@ -191,29 +191,32 @@ class DeepSeekSpecialistBatchAnalyzer:
             tasks[start : start + self._batch_size]
             for start in range(0, len(tasks), self._batch_size)
         ]
-        for index, partition in enumerate(partitions, start=1):
-            if self._progress_callback is not None:
-                self._progress_callback(
-                    f"agent:{role.value}:model_requested",
-                    (
-                        f"[{index}/{len(partitions)}] {_role_name(role)} Agent正在批量核验"
-                        f"{len(partition)}条风险。"
-                    ),
-                )
-            risk_ids = tuple(task.rule.id for task in partition)
+
+        def analyze_partition_with_isolation(
+            partition: Sequence[SpecialistTask],
+            *,
+            partition_index: int,
+            inherited_attempts: int = 0,
+            inherited_errors: tuple[str, ...] = (),
+        ) -> tuple[
+            list[SpecialistAssessment],
+            dict[str, int],
+            dict[str, tuple[str, ...]],
+        ]:
+            """批次持续失败时自动拆小，避免一条异常拖断整个专业角色。"""
             try:
                 outcome = self._retry_policy.run_with_feedback(
                     lambda correction: self._analyze_partition(
                         partition,
                         role=role,
-                        partition_index=index,
+                        partition_index=partition_index,
                         partition_count=len(partitions),
                         correction_feedback=correction,
                     ),
                     on_retry=(
                         lambda error, attempt, wait: self._report_retry(
                             role=role,
-                            partition_index=index,
+                            partition_index=partition_index,
                             partition_count=len(partitions),
                             attempt=attempt,
                             wait_seconds=wait,
@@ -225,38 +228,100 @@ class DeepSeekSpecialistBatchAnalyzer:
                 if isinstance(error.last_error, ModelBudgetExceededError):
                     raise error.last_error
                 message = str(error.last_error).strip() or type(error.last_error).__name__
-                for task in partition:
-                    assessments.append(
+                accumulated_attempts = inherited_attempts + error.attempts
+                accumulated_errors = (*inherited_errors, message)
+                if len(partition) > 1:
+                    midpoint = len(partition) // 2
+                    if self._progress_callback is not None:
+                        self._progress_callback(
+                            f"agent:{role.value}:retrying",
+                            (
+                                f"[{partition_index}/{len(partitions)}] {_role_name(role)} Agent"
+                                f"批次持续异常，已自动拆为{midpoint}条和"
+                                f"{len(partition) - midpoint}条继续核验；其他专业角色不受影响。"
+                            ),
+                        )
+                    left = analyze_partition_with_isolation(
+                        partition[:midpoint],
+                        partition_index=partition_index,
+                        inherited_attempts=accumulated_attempts,
+                        inherited_errors=accumulated_errors,
+                    )
+                    right = analyze_partition_with_isolation(
+                        partition[midpoint:],
+                        partition_index=partition_index,
+                        inherited_attempts=accumulated_attempts,
+                        inherited_errors=accumulated_errors,
+                    )
+                    return (
+                        [*left[0], *right[0]],
+                        {**left[1], **right[1]},
+                        {**left[2], **right[2]},
+                    )
+
+                task = partition[0]
+                status = (
+                    SpecialistStatus.TECHNICAL_FAILURE
+                    if retry_transient_api_error(error.last_error)
+                    else SpecialistStatus.EVIDENCE_INSUFFICIENT
+                )
+                return (
+                    [
                         SpecialistAssessment(
                             risk_type=task.rule.id,
-                            status=(
-                                SpecialistStatus.TECHNICAL_FAILURE
-                                if retry_transient_api_error(error.last_error)
-                                else SpecialistStatus.EVIDENCE_INSUFFICIENT
-                            ),
+                            status=status,
                             severity=task.rule.severity,
                             confidence=0.0,
-                            uncertainty=f"专业Agent批量核验失败，候选风险仍保留：{message}",
+                            uncertainty=f"专业Agent核验失败，候选风险仍保留：{message}",
                         )
-                    )
-                    attempts_by_risk[task.rule.id] = error.attempts
-                    errors_by_risk[task.rule.id] = (message,)
-                continue
-            assessments.extend(outcome.value.assessments)
+                    ],
+                    {task.rule.id: accumulated_attempts},
+                    {task.rule.id: accumulated_errors},
+                )
+
+            attempts = inherited_attempts + outcome.attempts
+            errors = (*inherited_errors, *outcome.errors)
+            risk_ids = (task.rule.id for task in partition)
+            return (
+                list(outcome.value.assessments),
+                {risk_id: attempts for risk_id in risk_ids},
+                {
+                    task.rule.id: errors
+                    for task in partition
+                },
+            )
+
+        for index, partition in enumerate(partitions, start=1):
+            if self._progress_callback is not None:
+                self._progress_callback(
+                    f"agent:{role.value}:model_requested",
+                    (
+                        f"[{index}/{len(partitions)}] {_role_name(role)} Agent正在批量核验"
+                        f"{len(partition)}条风险。"
+                    ),
+                )
+            partition_assessments, partition_attempts, partition_errors = (
+                analyze_partition_with_isolation(
+                    partition,
+                    partition_index=index,
+                )
+            )
+            assessments.extend(partition_assessments)
+            attempts_by_risk.update(partition_attempts)
+            errors_by_risk.update(partition_errors)
             if self._progress_callback is not None:
                 self._progress_callback(
                     f"agent:{role.value}:structured",
                     (
                         f"[[batch:{index}/{len(partitions)}]]"
                         + json.dumps(
-                            outcome.value.model_dump(mode="json"),
+                            SpecialistAssessmentBatch(
+                                assessments=tuple(partition_assessments)
+                            ).model_dump(mode="json"),
                             ensure_ascii=False,
                         )
                     ),
                 )
-            for risk_id in risk_ids:
-                attempts_by_risk[risk_id] = outcome.attempts
-                errors_by_risk[risk_id] = outcome.errors
         return SpecialistBatchResult(
             assessments=tuple(assessments),
             attempts_by_risk=attempts_by_risk,
@@ -276,10 +341,13 @@ class DeepSeekSpecialistBatchAnalyzer:
         if self._progress_callback is None:
             return
         message = str(error).strip() or type(error).__name__
+        failure_kind = (
+            "连接异常" if retry_transient_api_error(error) else "输出校验未通过"
+        )
         self._progress_callback(
             f"agent:{role.value}:retrying",
             (
-                f"[{partition_index}/{partition_count}] {_role_name(role)} Agent连接中断，"
+                f"[{partition_index}/{partition_count}] {_role_name(role)} Agent{failure_kind}，"
                 f"{wait_seconds:g}秒后进行第{attempt}次尝试：{message[:180]}"
             ),
         )
@@ -317,7 +385,6 @@ class DeepSeekSpecialistBatchAnalyzer:
                         "risk_name": task.rule.name,
                         "default_severity": task.rule.severity.value,
                         "review_question": task.rule.claim,
-                        "max_evidence": task.rule.max_evidence,
                         "search_queries": list(task.rule.search_queries),
                         "allowed_evidence_chunk_ids": [
                             chunk.chunk_id for chunk in task.candidates
@@ -382,7 +449,6 @@ class DeepSeekSpecialistBatchAnalyzer:
                 "specialist batch must cover every submitted risk: "
                 f"expected={sorted(expected)}, returned={sorted(returned)}"
             )
-        task_by_id = {task.rule.id: task for task in tasks}
         for assessment in batch.assessments:
             unknown = set(assessment.evidence_chunk_ids) - allowed_by_risk[
                 assessment.risk_type
@@ -390,13 +456,6 @@ class DeepSeekSpecialistBatchAnalyzer:
             if unknown:
                 raise ValueError(
                     f"{assessment.risk_type} cited unknown evidence chunks: {sorted(unknown)}"
-                )
-            if (
-                len(assessment.evidence_chunk_ids)
-                > task_by_id[assessment.risk_type].rule.max_evidence
-            ):
-                raise ValueError(
-                    f"{assessment.risk_type} cited more evidence than allowed"
                 )
             if assessment.duplicate_of is not None and assessment.duplicate_of not in expected:
                 raise ValueError(

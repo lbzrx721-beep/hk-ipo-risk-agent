@@ -51,6 +51,7 @@ from ipo_risk.domain import (
     AgentRole,
     Evidence,
     EvidenceType,
+    FeatureValue,
     RiskFinding,
     ToolCall,
     ToolCallStatus,
@@ -62,8 +63,11 @@ from ipo_risk.parser.document_parser import PageResult, parse_document
 from ipo_risk.parser.evidence_renderer import render_evidence_screenshot
 from ipo_risk.parser.layout import extract_printed_page_label
 from ipo_risk.modeling.prelisting import (
-    collect_prelisting_base_candidates,
     collect_prelisting_candidates,
+)
+from ipo_risk.modeling.rag_fundamentals import RagFundamentalExtractor
+from ipo_risk.modeling.structured_fundamentals import (
+    extract_structured_fundamental_snapshot,
 )
 from ipo_risk.reporting import (
     AnalysisSummary,
@@ -85,7 +89,6 @@ from ipo_risk.retrieval.semantic import (
 from ipo_risk.retrieval.pgvector import PgVectorRetriever
 from ipo_risk.resilience import RetryPolicy, retry_model_node_error
 from ipo_risk.runtime.prediction import (
-    DEFAULT_BASE_MODEL_PATH,
     generate_runtime_prediction,
 )
 from ipo_risk.storage.files import (
@@ -387,6 +390,7 @@ def analyze_prospectus(
     expected_source_hash: str | None = None,
     company_info: Mapping[str, object] | None = None,
     embedding_provider: EmbeddingProvider | None = None,
+    rag_fundamental_extractor: RagFundamentalExtractor | None = None,
     evidence_analyzer: EvidenceAnalyzer | None = None,
     specialist_analyzer: SpecialistBatchAnalyzer | None = None,
     specialist_followup_rounds: int = 1,
@@ -657,9 +661,8 @@ def analyze_prospectus(
         progress_callback,
         "agents_completed",
         (
-            f"风险整合完成：{len(decision_by_risk)}条风险进入人工复核，"
-            f"其中{supported_decision_count}条有证据支持、"
-            f"{unresolved_decision_count}条证据不足待人工判断。"
+            f"风险整合完成：机器采纳{supported_decision_count}条正式风险，"
+            f"{unresolved_decision_count}条未纳入；原始提案完整保留审计。"
         ),
     )
     analysis_ended = _now()
@@ -799,42 +802,21 @@ def analyze_prospectus(
             continue
 
         final_analysis = decision.analysis
-        if final_analysis.supported:
-            selected_chunk_by_id = {
-                chunk.chunk_id: chunk for chunk in decision.selected.selected_chunks
-            }
-            selected_chunks = tuple(
-                selected_chunk_by_id[chunk_id] for chunk_id in final_analysis.evidence_chunk_ids
+        if not final_analysis.supported:
+            _emit_progress(
+                progress_callback,
+                "decision_excluded",
+                f"风险{rule.id}未通过机器裁决，不纳入正式风险卡；原提案保留审计。",
             )
-            finding_claim = final_analysis.claim
-            finding_uncertainty = final_analysis.uncertainty
-        else:
-            # “证据不足”不是机器驳回。保留最相关候选原文供人工核验，但不把候选
-            # 片段伪装成模型已经采纳的证据。
-            candidate_chunks: list[DocumentChunk] = []
-            seen_chunk_ids: set[str] = set()
-            for candidate in decision.selected.candidates:
-                if candidate.chunk.chunk_id in seen_chunk_ids:
-                    continue
-                seen_chunk_ids.add(candidate.chunk.chunk_id)
-                candidate_chunks.append(candidate.chunk)
-                if len(candidate_chunks) >= max(1, rerank_top_k):
-                    break
-            selected_chunks = tuple(candidate_chunks)
-            if not selected_chunks:
-                _emit_progress(
-                    progress_callback,
-                    "evidence_insufficient_without_candidate",
-                    (
-                        f"风险{rule.id}证据不足且没有可展示候选片段，"
-                        "已保留在Agent提案账本，不生成正式风险卡。"
-                    ),
-                )
-                continue
-            finding_claim = rule.claim
-            finding_uncertainty = (
-                f"专业Agent状态：{decision.specialist_status.value}。{final_analysis.uncertainty}"
-            ).strip()
+            continue
+        selected_chunk_by_id = {
+            chunk.chunk_id: chunk for chunk in decision.selected.selected_chunks
+        }
+        selected_chunks = tuple(
+            selected_chunk_by_id[chunk_id] for chunk_id in final_analysis.evidence_chunk_ids
+        )
+        finding_claim = final_analysis.claim
+        finding_uncertainty = final_analysis.uncertainty
 
         finding_evidence_ids: list[str] = []
         for chunk in selected_chunks:
@@ -939,7 +921,7 @@ def analyze_prospectus(
         coverage_warning = (
             f"本次仅形成{supported_decision_count}条有充分证据风险，"
             f"低于期望值{min_findings}；另有{unresolved_decision_count}条"
-            "证据不足候选保留给人工复核。"
+            "证据不足候选未纳入正式风险，原始提案保留审计。"
         )
         _emit_progress(
             progress_callback,
@@ -975,8 +957,8 @@ def analyze_prospectus(
             "output_refs": tuple(finding.finding_id for finding in findings),
             "status": TraceStatus.SUCCEEDED,
             "decision": (
-                f"多角色Agent与决策Agent生成{len(findings)}条有原文、页码、"
-                "坐标和截图的候选风险，全部进入人工复核。"
+                f"多角色Agent与决策Agent机器采纳{len(findings)}条有原文、页码、"
+                "坐标和截图的正式候选风险；人工复核仅做质量确认。"
             ),
         }
     )
@@ -1040,6 +1022,68 @@ def analyze_prospectus(
             candidate_as_of = listing_date or source_as_of
             prediction_as_of = listing_date
             if candidate_as_of is not None:
+                supplemental_features: dict[str, FeatureValue] = {}
+                if rag_fundamental_extractor is not None:
+                    rag_sidecar_path = document_paths.prelisting_features_path.with_name(
+                        "rag_fundamental_features.json"
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        "rag_features_started",
+                        "正在从本公司pgvector招股书索引检索预测所需财务、发行与业务事实。",
+                    )
+                    try:
+                        existing_operating_cash_flow: float | None = None
+                        structured_for_rag = extract_structured_fundamental_snapshot(
+                            project_root,
+                            available_at=report.source_document.available_at,
+                            table_path=document_paths.tables_path,
+                            chunk_path=document_paths.chunks_path,
+                        )
+                        operating_cash_flow = structured_for_rag.features.get(
+                            "fundamental_operating_cash_flow_latest_native"
+                        )
+                        if operating_cash_flow is not None and isinstance(
+                            operating_cash_flow.value, (int, float)
+                        ):
+                            existing_operating_cash_flow = float(operating_cash_flow.value)
+                        rag_record = rag_fundamental_extractor.extract(
+                            manifest_row={
+                                "company_id": company_id,
+                                "company_name": company_name,
+                                "prospectus_date": report.source_document.available_at.isoformat(),
+                                "source_hash": report.source_document.source_hash,
+                            },
+                            document_id=document_id,
+                            chunks=chunks,
+                            existing_operating_cash_flow=existing_operating_cash_flow,
+                            progress=lambda detail: _emit_progress(
+                                progress_callback,
+                                "rag_features_progress",
+                                detail,
+                            ),
+                        )
+                        write_json(rag_record, rag_sidecar_path, pretty=True)
+                        supplemental_features = {
+                            name: FeatureValue.model_validate(payload)
+                            for name, payload in dict(rag_record.get("features") or {}).items()
+                        }
+                        available_rag_count = sum(
+                            feature.value is not None
+                            for feature in supplemental_features.values()
+                        )
+                        _emit_progress(
+                            progress_callback,
+                            "rag_features_completed",
+                            f"本公司RAG事实提取完成：取得{available_rag_count}项可用字段，审计记录已保存。",
+                        )
+                    except Exception as exc:  # noqa: BLE001 - RAG补充失败不丢风险报告
+                        _logger.warning("当前公司RAG预测特征提取失败: %s", exc)
+                        _emit_progress(
+                            progress_callback,
+                            "rag_features_failed",
+                            f"本公司RAG事实提取失败，继续使用表格和公式结果：{exc}",
+                        )
                 _emit_progress(
                     progress_callback,
                     "features_started",
@@ -1056,6 +1100,7 @@ def analyze_prospectus(
                     tables_path=document_paths.tables_path,
                     chunks_path=document_paths.chunks_path,
                     listing_date=listing_date,
+                    supplemental_features=supplemental_features,
                     progress_callback=lambda current, total, detail: _emit_progress(
                         progress_callback,
                         "features_progress",
@@ -1114,8 +1159,7 @@ def analyze_prospectus(
             "prediction_completed",
             (
                 "五日显著下跌预测完成："
-                f"概率{prediction['probability']:.1%}，"
-                f"输入完整度{prediction['feature_completeness']:.0%}。"
+                f"概率{prediction['probability']:.1%}。"
             ),
         )
     except Exception as exc:  # noqa: BLE001 - 风险报告不能因预测资源失败而丢失
@@ -1142,6 +1186,8 @@ def analyze_prospectus(
             embedding_dir = candidate_embedding_dir
     if isinstance(semantic_retriever, _DeferredSemanticRetriever):
         semantic_retriever.close()
+    if rag_fundamental_extractor is not None:
+        rag_fundamental_extractor.retriever.close()
     return AnalysisArtifacts(
         report=report,
         report_path=document_paths.report_path,
@@ -1228,6 +1274,7 @@ def analyze_company(
     search_planner: RoleSearchPlanner | None = None
     risk_discoverer: RiskDiscoverer | None = None
     risk_scope_planner: RiskScopePlanner | None = None
+    rag_fundamental_extractor: RagFundamentalExtractor | None = None
     model_usage_ledger: ModelUsageLedger | None = None
     if (
         config.agents.enable_open_discovery
@@ -1325,6 +1372,29 @@ def analyze_company(
             )
         }
         specialist_provider = specialist_providers[AgentRole.FINANCE]
+        if embedding_provider is not None and config.vector_store.backend == "pgvector":
+            rag_fundamental_extractor = RagFundamentalExtractor(
+                retriever=PgVectorRetriever(
+                    embedding_provider,
+                    dsn=config.vector_store.require_postgres_dsn(),
+                    schema=config.vector_store.postgres_schema,
+                    connect_timeout_seconds=(
+                        config.vector_store.postgres_connect_timeout_seconds
+                    ),
+                ),
+                provider=specialist_provider,
+                system_prompt=(
+                    root / "prompts" / "extraction" / "rag_fundamentals_v1.md"
+                ).read_text(encoding="utf-8"),
+                max_output_tokens=min(specialist_config.max_output_tokens, 12_000),
+                retry_policy=RetryPolicy(
+                    max_retries=config.agents.max_retries,
+                    initial_seconds=config.agents.retry_initial_seconds,
+                    backoff_factor=config.agents.retry_backoff_factor,
+                    max_seconds=config.agents.retry_max_seconds,
+                    retry_if=retry_model_node_error,
+                ),
+            )
         specialist_analyzer = DeepSeekSpecialistBatchAnalyzer(
             specialist_provider,
             temperature=specialist_config.temperature,
@@ -1427,6 +1497,7 @@ def analyze_company(
         expected_source_hash=document.source_hash,
         company_info=company_info,
         embedding_provider=embedding_provider,
+        rag_fundamental_extractor=rag_fundamental_extractor,
         evidence_analyzer=evidence_analyzer,
         specialist_analyzer=specialist_analyzer,
         specialist_followup_rounds=config.agents.specialist_followup_rounds,
@@ -1555,98 +1626,9 @@ def prepare_company_semantic_index(
         min_text_chars_before_ocr=config.parser.min_text_chars_before_ocr,
         progress_callback=progress_callback,
     )
-    company_info = read_json(root / ingestion.company.metadata_file)
-    listing_date = ingestion.company.listing_date
-    candidate_as_of = listing_date or document.available_at
-    base_feature_path = prepared.paths.prelisting_features_path.with_name(
-        "prelisting_features_base.json"
-    )
-    base_prediction_path = prepared.paths.report_path.with_name("prediction_5d_base.json")
-    base_prediction: dict[str, Any] | None = None
-    base_prediction_status = "unavailable"
-    base_prediction_error: str | None = None
-    try:
-        _emit_progress(
-            progress_callback,
-            "base_features_started",
-            "PDF解析完成，正在采集基础发行、财务和上市前市场特征。",
-        )
-        base_snapshot = collect_prelisting_base_candidates(
-            project_root=root,
-            company_info=dict(company_info),
-            company_id=ingestion.company.company_id,
-            source_ref=document.local_file,
-            source_available_at=document.available_at,
-            page_count=len(prepared.pages),
-            chunk_count=len(prepared.chunks),
-            prediction_as_of=candidate_as_of,
-            tables_path=prepared.paths.tables_path,
-            chunks_path=prepared.paths.chunks_path,
-            listing_date=listing_date,
-        )
-        write_json(
-            base_snapshot.to_payload(
-                run_id=f"BASE-{document.document_id}",
-                company_id=ingestion.company.company_id,
-            ),
-            base_feature_path,
-            pretty=True,
-        )
-        _emit_progress(
-            progress_callback,
-            "base_prediction_started",
-            "基础特征已就绪，正在计算五日显著下跌快速预测。",
-        )
-        base_prediction, base_prediction_path = generate_runtime_prediction(
-            project_root=root,
-            company_id=ingestion.company.company_id,
-            company_name=ingestion.company.company_name_zh,
-            run_id=f"BASE-{document.document_id}",
-            features=base_snapshot.features,
-            report_path=prepared.paths.report_path,
-            prediction_as_of=listing_date or candidate_as_of,
-            feature_units=base_snapshot.feature_units,
-            feature_formula_versions=base_snapshot.feature_formula_versions,
-            model_path=DEFAULT_BASE_MODEL_PATH,
-            destination_path=base_prediction_path,
-            prediction_variant="base",
-        )
-        base_prediction_status = "completed"
-        _emit_progress(
-            progress_callback,
-            "base_prediction_completed",
-            (
-                "五日快速预测完成："
-                f"概率{base_prediction['probability']:.1%}，"
-                f"输入完整度{base_prediction['feature_completeness']:.0%}。"
-            ),
-        )
-    except Exception as exc:  # noqa: BLE001 - 基础预测失败不能阻断文档索引
-        base_prediction_status = "failed"
-        base_prediction_error = f"{type(exc).__name__}: {exc}"
-        _emit_progress(
-            progress_callback,
-            "base_prediction_failed",
-            f"基础特征或快速预测暂不可用：{base_prediction_error}",
-        )
-    if artifact_callback is not None:
-        artifact_callback(
-            {
-                "base_feature_path": (
-                    _portable_path(base_feature_path, root)
-                    if base_feature_path.is_file()
-                    else None
-                ),
-                "base_prediction": base_prediction,
-                "base_prediction_path": (
-                    _portable_path(base_prediction_path, root)
-                    if base_prediction_path.is_file()
-                    else None
-                ),
-                "base_prediction_status": base_prediction_status,
-                "base_prediction_error": base_prediction_error,
-            }
-        )
+    # 预处理阶段只负责PDF解析和向量索引。五日预测统一在Agent分析、
+    # 当前公司RAG事实提取和决策裁决全部完成后执行。
+    del artifact_callback
     embedding_ready = False
     embedding_cache_hit = False
     if config.embedding.is_configured:
@@ -1711,17 +1693,6 @@ def prepare_company_semantic_index(
         embedding_ready=embedding_ready,
         embedding_cache_hit=embedding_cache_hit,
         parser_cache_hit=prepared.cache_hit,
-        base_feature_path=(
-            _portable_path(base_feature_path, root) if base_feature_path.is_file() else None
-        ),
-        base_prediction=base_prediction,
-        base_prediction_path=(
-            _portable_path(base_prediction_path, root)
-            if base_prediction_path.is_file()
-            else None
-        ),
-        base_prediction_status=base_prediction_status,
-        base_prediction_error=base_prediction_error,
     )
 
 

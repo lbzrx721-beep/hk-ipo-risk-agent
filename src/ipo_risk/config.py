@@ -200,7 +200,7 @@ class AgentsConfig(BaseModel):
     # 首轮完整发现，第二轮仅补充首轮遗漏的、证据独立的重大风险。
     discovery_max_batch_passes: int = Field(default=2, ge=1, le=4)
     consolidation_batch_size: int = Field(default=24, ge=2, le=100)
-    specialist_batch_size: int = Field(default=100, ge=2, le=200)
+    specialist_batch_size: int = Field(default=12, ge=2, le=200)
     specialist_followup_rounds: int = Field(default=0, ge=0, le=2)
     decision_conflict_batch_size: int = Field(default=12, ge=2, le=30)
     model_budget: ModelBudgetConfig = Field(default_factory=ModelBudgetConfig)

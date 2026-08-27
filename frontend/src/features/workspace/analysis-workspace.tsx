@@ -291,7 +291,7 @@ function AgentConclusionCard({ card }: { card: OutputCard }) {
   return (
     <Card
       size="sm"
-      className="risk-output-card relative border animate-in fade-in slide-in-from-bottom-2 duration-300"
+      className="risk-output-card relative border"
       data-severity={severity}
     >
       <span aria-hidden data-risk-accent className="absolute inset-y-0 left-0 w-1" />
@@ -309,7 +309,7 @@ function AgentConclusionCard({ card }: { card: OutputCard }) {
       <CardContent className="flex flex-col gap-2 text-xs">
         {card.claim && <p className="leading-relaxed">{card.claim}</p>}
         {card.rationale && <p className="leading-relaxed text-muted-foreground">裁决依据：{card.rationale}</p>}
-        {card.uncertainty && <p className="leading-relaxed text-muted-foreground">待核实：{card.uncertainty}</p>}
+        {card.uncertainty && <p className="leading-relaxed text-muted-foreground">证据边界：{card.uncertainty}</p>}
         <div className="flex flex-wrap gap-1">
           {card.owner && <Badge variant="outline">负责：{card.owner}</Badge>}
           <Badge variant="outline">原文证据 {card.evidenceIds.length} 条</Badge>
@@ -317,6 +317,16 @@ function AgentConclusionCard({ card }: { card: OutputCard }) {
       </CardContent>
     </Card>
   );
+}
+
+function agentCardKey(card: OutputCard): string {
+  return [
+    card.kind,
+    card.riskType ?? "",
+    card.title,
+    card.owner ?? "",
+    card.evidenceIds.join(","),
+  ].join(":");
 }
 
 function StreamingCardPlaceholder({ role, first = false }: { role: string; first?: boolean }) {
@@ -371,12 +381,12 @@ function AgentOutputPane({
   const rawCandidates = Math.max(
     company.progress?.funnel?.raw_candidates ?? 0,
     company.risk_scope_review?.funnel?.raw_candidates ?? 0,
-    cards.filter((card) => card.kind === "discovery").length,
+    output.rawCount,
   );
   const consolidatedCandidates = Math.max(
     company.progress?.funnel?.consolidated_candidates ?? 0,
     company.risk_scope_review?.funnel?.consolidated_candidates ?? 0,
-    cards.filter((card) => card.kind === "consolidated").length,
+    output.consolidatedCount,
   );
 
   useEffect(() => {
@@ -423,9 +433,9 @@ function AgentOutputPane({
         )}
       </div>
       <div className="grid gap-3 xl:grid-cols-2">
-        {visible.map((card, index) => (
+        {visible.map((card) => (
           <AgentConclusionCard
-            key={`${card.kind}-${card.riskType ?? card.title}-${index}`}
+            key={agentCardKey(card)}
             card={card}
           />
         ))}
@@ -564,7 +574,15 @@ function FeaturePredictionPanel({
 }) {
   const prediction = company.prediction;
   const decisionState = company.progress?.agents?.decision?.state;
-  const featureStarted = latestEvent(events, ["features_started"]);
+  const featureActivity = latestEvent(events, [
+    "rag_features_started",
+    "rag_features_progress",
+    "rag_features_completed",
+    "rag_features_failed",
+    "features_started",
+    "features_progress",
+  ]);
+  const featureStarted = latestEvent(events, ["rag_features_started", "features_started"]);
   const featureProgressEvent = latestEvent(events, ["features_progress"]);
   const featureTerminal = latestEvent(events, ["features_completed", "features_failed"]);
   const featureCompleted = featureTerminal?.stage === "features_completed" ? featureTerminal : undefined;
@@ -575,6 +593,7 @@ function FeaturePredictionPanel({
   const predictionFailed = predictionTerminal?.stage === "prediction_failed" ? predictionTerminal : undefined;
   const visible = Boolean(
     prediction
+    || featureActivity
     || featureStarted
     || featureCompleted
     || featureFailed
@@ -588,7 +607,7 @@ function FeaturePredictionPanel({
     ? "failed"
     : featureCompleted || predictionStarted || prediction
       ? "complete"
-      : featureStarted
+      : featureActivity || featureStarted
         ? "running"
         : "waiting";
   const predictionState: AutomaticStageState = predictionFailed
@@ -608,15 +627,6 @@ function FeaturePredictionPanel({
     : predictionState === "running" ? 55 : 0;
   const collectedCount = prediction?.candidate_feature_count
     ?? candidateCount(featureCompleted?.detail);
-  const availableCandidateCount = prediction?.available_candidate_feature_count;
-  const readinessLabel = prediction?.feature_readiness === "ready"
-    ? "输入就绪"
-    : prediction?.feature_readiness === "review_required"
-      ? "需要复核"
-      : prediction?.feature_readiness === "blocked"
-        ? "输入阻断"
-        : null;
-
   return (
     <div className="flex flex-col gap-4">
       <Card className="bg-card/75">
@@ -628,39 +638,34 @@ function FeaturePredictionPanel({
         <CardContent className="grid gap-3 lg:grid-cols-2">
           <AutomaticStageCard
             kind="features"
-            title="采集上市前宽候选特征"
-            description="发行、财务、文档、市场、近期IPO与Agent风险"
+            title="检索并采集上市前宽候选特征"
+            description="本公司向量库、表格公式、上市前市场与Agent风险"
             state={featuresState}
             progress={featurePercent}
             progressText={marker ? `${marker.current}/${marker.total} · ${marker.detail}` : automaticStageLabel[featuresState]}
-            detail={featureFailed?.detail ?? featureCompleted?.detail ?? featureStarted?.detail ?? "等待决策Agent完成后自动开始。"}
+            detail={featureFailed?.detail ?? featureCompleted?.detail ?? featureActivity?.detail ?? featureStarted?.detail ?? "等待决策Agent完成后自动开始。"}
             metrics={[
               collectedCount != null ? `候选特征 ${collectedCount} 项` : "",
-              availableCandidateCount != null ? `可用 ${availableCandidateCount} 项` : "",
             ].filter(Boolean)}
           />
           <AutomaticStageCard
             kind="prediction"
             title="模型输入校验与五日预测"
-            description="按冻结契约取值，检查单位、公式、时点和完整度"
+            description="按冻结契约取值，检查单位、公式和预测时点"
             state={predictionState}
             progress={predictionPercent}
             progressText={predictionState === "running" ? "正在校验并计算" : automaticStageLabel[predictionState]}
             detail={predictionFailed?.detail ?? predictionCompleted?.detail ?? predictionStarted?.detail ?? "候选特征完成后自动校验当前模型输入。"}
-            metrics={prediction ? [
-              `模型输入 ${prediction.available_feature_count}/${prediction.feature_count}`,
-              `完整度 ${Math.round(prediction.feature_completeness * 100)}%`,
-              readinessLabel ?? "",
-            ].filter(Boolean) : []}
+            metrics={prediction ? [`五日显著下跌概率 ${Math.round(prediction.probability * 100)}%`] : []}
           />
         </CardContent>
       </Card>
 
-      {(company.base_prediction || prediction) && (
+      {prediction && (
         <Alert>
           <ChartNoAxesCombined />
           <AlertTitle>五日预测已有可用结果</AlertTitle>
-          <AlertDescription>概率、置信度、输入完整度和两阶段对照已移至独立预测页。</AlertDescription>
+          <AlertDescription>统一五日显著下跌概率、风险等级和主要风险已移至独立预测页。</AlertDescription>
           <AlertAction>
             <Button variant="outline" size="sm" onClick={onOpenPredictions}>查看五日预测</Button>
           </AlertAction>

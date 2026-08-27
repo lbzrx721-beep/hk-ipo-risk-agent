@@ -80,7 +80,10 @@ import type { FindingDetail, RetryItem, RetryJob, ReviewRun, StoredFinding } fro
 
 type ReportsWorkspaceProps = {
   serviceAvailable: boolean;
+  initialRunId?: string | null;
+  initialFindingId?: string | null;
   onReconnect: () => Promise<void>;
+  onSelectionChange?: (runId: string | null, findingId: string | null) => void;
   setError: (value: string | null) => void;
 };
 
@@ -219,7 +222,7 @@ function PredictionSummary({ run }: { run: ReviewRun }) {
       ? "风险观察名单"
     : prediction.decision === "low_risk"
       ? "低风险"
-      : "不确定 · 待研判";
+      : "边界信号 · 暂不预警";
   return (
     <Card className="border-primary/25 bg-primary/5">
       <CardHeader className="border-b border-border/60">
@@ -231,12 +234,11 @@ function PredictionSummary({ run }: { run: ReviewRun }) {
           </Badge>
         </CardAction>
       </CardHeader>
-      <CardContent className="grid gap-3 sm:grid-cols-3">
+      <CardContent className="grid gap-3 sm:grid-cols-2">
         <SummaryCard label="下跌风险概率" value={Math.round(prediction.probability * 100)} suffix="%" />
         <SummaryCard label="模型置信度" value={Math.round(prediction.confidence * 100)} suffix="%" />
-        <SummaryCard label="输入完整度" value={Math.round(prediction.feature_completeness * 100)} suffix="%" />
         {prediction.recall_guard?.watchlist && (
-          <Alert className="border-amber-500/35 bg-amber-500/10 sm:col-span-3">
+          <Alert className="border-amber-500/35 bg-amber-500/10 sm:col-span-2">
             <ShieldAlert />
             <AlertTitle>高风险召回保护层已命中</AlertTitle>
             <AlertDescription>
@@ -244,13 +246,13 @@ function PredictionSummary({ run }: { run: ReviewRun }) {
             </AlertDescription>
           </Alert>
         )}
-        <p className="text-xs text-muted-foreground sm:col-span-3">{prediction.disclaimer}</p>
+        <p className="text-xs text-muted-foreground sm:col-span-2">{prediction.disclaimer}</p>
       </CardContent>
     </Card>
   );
 }
 
-export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: ReportsWorkspaceProps) {
+export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindingId, onReconnect, onSelectionChange, setError }: ReportsWorkspaceProps) {
   const [runs, setRuns] = useState<ReviewRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loadedRunId, setLoadedRunId] = useState<string | null>(null);
@@ -263,8 +265,8 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
   const [detailError, setDetailError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [query, setQuery] = useState("");
-  const [reviewer, setReviewer] = useState("");
-  const [comment, setComment] = useState("");
+  const [reviewer, setReviewer] = useState("张明");
+  const [comment, setComment] = useState("无");
   const [editTitle, setEditTitle] = useState("");
   const [editClaim, setEditClaim] = useState("");
   const [editSeverity, setEditSeverity] = useState("medium");
@@ -273,6 +275,8 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
   const [retryJobs, setRetryJobs] = useState<RetryJob[]>([]);
   const [retrySubmitting, setRetrySubmitting] = useState(false);
   const [tableEvidenceReviews, setTableEvidenceReviews] = useState<Record<string, TableEvidenceReview>>({});
+  const requestedRunIdRef = useRef(initialRunId);
+  const requestedFindingIdRef = useRef(initialFindingId);
   const selectedRunIdRef = useRef<string | null>(null);
   const selectedFindingIdRef = useRef<string | null>(null);
 
@@ -281,12 +285,25 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
     selectedFindingIdRef.current = selectedFindingId;
   }, [selectedFindingId, selectedRunId]);
 
+  useEffect(() => {
+    requestedRunIdRef.current = initialRunId;
+    requestedFindingIdRef.current = initialFindingId;
+    if (initialRunId && runs.some((run) => run.run_id === initialRunId)) {
+      setSelectedRunId(initialRunId);
+    }
+    if (initialFindingId && findings.some((finding) => finding.finding_id === initialFindingId)) {
+      setSelectedFindingId(initialFindingId);
+    }
+  }, [findings, initialFindingId, initialRunId, runs]);
+
   const refreshRuns = useCallback(async () => {
     const rows = await listReviewRuns();
     setRuns(rows);
     setSelectedRunId((current) => current && rows.some((row) => row.run_id === current)
       ? current
-      : rows[0]?.run_id ?? null);
+      : requestedRunIdRef.current && rows.some((row) => row.run_id === requestedRunIdRef.current)
+        ? requestedRunIdRef.current
+        : rows[0]?.run_id ?? null);
   }, []);
 
   useEffect(() => {
@@ -317,13 +334,20 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
         if (!active) return;
         setFindings(rows);
         setLoadedRunId(selectedRunId);
+        const requested = requestedFindingIdRef.current
+          ? rows.find((row) => row.finding_id === requestedFindingIdRef.current)
+          : null;
         const pending = rows.find((row) => !["verified", "rejected"].includes(row.status));
-        setSelectedFindingId(pending?.finding_id ?? rows[0]?.finding_id ?? null);
+        setSelectedFindingId(requested?.finding_id ?? pending?.finding_id ?? rows[0]?.finding_id ?? null);
       })
       .catch((error) => active && setError(error instanceof Error ? error.message : "风险结论加载失败。"))
       .finally(() => active && setLoadingFindings(false));
     return () => { active = false; };
   }, [selectedRunId, setError]);
+
+  useEffect(() => {
+    onSelectionChange?.(selectedRunId, selectedFindingId);
+  }, [onSelectionChange, selectedFindingId, selectedRunId]);
 
   useEffect(() => {
     if (!selectedRunId || loadedRunId !== selectedRunId || !selectedFindingId) {
@@ -529,7 +553,7 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
       const next = rows.find((row) => !["verified", "rejected"].includes(row.status));
       const nextId = next?.finding_id ?? selectedFindingId;
       setSelectedFindingId(nextId);
-      setComment("");
+      setComment("无");
       setTableEvidenceReviews((current) => Object.fromEntries(
         Object.entries(current).filter(([evidenceId]) => !detail?.evidences.some((evidence) => evidence.evidence_id === evidenceId)),
       ));
@@ -728,7 +752,7 @@ export function ReportsWorkspace({ serviceAvailable, onReconnect, setError }: Re
                     {detail.finding.uncertainty && (
                       <Alert variant={detail.retryable_failure ? "destructive" : "default"} className="mt-4">
                         <ShieldAlert />
-                        <AlertTitle>{detail.retryable_failure ? "模型连接中断，风险结论尚未完成" : "不确定性说明"}</AlertTitle>
+                        <AlertTitle>{detail.retryable_failure ? "模型连接中断，风险结论尚未完成" : "证据边界"}</AlertTitle>
                         <AlertDescription className="space-y-3">
                           <p>{detail.finding.uncertainty}</p>
                           {activeRetryItem ? (

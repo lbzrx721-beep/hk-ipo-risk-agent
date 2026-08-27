@@ -330,7 +330,7 @@ class FindingRetryService:
                     job_id,
                     finding.finding_id,
                     state="succeeded",
-                    stage=("已重新分析，等待人工复核" if verdict is not None else "证据不足，已交由人工判断"),
+                    stage=("已重新分析，进入质量复核" if verdict is not None else "证据不足，机器未纳入正式结论"),
                     error=None,
                 )
 
@@ -532,7 +532,7 @@ def _finding_rule(finding: RiskFinding) -> RiskRule:
         query=finding.title,
         required_keywords=(finding.title,),
         claim=finding.claim,
-        max_evidence=min(8, max(1, len(finding.evidence_ids))),
+        max_evidence=max(1, len(finding.evidence_ids)),
     )
 
 
@@ -615,7 +615,7 @@ def _updated_finding(finding: RiskFinding, assessment: SpecialistAssessment, ver
         )
     else:
         payload["specialist_status"] = SpecialistStatus.CONFLICT.value
-        payload["uncertainty"] = f"决策Agent保留分歧，等待人工判断：{verdict.rationale}"
+        payload["uncertainty"] = f"决策Agent最终未纳入；证据边界：{verdict.rationale}"
     return RiskFinding.model_validate(payload)
 
 

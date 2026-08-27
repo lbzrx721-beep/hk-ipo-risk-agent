@@ -79,6 +79,52 @@ class BatchProvider:
         }
 
 
+class AllEvidenceProvider(BatchProvider):
+    def complete_json(self, **request: object) -> dict[str, object]:
+        self.calls += 1
+        payload = json.loads(str(request["user_prompt"]))
+        self.payloads.append(payload)
+        risk = payload["risks"][0]
+        self.batch_sizes.append(1)
+        return {
+            "assessments": [
+                {
+                    "risk_type": risk["risk_type"],
+                    "status": "supported",
+                    "claim": f"{risk['risk_name']}由全部原文证据共同支持。",
+                    "severity": "high",
+                    "confidence": 0.9,
+                    "evidence_chunk_ids": risk["allowed_evidence_chunk_ids"],
+                    "uncertainty": "影响程度仍需人工判断。",
+                    "followup_queries": [],
+                    "duplicate_of": None,
+                }
+            ]
+        }
+
+
+def test_specialist_preserves_all_legal_evidence_without_count_cap() -> None:
+    provider = AllEvidenceProvider()
+    analyzer = DeepSeekSpecialistBatchAnalyzer(
+        provider,
+        temperature=0.1,
+        max_output_tokens=4_096,
+        batch_size=20,
+    )
+    candidates = tuple(_chunk(index) for index in range(1, 6))
+
+    result = analyzer.analyze_batch(
+        [SpecialistTask(rule=_rule(1), candidates=candidates)]
+    )
+
+    assessment = result.assessments[0]
+    assert assessment.evidence_chunk_ids == tuple(
+        chunk.chunk_id for chunk in candidates
+    )
+    assert provider.calls == 1
+    assert "max_evidence" not in provider.payloads[0]["risks"][0]
+
+
 def test_specialist_receives_table_structure_and_cell_references() -> None:
     provider = BatchProvider()
     analyzer = DeepSeekSpecialistBatchAnalyzer(
@@ -304,6 +350,21 @@ class InterruptedStreamProvider(BatchProvider):
         return super().complete_json(**request)
 
 
+class OversizedPartitionProvider(BatchProvider):
+    """模拟上游在多风险批次上断开、拆成单条后恢复。"""
+
+    def complete_json(self, **request: object) -> dict[str, object]:
+        payload = json.loads(str(request["user_prompt"]))
+        risks = payload["risks"]
+        if len(risks) > 1:
+            self.calls += 1
+            self.batch_sizes.append(len(risks))
+            raise RemoteProtocolError(
+                "peer closed connection without sending complete message body"
+            )
+        return super().complete_json(**request)
+
+
 def test_incomplete_chunked_read_is_retried_and_recovers() -> None:
     provider = InterruptedStreamProvider(always_fail=False)
     retries: list[tuple[int, float]] = []
@@ -353,3 +414,32 @@ def test_exhausted_stream_failure_is_not_mislabeled_as_evidence_insufficient() -
 
     assert result.assessments[0].status is SpecialistStatus.TECHNICAL_FAILURE
     assert result.attempts_by_risk[_rule(1).id] == 3
+
+
+def test_failed_multi_risk_partition_is_split_without_interrupting_role() -> None:
+    provider = OversizedPartitionProvider()
+    analyzer = DeepSeekSpecialistBatchAnalyzer(
+        provider,
+        temperature=0.1,
+        max_output_tokens=4_096,
+        batch_size=20,
+        retry_policy=RetryPolicy(
+            max_retries=0,
+            initial_seconds=0,
+            retry_if=retry_model_node_error,
+        ),
+    )
+
+    result = analyzer.analyze_batch(
+        [
+            SpecialistTask(rule=_rule(index), candidates=(_chunk(index),))
+            for index in range(1, 5)
+        ]
+    )
+
+    assert len(result.assessments) == 4
+    assert all(
+        assessment.status is SpecialistStatus.SUPPORTED
+        for assessment in result.assessments
+    )
+    assert provider.batch_sizes == [4, 2, 1, 1, 2, 1, 1]

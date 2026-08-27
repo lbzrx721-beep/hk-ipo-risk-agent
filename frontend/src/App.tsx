@@ -19,11 +19,24 @@ import { AnalysisWorkspace } from "@/features/workspace/analysis-workspace";
 import { PredictionsWorkspace } from "@/features/predictions/predictions-workspace";
 import { ReportsWorkspace } from "@/features/reports/reports-workspace";
 import { batchAction, checkApiHealth, connectBatchStream, getBatch } from "@/api";
-import { ACTIVE_BATCH_KEY, mergeAnalysisEvents, type AppView } from "@/lib/presentation";
+import {
+  ACTIVE_BATCH_KEY,
+  mergeAnalysisEvents,
+  viewFromPath,
+  viewPath,
+  type AppView,
+} from "@/lib/presentation";
 import type { AnalysisEvent, BatchSnapshot, PendingUpload } from "@/types";
 
 function App() {
-  const [view, setView] = useState<AppView>("workspace");
+  const [view, setView] = useState<AppView>(() => viewFromPath(window.location.pathname));
+  const [visitedViews, setVisitedViews] = useState<Set<AppView>>(() => new Set([
+    "workspace",
+    viewFromPath(window.location.pathname),
+  ]));
+  const initialSearch = new URLSearchParams(window.location.search);
+  const [routeRunId, setRouteRunId] = useState<string | null>(() => initialSearch.get("run_id"));
+  const [routeFindingId, setRouteFindingId] = useState<string | null>(() => initialSearch.get("finding_id"));
   const [batch, setBatch] = useState<BatchSnapshot | null>(null);
   const [pending, setPending] = useState<PendingUpload[]>([]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -38,6 +51,53 @@ function App() {
     setServiceStatus(available ? "online" : "offline");
     return available;
   }, []);
+
+  const applyRoute = useCallback((nextView: AppView, runId?: string | null, findingId?: string | null, replace = false) => {
+    const params = new URLSearchParams();
+    if (runId) params.set("run_id", runId);
+    if (findingId) params.set("finding_id", findingId);
+    const href = `${viewPath[nextView]}${params.size ? `?${params.toString()}` : ""}`;
+    window.history[replace ? "replaceState" : "pushState"]({}, "", href);
+    setRouteRunId(runId ?? null);
+    setRouteFindingId(findingId ?? null);
+    setVisitedViews((current) => new Set(current).add(nextView));
+    setView(nextView);
+  }, []);
+
+  const updateRouteSelection = useCallback((nextView: AppView, runId?: string | null, findingId?: string | null) => {
+    if (viewFromPath(window.location.pathname) !== nextView) return;
+    const params = new URLSearchParams();
+    if (runId) params.set("run_id", runId);
+    if (findingId) params.set("finding_id", findingId);
+    const href = `${viewPath[nextView]}${params.size ? `?${params.toString()}` : ""}`;
+    window.history.replaceState({}, "", href);
+    setRouteRunId(runId ?? null);
+    setRouteFindingId(findingId ?? null);
+  }, []);
+
+  const updatePredictionRoute = useCallback((runId: string | null) => {
+    updateRouteSelection("predictions", runId);
+  }, [updateRouteSelection]);
+
+  const updateReviewRoute = useCallback((runId: string | null, findingId: string | null) => {
+    updateRouteSelection("results", runId, findingId);
+  }, [updateRouteSelection]);
+
+  useEffect(() => {
+    if (window.location.pathname === "/") {
+      applyRoute("workspace", null, null, true);
+    }
+    const onPopState = () => {
+      const nextView = viewFromPath(window.location.pathname);
+      const search = new URLSearchParams(window.location.search);
+      setView(nextView);
+      setVisitedViews((current) => new Set(current).add(nextView));
+      setRouteRunId(search.get("run_id"));
+      setRouteFindingId(search.get("finding_id"));
+    };
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, [applyRoute]);
 
   useEffect(() => {
     void checkService();
@@ -135,13 +195,13 @@ function App() {
             </div>
 
             <nav className="flex rounded-xl border bg-card/70 p-1" aria-label="主导航">
-              <Button variant={view === "workspace" ? "secondary" : "ghost"} size="sm" onClick={() => setView("workspace")}>
+              <Button variant={view === "workspace" ? "secondary" : "ghost"} size="sm" onClick={() => applyRoute("workspace")}>
                 <LayoutDashboard data-icon="inline-start" />分析工作台
               </Button>
-              <Button variant={view === "predictions" ? "secondary" : "ghost"} size="sm" onClick={() => setView("predictions")}>
+              <Button variant={view === "predictions" ? "secondary" : "ghost"} size="sm" onClick={() => applyRoute("predictions", selected?.run_id)}>
                 <ChartNoAxesCombined data-icon="inline-start" />五日预测
               </Button>
-              <Button variant={view === "results" ? "secondary" : "ghost"} size="sm" onClick={() => setView("results")}>
+              <Button variant={view === "results" ? "secondary" : "ghost"} size="sm" onClick={() => applyRoute("results", selected?.run_id)}>
                 <FileCheck2 data-icon="inline-start" />结果与复核
               </Button>
             </nav>
@@ -182,7 +242,7 @@ function App() {
         )}
 
         <main>
-          {view === "workspace" ? (
+          <div hidden={view !== "workspace"}>
             <AnalysisWorkspace
               batch={batch}
               pending={pending}
@@ -198,24 +258,38 @@ function App() {
               onSnapshot={acceptSnapshot}
               onSelectCompany={setSelectedKey}
               onAction={(kind) => void action(kind)}
-              onOpenPredictions={() => setView("predictions")}
+              onOpenPredictions={() => applyRoute("predictions", selected?.run_id)}
             />
-          ) : view === "predictions" ? (
+          </div>
+          {visitedViews.has("predictions") && (
+            <div hidden={view !== "predictions"}>
             <PredictionsWorkspace
               batch={batch}
-              selected={selected}
               selectedKey={selectedKey}
               busy={busy}
               serviceAvailable={serviceAvailable}
+              initialRunId={routeRunId}
               onSelectCompany={setSelectedKey}
               onSnapshot={acceptSnapshot}
               setBusy={setBusy}
               setError={setError}
-              onOpenResults={() => setView("results")}
+              onSelectionChange={updatePredictionRoute}
+              onOpenResults={(runId, findingId) => applyRoute("results", runId, findingId)}
             />
-          ) : (
+            </div>
+          )}
+          {visitedViews.has("results") && (
+            <div hidden={view !== "results"}>
             <div className="mx-auto w-full max-w-[1920px] px-4 py-6 lg:px-6 2xl:px-8">
-              <ReportsWorkspace serviceAvailable={serviceAvailable} onReconnect={reconnect} setError={setError} />
+              <ReportsWorkspace
+                serviceAvailable={serviceAvailable}
+                initialRunId={routeRunId}
+                initialFindingId={routeFindingId}
+                onReconnect={reconnect}
+                onSelectionChange={updateReviewRoute}
+                setError={setError}
+              />
+            </div>
             </div>
           )}
         </main>

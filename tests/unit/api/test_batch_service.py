@@ -102,7 +102,7 @@ def test_workspace_keeps_structured_agent_events_outside_recent_window(
     ]
 
 
-def test_workspace_keeps_base_prediction_events_for_reconnect(tmp_path: Path) -> None:
+def test_workspace_ignores_retired_base_prediction_events(tmp_path: Path) -> None:
     workspace = BatchWorkspace(workspace_id="web_batch_test", project_root=tmp_path)
     job = FakeBatchJob()
     job.events_for = lambda _company_folder: (
@@ -116,7 +116,7 @@ def test_workspace_keeps_base_prediction_events_for_reconnect(tmp_path: Path) ->
 
     durable = workspace.structured_events_payload("s01:00001")
 
-    assert [event["stage"] for event in durable] == ["base_prediction_completed"]
+    assert durable == []
 
 
 def test_fastapi_health_endpoint(tmp_path: Path) -> None:

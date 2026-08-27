@@ -41,9 +41,8 @@ class OpenRiskCandidate(BaseModel):
     severity: RiskSeverity
     claim: str = Field(min_length=8)
     confidence: float = Field(ge=0.0, le=1.0)
-    # 单条风险允许引用多段跨页证据；与全局合并后的上限保持一致。
-    # 旧版限制为3条，模型返回第4条时会让整个原文包校验失败。
-    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
+    # 保留模型实际找到的全部互补原文，不因固定数量上限让整个批次校验失败。
+    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1)
     search_queries: tuple[str, ...] = Field(min_length=1, max_length=6)
     anchor_terms: tuple[str, ...] = Field(min_length=1, max_length=6)
     uncertainty: str = Field(min_length=2)
@@ -196,7 +195,7 @@ class ConsolidatedRiskCandidate(BaseModel):
     severity: RiskSeverity
     claim: str = Field(min_length=8)
     confidence: float = Field(ge=0.0, le=1.0)
-    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
+    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1)
     search_queries: tuple[str, ...] = Field(min_length=1, max_length=6)
     anchor_terms: tuple[str, ...] = Field(min_length=1, max_length=6)
     uncertainty: str = Field(min_length=2)
@@ -272,7 +271,7 @@ class DiscoveredRisk(BaseModel):
     severity: RiskSeverity
     claim: str
     confidence: float = Field(ge=0.0, le=1.0)
-    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1, max_length=8)
+    evidence_chunk_ids: tuple[str, ...] = Field(min_length=1)
     search_queries: tuple[str, ...] = Field(min_length=1, max_length=6)
     anchor_terms: tuple[str, ...] = Field(min_length=1, max_length=6)
     uncertainty: str
@@ -290,7 +289,7 @@ class DiscoveredRisk(BaseModel):
             query_variants=self.search_queries[1:],
             required_keywords=self.anchor_terms,
             claim=self.claim,
-            max_evidence=min(8, len(self.evidence_chunk_ids)),
+            max_evidence=len(self.evidence_chunk_ids),
         )
 
 
@@ -987,7 +986,7 @@ class DeepSeekOpenRiskDiscoverer:
                     "preserve_materially_distinct_risks": True,
                     "catalog_is_matching_reference_only": True,
                     "no_silent_truncation": True,
-                    "max_evidence_per_risk": 8,
+                    "preserve_all_material_evidence": True,
                 },
             },
             correction_feedback,
@@ -1154,7 +1153,7 @@ def _deduplicate_candidates(
         ]
         evidence_ids = _unique_strings(
             value for item in ordered_group for value in item.evidence_chunk_ids
-        )[:8]
+        )
         search_queries = _unique_strings(
             value for item in ordered_group for value in item.search_queries
         )[:6]

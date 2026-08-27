@@ -97,7 +97,7 @@ def test_runtime_prediction_blocks_when_current_snapshot_is_too_incomplete(
 
     with pytest.raises(
         prediction_module.RuntimePredictionUnavailable,
-        match="低于最低要求",
+        match="模型输入不满足特征契约",
     ):
         prediction_module.generate_runtime_prediction(
             project_root=tmp_path,

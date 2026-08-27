@@ -1,6 +1,18 @@
 import type { AnalysisEvent, BatchCompany } from "@/types";
 
 export type AppView = "workspace" | "predictions" | "results";
+
+export const viewPath: Record<AppView, string> = {
+  workspace: "/analysis",
+  predictions: "/prediction",
+  results: "/review",
+};
+
+export function viewFromPath(pathname: string): AppView {
+  if (pathname.startsWith("/prediction")) return "predictions";
+  if (pathname.startsWith("/review")) return "results";
+  return "workspace";
+}
 export type FindingFilter = "all" | "pending" | "verified" | "rejected";
 
 export const ACTIVE_BATCH_KEY = "ipo-risk-active-batch";

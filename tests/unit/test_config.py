@@ -215,7 +215,7 @@ def test_default_discovery_pack_is_small_enough_for_early_visible_results(
     assert config.agents.discovery_retrieval_query_count == 16
     assert config.agents.discovery_max_selected_chunks == 520
     assert config.agents.discovery_max_batch_passes == 2
-    assert config.agents.specialist_batch_size == 100
+    assert config.agents.specialist_batch_size == 12
     assert config.agents.specialist_followup_rounds == 0
     assert config.agents.model_budget.max_calls is None
     assert config.agents.model_budget.max_input_tokens is None

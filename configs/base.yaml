@@ -99,7 +99,7 @@ agents:
   # 大量候选分区语义合并，降低超长JSON导致的漏项与降级概率。
   consolidation_batch_size: 24
   # 四个专业Agent并行；每个角色一次处理一组风险，而不是每条风险调用一次。
-  specialist_batch_size: 100
+  specialist_batch_size: 12
   specialist_followup_rounds: 0
   # 决策Agent按批复核全部有证据专业提案；模型失败时保留风险并确定性兜底。
   decision_conflict_batch_size: 12

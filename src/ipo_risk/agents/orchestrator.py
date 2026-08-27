@@ -535,7 +535,7 @@ class MultiAgentOrchestrator:
                     confidence=analysis.confidence,
                     evidence_chunk_ids=analysis.evidence_chunk_ids,
                     uncertainty=analysis.uncertainty,
-                    rationale="接受有原文证据的最高置信度角色提案，等待人工复核。",
+                    rationale="接受有原文证据的最高置信度角色提案，进入质量复核。",
                     source_proposal_ids=tuple(proposal.proposal_id for proposal in supported),
                 )
             )
@@ -1100,7 +1100,7 @@ class MultiAgentOrchestrator:
             (
                 f"决策Agent接收{len(ordered_proposals)}条专业提案："
                 f"{len(eligible_proposals)}条进入模型裁决，"
-                f"{len(unresolved_proposals)}条证据不足项直接保留给人工。"
+                f"{len(unresolved_proposals)}条证据不足项由机器直接不纳入。"
             ),
         )
         _emit_progress(
@@ -1197,7 +1197,7 @@ class MultiAgentOrchestrator:
                 decision_attempts += error.attempts
                 decision_error = str(error.last_error)
                 repair_errors.append(decision_error)
-                # 模型失败时不删除风险；保留专业提案并用最高置信度结果进入人工复核。
+                # 模型失败时不删除风险；由确定性规则选择最高置信度提案完成机器裁决。
                 verdicts.extend(self._deterministic_decisions(decision_batch_proposals).decisions)
                 model_failed = True
         decision_batch = DecisionBatch(decisions=tuple(verdicts))
@@ -1211,6 +1211,10 @@ class MultiAgentOrchestrator:
         for verdict in decision_batch.decisions:
             self._validate_verdict(verdict, proposal_by_id)
             sources = [proposal_by_id[item] for item in verdict.source_proposal_ids]
+            selected = max(
+                sources,
+                key=lambda proposal: proposal.analyzed_risk.analysis.confidence,
+            )
             if not verdict.accepted:
                 if any(proposal.analyzed_risk.analysis.supported for proposal in sources):
                     conflicts.append(
@@ -1218,18 +1222,32 @@ class MultiAgentOrchestrator:
                             risk_type=verdict.risk_type,
                             kind="unresolved_support_conflict",
                             proposal_ids=verdict.source_proposal_ids,
-                            detail="专业Agent认为风险成立，冲突升级模型认为暂不能形成统一结论。",
-                            resolution=(f"保留全部专业提案并交由人工复核：{verdict.rationale}"),
+                            detail="专业Agent认为风险成立，决策Agent最终裁定不纳入正式风险。",
+                            resolution=f"机器最终不纳入：{verdict.rationale}",
                         )
                     )
-                fallback = self._deterministic_decisions(sources).decisions
-                if not fallback:
-                    continue
-                verdict = fallback[0]
-            selected = max(
-                sources,
-                key=lambda proposal: proposal.analyzed_risk.analysis.confidence,
-            )
+                decisions.append(
+                    AdjudicatedRisk(
+                        risk_type=verdict.risk_type,
+                        selected=selected.analyzed_risk,
+                        analysis=EvidenceAnalysis(
+                            supported=False,
+                            claim="",
+                            severity=verdict.severity,
+                            confidence=verdict.confidence,
+                            evidence_chunk_ids=(),
+                            uncertainty=verdict.uncertainty,
+                        ),
+                        source_proposal_ids=verdict.source_proposal_ids,
+                        rationale=verdict.rationale,
+                        decision_mode=decision_mode,
+                        decision_attempts=decision_attempts,
+                        decision_error=decision_error,
+                        conflict=True,
+                        specialist_status=selected.analyzed_risk.specialist_status,
+                    )
+                )
+                continue
             severity_disagreement = any(
                 proposal.analyzed_risk.analysis.severity is not verdict.severity
                 for proposal in sources
@@ -1283,16 +1301,26 @@ class MultiAgentOrchestrator:
             status = analyzed.specialist_status
             rationale = (
                 "专业Agent未获得足以支持正式结论的证据；"
-                "系统不自动删除该候选，保留原始风险方向与候选片段，交由人工判断。"
+                "机器最终不纳入正式风险清单，原始提案保留在审计记录中。"
             )
             decisions.append(
                 AdjudicatedRisk(
                     risk_type=risk_type,
                     selected=analyzed,
-                    analysis=analyzed.analysis,
+                    analysis=EvidenceAnalysis(
+                        supported=False,
+                        claim="",
+                        severity=analyzed.analysis.severity,
+                        confidence=analyzed.analysis.confidence,
+                        evidence_chunk_ids=(),
+                        uncertainty=(
+                            analyzed.analysis.uncertainty
+                            or "现有检索证据不足以形成可验证风险结论。"
+                        ),
+                    ),
                     source_proposal_ids=(proposal.proposal_id,),
                     rationale=rationale,
-                    decision_mode="human_review_required",
+                    decision_mode="excluded_insufficient_evidence",
                     decision_attempts=0,
                     specialist_status=status,
                 )
@@ -1360,7 +1388,7 @@ class MultiAgentOrchestrator:
                 "integrated_risk_types": [decision.risk_type for decision in decisions],
                 "proposal_count": len(ordered_proposals),
                 "model_adjudicated_count": len(eligible_proposals),
-                "human_review_required_count": len(unresolved_proposals),
+                "excluded_insufficient_evidence_count": len(unresolved_proposals),
                 "direct_proposal_count": len(direct_proposals),
                 "escalation_batch_count": len(escalation_batches),
                 "decision_batch_count": len(model_batches),
@@ -1407,17 +1435,18 @@ class MultiAgentOrchestrator:
             decision=(
                 f"决策Agent整合{len(decisions)}条风险提案；"
                 f"其中{len(eligible_proposals)}条由模型裁决，"
-                f"{len(unresolved_proposals)}条证据不足项原样保留给人工，"
-                "最终确认或驳回由人工复核完成。"
+                f"{len(unresolved_proposals)}条证据不足项未纳入正式风险；"
+                "原始提案与裁决理由完整保留在审计记录中。"
             ),
         )
         _emit_progress(
             progress_callback,
             "agent:decision:completed",
             (
-                f"决策Agent裁决完成：{len(decisions)}条进入人工复核，"
-                f"其中{len(unresolved_proposals)}条证据不足；"
-                f"记录{len(conflicts)}项待人工处理分歧。"
+                f"决策Agent裁决完成：机器采纳"
+                f"{sum(item.analysis.supported for item in decisions)}条风险，"
+                f"不纳入{sum(not item.analysis.supported for item in decisions)}条；"
+                f"记录{len(conflicts)}项裁决分歧。"
             ),
         )
         return _DecisionExecution(

@@ -145,12 +145,12 @@ class CorrectingEvidenceProvider(StubJsonChatProvider):
             "claim": "公司持续产生经营现金净流出。",
             "severity": "high",
             "confidence": 0.9,
-            "evidence_chunk_ids": (allowed[:2] if self.calls == 1 else allowed[:1]),
+            "evidence_chunk_ids": allowed,
             "uncertainty": "未来现金需求仍需核验。",
         }
 
 
-def test_evidence_analysis_retry_corrects_excess_evidence_count() -> None:
+def test_evidence_analysis_preserves_all_legal_evidence_without_retry() -> None:
     provider = CorrectingEvidenceProvider()
     analyzer = DeepSeekEvidenceAnalyzer(
         provider,
@@ -177,12 +177,11 @@ def test_evidence_analysis_retry_corrects_excess_evidence_count() -> None:
 
     analyzed = engine.analyze()[0]
 
-    assert provider.calls == 2
-    assert len(analyzed.analysis.evidence_chunk_ids) == 1
-    assert analyzed.analysis.evidence_chunk_ids[0] in {"C1", "C2"}
-    assert analyzed.analysis_attempts == 2
-    assert analyzed.analysis_retry_errors
-    assert "correction" in provider.prompts[1]
+    assert provider.calls == 1
+    assert set(analyzed.analysis.evidence_chunk_ids) == {"C1", "C2"}
+    assert analyzed.analysis_attempts == 1
+    assert not analyzed.analysis_retry_errors
+    assert "max_evidence" not in provider.prompts[0]["constraints"]
 
 
 class UnknownEvidenceProvider(StubJsonChatProvider):

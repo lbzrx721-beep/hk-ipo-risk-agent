@@ -813,7 +813,7 @@ def test_open_risk_fails_closed_when_professional_model_fails() -> None:
         result.decisions[0].specialist_status
         is SpecialistStatus.EVIDENCE_INSUFFICIENT
     )
-    assert result.decisions[0].decision_mode == "human_review_required"
+    assert result.decisions[0].decision_mode == "excluded_insufficient_evidence"
 
 
 def test_open_risk_fails_closed_when_decision_model_fails() -> None:
@@ -1188,6 +1188,6 @@ def test_decision_rejection_of_supported_proposal_is_a_support_conflict() -> Non
     assert len(result.decisions) == 1
     assert result.decisions[0].risk_type == "cash_burn"
     assert result.conflicts[0].kind == "unresolved_support_conflict"
-    assert "人工复核" in result.conflicts[0].resolution
+    assert "机器最终不纳入" in result.conflicts[0].resolution
     decision_trace = next(trace for trace in result.traces if trace.agent is AgentRole.DECISION)
     assert decision_trace.tool_calls[0].output["conflict_count"] == 1

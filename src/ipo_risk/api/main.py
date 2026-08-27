@@ -7,6 +7,8 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.responses import Response
 
 from ipo_risk.api.batch_service import BatchWorkspaceRegistry
 from ipo_risk.api.routers.analysis import create_analysis_router
@@ -15,6 +17,29 @@ from ipo_risk.config import load_config
 from ipo_risk.reviewing import ReviewService
 from ipo_risk.retrying import FindingRetryService
 from ipo_risk.storage.repositories import CatalogRepository
+
+
+class SpaStaticFiles(StaticFiles):
+    """为React客户端路由返回入口页，同时保留真实静态资源的404。"""
+
+    async def get_response(self, path: str, scope: dict) -> Response:
+        try:
+            response = await super().get_response(path, scope)
+        except StarletteHTTPException as exc:
+            if (
+                exc.status_code == 404
+                and scope.get("method") in {"GET", "HEAD"}
+                and not Path(path).suffix
+            ):
+                return await super().get_response("index.html", scope)
+            raise
+        if (
+            response.status_code == 404
+            and scope.get("method") in {"GET", "HEAD"}
+            and not Path(path).suffix
+        ):
+            return await super().get_response("index.html", scope)
+        return response
 
 
 def create_app(*, project_root: Path | None = None) -> FastAPI:
@@ -56,7 +81,7 @@ def create_app(*, project_root: Path | None = None) -> FastAPI:
     if frontend_dist.is_dir():
         app.mount(
             "/",
-            StaticFiles(directory=frontend_dist, html=True),
+            SpaStaticFiles(directory=frontend_dist, html=True),
             name="frontend",
         )
     return app

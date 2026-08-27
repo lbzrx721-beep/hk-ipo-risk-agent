@@ -272,6 +272,7 @@ def collect_prelisting_candidates(
     tables_path: Path | None = None,
     chunks_path: Path | None = None,
     listing_date: date | None = None,
+    supplemental_features: Mapping[str, FeatureValue] | None = None,
     progress_callback: FeatureCollectionProgress | None = None,
 ) -> CandidateFeatureSnapshot:
     """收集本次公司可用的宽候选池，不提前限制为模型的18个字段。"""
@@ -296,6 +297,8 @@ def collect_prelisting_candidates(
         warnings.extend(f"structured:{reason}" for reason in structured.missing_reasons)
     except Exception as exc:  # noqa: BLE001 - 单类候选失败不能丢掉整份快照
         warnings.append(f"structured_extraction_failed:{exc}")
+    if supplemental_features:
+        _merge_supplemental(features, supplemental_features, warnings)
     _notify_feature_progress(progress_callback, 2, "发行与财务结构化字段已汇总")
 
     _merge(
@@ -565,28 +568,16 @@ def project_model_inputs(
         issues.append(f"缺少必需字段：{', '.join(required_missing)}")
         status = "blocked"
     if completeness < contract.minimum_feature_completeness:
-        issues.append(
-            "模型输入完整度"
-            f"{completeness:.0%}低于最低要求{contract.minimum_feature_completeness:.0%}。"
-        )
         status = "blocked"
     elif completeness < contract.review_below_completeness and status == "ready":
-        issues.append(
-            "模型输入完整度"
-            f"{completeness:.0%}，低于自动判断标准{contract.review_below_completeness:.0%}。"
-        )
         status = "review_required"
     for group, minimum in contract.required_group_completeness:
         required_actual = group_completeness.get(group, 0.0)
         if required_actual < minimum:
-            issues.append(
-                f"{group}特征完整度{required_actual:.0%}低于必需标准{minimum:.0%}。"
-            )
             status = "blocked"
     for group, minimum in contract.review_group_completeness:
         review_actual = group_completeness.get(group)
         if review_actual is not None and review_actual < minimum:
-            issues.append(f"{group}特征完整度{review_actual:.0%}，建议人工复核。")
             if status == "ready":
                 status = "review_required"
     return ModelInputProjection(
@@ -791,6 +782,23 @@ def _merge(
             continue
         if existing.value != feature.value:
             raise ValueError(f"conflicting candidate feature values for {name}")
+
+
+def _merge_supplemental(
+    destination: dict[str, FeatureValue],
+    incoming: Mapping[str, FeatureValue],
+    warnings: list[str],
+) -> None:
+    """RAG只补足当前文档缺失值；表格与公式提取结果始终优先。"""
+    for name, feature in incoming.items():
+        if feature.value is None:
+            continue
+        existing = destination.get(name)
+        if existing is None or existing.value is None:
+            destination[name] = feature
+            continue
+        if existing.value != feature.value:
+            warnings.append(f"rag_conflict_kept_deterministic:{name}")
 
 
 def _value_and_date(raw: Any) -> tuple[Any, date | None]:

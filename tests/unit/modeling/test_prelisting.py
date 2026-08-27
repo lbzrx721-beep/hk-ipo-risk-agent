@@ -5,9 +5,44 @@ from datetime import date
 from ipo_risk.domain import FeatureValue
 from ipo_risk.modeling.prelisting import (
     ModelFeatureContract,
+    _merge_supplemental,
     load_model_feature_contract,
     project_model_inputs,
 )
+
+
+def test_rag_supplement_only_fills_missing_values() -> None:
+    available_at = date(2025, 1, 1)
+    deterministic = FeatureValue(
+        value=188.4,
+        available_at=available_at,
+        source_ref="table:T-1",
+    )
+    rag_value = FeatureValue(
+        value=200.0,
+        available_at=available_at,
+        source_ref="rag:C-1",
+    )
+    rag_only = FeatureValue(
+        value=25.0,
+        available_at=available_at,
+        source_ref="rag:C-2",
+    )
+    features = {"offering_net_proceeds_hkd": deterministic}
+    warnings: list[str] = []
+
+    _merge_supplemental(
+        features,
+        {
+            "offering_net_proceeds_hkd": rag_value,
+            "customer_top5_ratio_pct": rag_only,
+        },
+        warnings,
+    )
+
+    assert features["offering_net_proceeds_hkd"] is deterministic
+    assert features["customer_top5_ratio_pct"] is rag_only
+    assert warnings == ["rag_conflict_kept_deterministic:offering_net_proceeds_hkd"]
 
 
 def test_candidate_pool_can_be_wider_than_frozen_model_contract() -> None:
