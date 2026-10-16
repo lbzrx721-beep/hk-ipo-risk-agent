@@ -1,18 +1,22 @@
 import {
   Activity,
+  ArrowDownToLine,
   Bot,
   ChartNoAxesCombined,
   Check,
+  ChevronDown,
   ChevronRight,
   CirclePause,
   CirclePlay,
   FileSearch,
   ListTree,
+  LockKeyhole,
+  MessageSquareWarning,
   Network,
   ShieldCheck,
   Timer,
 } from "lucide-react";
-import { memo, startTransition, useEffect, useMemo, useState } from "react";
+import { memo, startTransition, useEffect, useMemo, useRef, useState } from "react";
 
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
@@ -38,7 +42,9 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Spinner } from "@/components/ui/spinner";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { VirtualList } from "@/components/virtual-list";
+import { DebateTimeline } from "@/components/debate-timeline";
 import { parseAgentOutput, type AgentOutputCard as OutputCard } from "@/lib/agent-output";
+import { shouldShowStreamingPlaceholder } from "@/lib/streaming-state";
 import {
   compactDetail,
   companyStage,
@@ -55,11 +61,13 @@ import type {
   AnalysisEvent,
   BatchCompany,
   BatchSnapshot,
+  DebateRecord,
   PendingUpload,
 } from "@/types";
 import { LlmRecoveryPanel } from "./llm-recovery-panel";
 import { RiskScopePanel } from "./risk-scope-panel";
 import { UploadPanel } from "./upload-panel";
+import { CompanyReviewPlanView, parseCompanyReviewPlan } from "./company-review-plan";
 
 type AnalysisWorkspaceProps = {
   batch: BatchSnapshot | null;
@@ -86,6 +94,12 @@ const agentStateLabel: Record<string, string> = {
   failed: "异常",
   degraded: "部分降级",
   skipped: "本次无任务",
+};
+
+const modelDisplayName: Record<string, string> = {
+  deepseek_flash: "DeepSeek Flash",
+  deepseek_pro: "DeepSeek Pro",
+  kimi: "Kimi K3",
 };
 
 const outputKindLabel: Record<OutputCard["kind"], string> = {
@@ -231,6 +245,7 @@ const AgentCard = memo(function AgentCard({
         : "outline";
   const progress = live?.progress ?? (state === "complete" || state === "skipped" ? 100 : 0);
   const detail = publicAgentMessage(roleKey, state, live?.message || fallback.detail);
+  const assignedModel = company.agent_models?.[roleKey];
   return (
     <Card size="sm" className={cn("min-h-44 bg-muted/10", state === "running" && "border-primary/30 bg-primary/[0.035]")}>
       <CardHeader>
@@ -239,11 +254,12 @@ const AgentCard = memo(function AgentCard({
           {label}
         </CardTitle>
         <CardDescription>{description}</CardDescription>
-        <CardAction>
+        <CardAction className="flex flex-col items-end gap-1">
           <Badge variant={variant}>
             {state === "running" && <Spinner data-icon="inline-start" />}
             {agentStateLabel[state] ?? state}
           </Badge>
+          {assignedModel && <Badge variant="outline"><LockKeyhole data-icon="inline-start" />{modelDisplayName[assignedModel] ?? assignedModel}</Badge>}
         </CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
@@ -280,7 +296,7 @@ function normalizedSeverity(severity: string): keyof typeof severityBadgeVariant
     : "unknown";
 }
 
-function AgentConclusionCard({ card }: { card: OutputCard }) {
+const AgentConclusionCard = memo(function AgentConclusionCard({ card }: { card: OutputCard }) {
   const confidence = card.confidence == null ? null : Math.round(card.confidence * 100);
   const severity = normalizedSeverity(card.severity);
   const outcome = card.kind === "decision"
@@ -291,7 +307,7 @@ function AgentConclusionCard({ card }: { card: OutputCard }) {
   return (
     <Card
       size="sm"
-      className="risk-output-card relative border"
+      className="risk-output-card relative border animate-in fade-in slide-in-from-bottom-1 duration-200"
       data-severity={severity}
     >
       <span aria-hidden data-risk-accent className="absolute inset-y-0 left-0 w-1" />
@@ -309,7 +325,6 @@ function AgentConclusionCard({ card }: { card: OutputCard }) {
       <CardContent className="flex flex-col gap-2 text-xs">
         {card.claim && <p className="leading-relaxed">{card.claim}</p>}
         {card.rationale && <p className="leading-relaxed text-muted-foreground">裁决依据：{card.rationale}</p>}
-        {card.uncertainty && <p className="leading-relaxed text-muted-foreground">证据边界：{card.uncertainty}</p>}
         <div className="flex flex-wrap gap-1">
           {card.owner && <Badge variant="outline">负责：{card.owner}</Badge>}
           <Badge variant="outline">原文证据 {card.evidenceIds.length} 条</Badge>
@@ -317,22 +332,28 @@ function AgentConclusionCard({ card }: { card: OutputCard }) {
       </CardContent>
     </Card>
   );
-}
+}, (previous, next) => (
+  previous.card.title === next.card.title
+  && previous.card.claim === next.card.claim
+  && previous.card.severity === next.card.severity
+  && previous.card.confidence === next.card.confidence
+  && previous.card.owner === next.card.owner
+  && previous.card.supported === next.card.supported
+  && previous.card.accepted === next.card.accepted
+  && previous.card.rationale === next.card.rationale
+  && previous.card.evidenceIds.join("|") === next.card.evidenceIds.join("|")
+));
 
 function agentCardKey(card: OutputCard): string {
-  return [
-    card.kind,
-    card.riskType ?? "",
-    card.title,
-    card.owner ?? "",
-    card.evidenceIds.join(","),
-  ].join(":");
+  return card.riskType
+    ? `${card.kind}:${card.riskType}`
+    : [card.kind, card.owner ?? "", card.title].join(":");
 }
 
 function StreamingCardPlaceholder({ role, first = false }: { role: string; first?: boolean }) {
   const label = roleMeta.find(([key]) => key === role)?.[1] ?? "Agent";
   const detail = role === "discovery"
-    ? "模型正在整理候选片段；完成一条后会立即显示为风险卡片。"
+    ? "正在检索公司概况、核对原文引用并规划审查问题；本阶段不判断风险成立。"
     : role === "decision"
       ? "模型正在整合专业意见；完成一条后会立即显示为裁决卡片。"
       : "正在复用现有证据批量核验；完成一条后会立即显示为专业结论。";
@@ -343,9 +364,9 @@ function StreamingCardPlaceholder({ role, first = false }: { role: string; first
     >
       <CardHeader>
         <CardDescription className="flex items-center gap-2 text-primary">
-          <Spinner />{first ? "首条生成中" : "下一条生成中"}
+          <Spinner />{role === "discovery" ? "画像与审查规划中" : first ? "首条生成中" : "下一条生成中"}
         </CardDescription>
-        <CardTitle className="text-sm">{label}正在生成{first ? "首条" : "下一条"}结构化结论</CardTitle>
+        <CardTitle className="text-sm">{role === "discovery" ? "风险发现 Agent 正在构建公司画像与待查问题" : `${label}正在生成${first ? "首条" : "下一条"}结构化结论`}</CardTitle>
       </CardHeader>
       <CardContent className="flex flex-col gap-3">
         <Skeleton className="h-3 w-11/12" />
@@ -354,6 +375,231 @@ function StreamingCardPlaceholder({ role, first = false }: { role: string; first
         <p className="text-xs text-muted-foreground">{detail}</p>
       </CardContent>
     </Card>
+  );
+}
+
+const stageLabel: Record<string, string> = {
+  analysis_model_selected: "分析模型已确认",
+  upload_started: "PDF 登记开始",
+  upload_completed: "PDF 登记完成",
+  parsing_started: "PDF 解析开始",
+  parsing_progress: "PDF 解析中",
+  parsing_completed: "PDF 解析完成",
+  embedding_started: "向量索引创建",
+  embedding_progress: "向量索引创建中",
+  embedding_join_wait: "等待索引同步",
+  embedding_join_completed: "索引同步完成",
+  vector_store_indexed: "向量库已就绪",
+  embedding_fallback: "索引降级（备用方案）",
+  agents_started: "多 Agent 分析启动",
+  agents_completed: "多 Agent 分析完成",
+  risk_scoping_started: "风险发现开始",
+  risk_scoping_completed: "风险发现完成",
+  text_embellishment_registered: "文本粉饰模块已启用",
+  text_embellishment_started: "文本粉饰分析开始",
+  text_embellishment_completed: "文本粉饰分析完成",
+  "agent:decision:debate_requested": "决策Agent发起质疑",
+  "agent:finance:debate_retrieval": "财务Agent定向补证",
+  "agent:legal:debate_retrieval": "法律Agent定向补证",
+  "agent:business:debate_retrieval": "业务Agent定向补证",
+  "agent:market:debate_retrieval": "市场Agent定向补证",
+  "agent:finance:debate_response": "财务Agent提交补证",
+  "agent:legal:debate_response": "法律Agent提交补证",
+  "agent:business:debate_response": "业务Agent提交补证",
+  "agent:market:debate_response": "市场Agent提交补证",
+  "agent:decision:debate_completed": "决策Agent完成再次裁决",
+  "agent:decision:debate_failed": "补证辩论异常",
+  debate_record: "辩论记录已保存",
+  risk_scope_review_started: "等待确认风险范围",
+  risk_scope_review_submitted: "风险范围已提交",
+  risk_scope_review_completed: "已确认风险范围",
+  rag_features_started: "特征提取开始",
+  rag_features_progress: "特征提取中",
+  rag_features_completed: "特征提取完成",
+  rag_features_failed: "特征提取异常",
+  features_started: "上市前特征开始",
+  features_progress: "上市前特征采集中",
+  features_completed: "上市前特征采集完成",
+  features_failed: "上市前特征异常",
+  prediction_started: "风险预测开始",
+  prediction_completed: "风险预测完成",
+  prediction_failed: "风险预测异常",
+  evidence_started: "证据链生成开始",
+  evidence_completed: "证据链生成完成",
+  agent_completed: "Agent 阶段完成",
+  completed: "已完成",
+  failed: "异常中止",
+};
+
+function stageCapabilities(stage: string): string[] {
+  if (stage.startsWith("upload_")) return ["文件哈希", "PDF登记"];
+  if (stage.startsWith("parsing_")) return ["PyMuPDF", "RapidOCR", "表格识别"];
+  if (stage.startsWith("embedding_") || stage === "vector_store_indexed") return ["Qwen3-Embedding-4B", "pgvector"];
+  if (stage.startsWith("risk_scop") || stage.startsWith("agent:discovery")) return ["RAG检索", "风险发现能力"];
+  if (stage.startsWith("text_embellishment")) return ["向量检索", "披露语言风险分析"];
+  if (stage.includes("debate")) return ["定向补证", "多Agent辩论"];
+  if (/^agent:(finance|legal|business|market):/.test(stage)) return ["所选推理模型", "专业核验能力"];
+  if (stage === "analysis_model_selected") return ["模型路由", "任务级配置"];
+  if (stage.startsWith("agent:decision")) return ["所选推理模型", "风险裁决能力"];
+  if (stage.startsWith("rag_features")) return ["pgvector检索", "财务字段提取"];
+  if (stage.startsWith("features_")) return ["特征工程", "时点校验"];
+  if (stage.startsWith("prediction_")) return ["1/5/20/60日模型", "模型契约"];
+  if (stage.startsWith("evidence_")) return ["原文定位", "证据截图"];
+  if (stage === "completed") return ["审计落盘"];
+  return [];
+}
+
+function stageLabelClean(stage: string): string {
+  const direct = stageLabel[stage];
+  if (direct) return direct;
+  // "agent:finance:completed" → "财务 Agent 完成"
+  const agentMatch = /^agent:(\w+):(.+)$/.exec(stage);
+  if (agentMatch) {
+    const roleMap: Record<string, string> = {
+      discovery: "发现", finance: "财务", legal: "法律", business: "业务", market: "市场", decision: "决策",
+    };
+    const role = roleMap[agentMatch[1]] ?? agentMatch[1];
+    const verb = agentMatch[2] === "completed" ? "完成" : agentMatch[2] === "running" ? "运行中" : agentMatch[2] === "failed" ? "异常" : agentMatch[2];
+    return `${role} Agent ${verb}`;
+  }
+  return stage.replace(/_/g, " ").replace(/:/g, " · ");
+}
+
+function cleanDetail(detail: string): string {
+  // Remove internal IDs and noisy tokens
+  let cleaned = detail
+    .replace(/\bopen_[0-9a-f]+\b/gi, "")
+    .replace(/\[request .*?]\s*/gi, "")
+    .replace(/概率\s*\d+(?:\.\d+)?%/g, "方向性预警已生成")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (cleaned.length > 160) cleaned = cleaned.slice(0, 157) + "…";
+  return cleaned || detail.slice(0, 120);
+}
+
+function groupEvents(events: AnalysisEvent[]): { stage: string; label: string; events: AnalysisEvent[] }[] {
+  const groups: { stage: string; label: string; events: AnalysisEvent[] }[] = [];
+  for (const event of events) {
+    const last = groups[groups.length - 1];
+    if (last && last.stage === event.stage) {
+      last.events.push(event);
+    } else {
+      groups.push({
+        stage: event.stage,
+        label: stageLabelClean(event.stage),
+        events: [event],
+      });
+    }
+  }
+  return groups;
+}
+
+function compactGroupEvents(stage: string, events: AnalysisEvent[]): AnalysisEvent[] {
+  const noisy = stage.endsWith("_progress") || stage.includes("embedding_progress") || stage.includes("vectorization");
+  if (!noisy || events.length <= 2) return events;
+  return [events[0], events[events.length - 1]];
+}
+
+function parseDebateRecords(events: AnalysisEvent[]): DebateRecord[] {
+  const records = new Map<string, DebateRecord>();
+  for (const event of events) {
+    if (event.stage !== "debate_record") continue;
+    try {
+      const record = JSON.parse(event.detail) as DebateRecord;
+      if (!record.debate_id || !record.risk_type) continue;
+      records.set(record.debate_id, record);
+    } catch {
+      // Older or interrupted runs may contain a partial business event.
+    }
+  }
+  return [...records.values()];
+}
+
+function EventLog({ events }: { events: AnalysisEvent[] }) {
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const [userScrolled, setUserScrolled] = useState(false);
+  const displayEvents = useMemo(
+    () => events.filter((event) => !event.stage.endsWith(":delta") && event.stage !== "debate_record" && event.stage !== "company_review_plan"),
+    [events],
+  );
+  const groups = useMemo(() => groupEvents(displayEvents), [displayEvents]);
+
+  useEffect(() => {
+    if (!userScrolled && scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+  }, [events, userScrolled]);
+
+  const handleScroll = () => {
+    if (!scrollRef.current) return;
+    const el = scrollRef.current;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+    setUserScrolled(!atBottom);
+  };
+
+  const scrollToBottom = () => {
+    if (scrollRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+      setUserScrolled(false);
+    }
+  };
+
+  if (events.length === 0) {
+    return (
+      <Empty className="min-h-64 border">
+        <EmptyHeader>
+          <EmptyMedia variant="icon"><FileSearch /></EmptyMedia>
+          <EmptyTitle>等待第一条分析事件</EmptyTitle>
+          <EmptyDescription>PDF 登记后，事件会在这里持续追加。</EmptyDescription>
+        </EmptyHeader>
+      </Empty>
+    );
+  }
+
+  return (
+    <div className="relative">
+      <div
+        ref={scrollRef}
+        onScroll={handleScroll}
+        className="max-h-[480px] overflow-auto pr-1"
+      >
+        {groups.map((group, gi) => (
+          <div key={`${group.stage}-${gi}`} className="border-b border-border/40 last:border-b-0">
+            <div className="flex items-center gap-2 px-1 py-2">
+              <span className="size-2 rounded-full bg-primary/70" />
+              <span className="text-xs font-semibold text-foreground/85">{group.label}</span>
+              {group.events.length > 1 && (
+                <Badge variant="secondary" className="ml-auto text-[10px]">{group.events.length}</Badge>
+              )}
+              {stageCapabilities(group.stage).map((capability) => (
+                <Badge key={capability} variant="outline" className="text-[10px] font-normal text-muted-foreground">{capability}</Badge>
+              ))}
+            </div>
+            {compactGroupEvents(group.stage, group.events).map((event, ei, shown) => (
+              <div key={`${gi}-${ei}`} className="ml-2.5 border-l-2 border-muted pl-4 pb-2.5 last:pb-3">
+                <time className="text-[11px] tabular-nums text-muted-foreground/70">
+                  {formatTime(event.occurred_at)}
+                  {group.events.length > 2 && shown.length === 2 && ei === 1 ? ` · 共 ${group.events.length} 次更新` : ""}
+                </time>
+                <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">{cleanDetail(event.detail)}</p>
+              </div>
+            ))}
+          </div>
+        ))}
+      </div>
+
+      {userScrolled && (
+        <Button
+          variant="secondary"
+          size="sm"
+          className="absolute bottom-3 right-3 shadow-lg"
+          onClick={scrollToBottom}
+        >
+          <ArrowDownToLine className="size-3.5" />
+          最新
+        </Button>
+      )}
+    </div>
   );
 }
 
@@ -377,7 +623,7 @@ function AgentOutputPane({
   const safePage = Math.min(page, pageCount);
   const visible = cards.slice((safePage - 1) * pageSize, safePage * pageSize);
   const progress = company.progress?.agents?.[role];
-  const isStreaming = progress?.state === "running" || output.incomplete;
+  const isStreaming = shouldShowStreamingPlaceholder(progress?.state, output.incomplete);
   const rawCandidates = Math.max(
     company.progress?.funnel?.raw_candidates ?? 0,
     company.risk_scope_review?.funnel?.raw_candidates ?? 0,
@@ -390,8 +636,13 @@ function AgentOutputPane({
   );
 
   useEffect(() => {
-    if (isStreaming) setPage(pageCount);
-  }, [cards.length, isStreaming, pageCount]);
+    setPage((current) => Math.min(current, pageCount));
+  }, [pageCount]);
+
+  if (role === "discovery") {
+    const plan = parseCompanyReviewPlan(events);
+    if (plan) return <CompanyReviewPlanView plan={plan} />;
+  }
 
   if (cards.length === 0) {
     if (isStreaming) {
@@ -631,8 +882,8 @@ function FeaturePredictionPanel({
     <div className="flex flex-col gap-4">
       <Card className="bg-card/75">
         <CardHeader className="border-b border-border/60">
-          <CardTitle>上市前特征与五日预测</CardTitle>
-          <CardDescription>决策Agent结束后自动执行，无需人工点击；所有输入严格截止到上市日前。</CardDescription>
+          <CardTitle>上市前特征与多时间窗口预测</CardTitle>
+          <CardDescription>决策Agent结束后自动执行，分别生成上市首日、5日、20日和60日风险预测。</CardDescription>
           <CardAction><Badge variant="outline">自动流程</Badge></CardAction>
         </CardHeader>
         <CardContent className="grid gap-3 lg:grid-cols-2">
@@ -650,13 +901,13 @@ function FeaturePredictionPanel({
           />
           <AutomaticStageCard
             kind="prediction"
-            title="模型输入校验与五日预测"
-            description="按冻结契约取值，检查单位、公式和预测时点"
+            title="多时间窗口风险预测"
+            description="使用四个独立模型生成不同时间窗口的方向性预警"
             state={predictionState}
             progress={predictionPercent}
             progressText={predictionState === "running" ? "正在校验并计算" : automaticStageLabel[predictionState]}
-            detail={predictionFailed?.detail ?? predictionCompleted?.detail ?? predictionStarted?.detail ?? "候选特征完成后自动校验当前模型输入。"}
-            metrics={prediction ? [`五日显著下跌概率 ${Math.round(prediction.probability * 100)}%`] : []}
+            detail={cleanDetail(predictionFailed?.detail ?? predictionCompleted?.detail ?? predictionStarted?.detail ?? "候选特征完成后自动校验当前模型输入。")}
+            metrics={prediction ? ["1日、5日、20日和60日预测已生成"] : []}
           />
         </CardContent>
       </Card>
@@ -664,10 +915,10 @@ function FeaturePredictionPanel({
       {prediction && (
         <Alert>
           <ChartNoAxesCombined />
-          <AlertTitle>五日预测已有可用结果</AlertTitle>
-          <AlertDescription>统一五日显著下跌概率、风险等级和主要风险已移至独立预测页。</AlertDescription>
+          <AlertTitle>多时间窗口预测已有可用结果</AlertTitle>
+          <AlertDescription>四个时间窗口的预警状态和主要风险已移至独立预测页。</AlertDescription>
           <AlertAction>
-            <Button variant="outline" size="sm" onClick={onOpenPredictions}>查看五日预测</Button>
+            <Button variant="outline" size="sm" onClick={onOpenPredictions}>查看风险预测</Button>
           </AlertAction>
         </Alert>
       )}
@@ -697,9 +948,11 @@ function CompanyDetail({
   onOpenPredictions: () => void;
 }) {
   const currentStage = companyStage(company, events);
-  const pipeline = ["文档登记", "解析与索引", "风险发现", "范围确认", "专业核验", "决策整合", "特征生成", "五日预测", "完成"];
+  const pipeline = ["文档登记", "解析与索引", "风险发现", "范围确认", "专业核验", "决策整合", "特征生成", "风险预测", "完成"];
   const percent = statusProgress(company);
   const elapsed = elapsedSeconds(company, nowMs);
+  const debateRecords = useMemo(() => parseDebateRecords(events), [events]);
+  const debateActive = company.state !== "completed" && company.state !== "failed";
 
   return (
     <div className="flex min-w-0 flex-col gap-4">
@@ -808,6 +1061,7 @@ function CompanyDetail({
                 {roleMeta.map(([key, label]) => (
                   <TabsTrigger key={key} value={key}>{label}</TabsTrigger>
                 ))}
+                <TabsTrigger value="debates"><MessageSquareWarning data-icon="inline-start" />辩论与补证</TabsTrigger>
                 <TabsTrigger value="events"><Activity data-icon="inline-start" />事件流</TabsTrigger>
               </TabsList>
             </div>
@@ -816,31 +1070,11 @@ function CompanyDetail({
                 <AgentOutputPane role={key} events={events} company={company} />
               </TabsContent>
             ))}
+            <TabsContent value="debates">
+              <DebateTimeline records={debateRecords} active={debateActive} />
+            </TabsContent>
             <TabsContent value="events">
-              <div className="max-h-[480px] overflow-auto pr-2">
-                {visibleEvents.length > 0 ? (
-                  <div className="flex flex-col">
-                    {visibleEvents.map((event, index) => (
-                      <article key={`${event.stage}-${event.occurred_at}-${index}`} className="grid grid-cols-[70px_12px_minmax(0,1fr)] gap-3 border-b border-border/50 py-3 last:border-b-0">
-                        <time className="text-xs tabular-nums text-muted-foreground">{formatTime(event.occurred_at)}</time>
-                        <span className="mt-1.5 size-2 rounded-full bg-primary shadow-[0_0_12px_var(--primary)]" />
-                        <div className="min-w-0">
-                          <strong className="text-xs font-medium">{event.stage.replaceAll(":", " · ")}</strong>
-                          <p className="mt-1 text-xs leading-relaxed text-muted-foreground">{compactDetail(event.detail, 260)}</p>
-                        </div>
-                      </article>
-                    ))}
-                  </div>
-                ) : (
-                  <Empty className="min-h-64 border">
-                    <EmptyHeader>
-                      <EmptyMedia variant="icon"><FileSearch /></EmptyMedia>
-                      <EmptyTitle>等待第一条分析事件</EmptyTitle>
-                      <EmptyDescription>PDF 登记后，事件会在这里持续追加。</EmptyDescription>
-                    </EmptyHeader>
-                  </Empty>
-                )}
-              </div>
+              <EventLog events={visibleEvents} />
             </TabsContent>
           </Tabs>
         </CardContent>
@@ -923,7 +1157,6 @@ export function AnalysisWorkspace({
           <Card size="sm" className="bg-card/75">
             <CardHeader>
               <CardTitle>批次总体进度</CardTitle>
-              <CardDescription>按每家公司真实端到端进度计算，进度只前进、不回跳。</CardDescription>
             </CardHeader>
             <CardContent>
               <LabeledProgress
@@ -938,7 +1171,6 @@ export function AnalysisWorkspace({
             <Card className="h-fit bg-card/75 xl:sticky xl:top-20">
               <CardHeader className="border-b border-border/60">
                 <CardTitle className="flex items-center gap-2"><ListTree className="size-4 text-primary" />公司任务队列</CardTitle>
-                <CardDescription>点击公司只切换右侧详情，不刷新整个页面。</CardDescription>
                 <CardAction><Badge variant="outline">{batch.company_count} 家</Badge></CardAction>
               </CardHeader>
               <CardContent>

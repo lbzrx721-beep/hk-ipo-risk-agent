@@ -17,6 +17,7 @@ class UploadMetadata(BaseModel):
     company_id: str = Field(min_length=1, max_length=32)
     company_name: str = Field(min_length=1, max_length=120)
     document_date: date
+    listing_date: date | None = None
     force_reanalysis: bool = False
 
 

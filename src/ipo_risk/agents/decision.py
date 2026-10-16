@@ -6,11 +6,11 @@ import json
 from collections.abc import Callable, Sequence
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ipo_risk.agents.analysis import JsonChatProvider, TextDeltaCallback
 from ipo_risk.agents.prompting import prompt_audit, with_correction
-from ipo_risk.domain import RiskSeverity
+from ipo_risk.domain import AgentRole, RiskSeverity
 
 
 class DecisionVerdict(BaseModel):
@@ -27,6 +27,17 @@ class DecisionVerdict(BaseModel):
     uncertainty: str = ""
     rationale: str = Field(min_length=1)
     source_proposal_ids: tuple[str, ...] = ()
+    needs_debate: bool = False
+    challenge: str = ""
+    challenge_role: AgentRole | None = None
+    challenge_queries: tuple[str, ...] = Field(default=(), max_length=4)
+
+    @field_validator("challenge_queries")
+    @classmethod
+    def challenge_queries_must_be_unique(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if len(value) != len(set(value)):
+            raise ValueError("decision challenge_queries must be unique")
+        return value
 
     @model_validator(mode="after")
     def validate_grounded_verdict(self) -> DecisionVerdict:
@@ -44,6 +55,16 @@ class DecisionVerdict(BaseModel):
             )
         if not self.accepted and self.evidence_chunk_ids:
             raise ValueError("a rejected decision cannot cite accepted evidence")
+        if self.needs_debate and (
+            not self.challenge or self.challenge_role is None or not self.challenge_queries
+        ):
+            raise ValueError(
+                "a debate request requires challenge, challenge_role and challenge_queries"
+            )
+        if not self.needs_debate and (
+            self.challenge or self.challenge_role is not None or self.challenge_queries
+        ):
+            raise ValueError("debate fields are only allowed when needs_debate is true")
         return self
 
 
@@ -102,7 +123,9 @@ class DeepSeekDecisionAnalyzer:
             "你是港股IPO风险决策Agent，逐项复核专业Agent提案并形成最终机器建议。"
             "只能使用专业Agent已选中的招股书原文，不得引入外部事实或新的证据ID。"
             "accepted=true表示纳入正式风险，accepted=false表示机器最终不纳入；"
-            "原始提案仍保留在审计记录中。uncertainty只描述证据边界，不得把任务交给人工。"
+            "原始提案仍保留在审计记录中。第一轮遇到实质冲突时用needs_debate、"
+            "challenge、challenge_role和challenge_queries发起定向补证；补证后的最终轮"
+            "不得再次发起辩论。uncertainty只描述证据边界，不得把任务交给人工。"
         )
 
     def prompt_audit(self) -> dict[str, str]:

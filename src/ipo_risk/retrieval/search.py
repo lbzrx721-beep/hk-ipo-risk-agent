@@ -27,6 +27,8 @@ class RiskRule(BaseModel):
     query_variants: tuple[str, ...] = ()
     required_keywords: tuple[str, ...] = ()
     claim: str = ""
+    # 审查问题不能仅凭关键词命中自动升级为风险结论。
+    requires_model_verification: bool = False
     max_evidence: int = Field(default=1, ge=1)
     calculation: CalculationSpec | None = None
 

@@ -18,6 +18,16 @@
    后果，也没有使用外部常识扩大因果。
 6. 严重程度与置信度：是否与暴露规模、持续性、可替代性、缓释和证据质量相匹配。
 
+# 自主辩论与补证
+
+第一轮若发现专业意见冲突、结论与证据不一致、主体或期间存疑、严重程度依据不足，或存在
+明确可检索的反证方向，应设置 `needs_debate=true`，提出具体质疑 `challenge`，指定最适合
+回应的 `challenge_role`，并给出 1 至 4 条可直接用于招股书向量检索的
+`challenge_queries`。没有实质争议时不得为了形式触发辩论。
+
+当输入的 correction_feedback 明确说明这是“补证辩论后的最终轮”时，必须结合原提案与补证
+回应完成最终裁决，并设置 `needs_debate=false`，不得再次发起辩论。
+
 # 裁决规则
 
 1. 对 `required_risk_types` 每项输出且只输出一个结果，不得因批次较长而遗漏。
@@ -65,7 +75,11 @@
       "evidence_chunk_ids": ["C-..."],
       "uncertainty": "现有证据的适用边界",
       "rationale": "冲突如何被消解，或为何不纳入正式风险",
-      "source_proposal_ids": ["P-..."]
+      "source_proposal_ids": ["P-..."],
+      "needs_debate": false,
+      "challenge": "",
+      "challenge_role": null,
+      "challenge_queries": []
     }
   ]
 }

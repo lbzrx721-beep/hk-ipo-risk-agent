@@ -182,6 +182,53 @@
 }
 
 @layer components {
+  .landing-grid {
+    background-image:
+      linear-gradient(color-mix(in oklab, var(--primary) 8%, transparent) 1px, transparent 1px),
+      linear-gradient(90deg, color-mix(in oklab, var(--primary) 8%, transparent) 1px, transparent 1px);
+    background-size: 72px 72px;
+    mask-image: radial-gradient(ellipse 85% 75% at 70% 40%, black 20%, transparent 78%);
+  }
+
+  .landing-copy {
+    animation: landing-fade-up 700ms cubic-bezier(.22, 1, .36, 1) both;
+  }
+
+  .landing-visual {
+    animation: landing-fade-through 900ms 120ms cubic-bezier(.22, 1, .36, 1) both;
+  }
+
+  .landing-hero-media img {
+    filter: drop-shadow(0 30px 70px rgba(0, 0, 0, .3));
+    -webkit-mask-image:
+      linear-gradient(to right, transparent 0%, black 6%, black 94%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 6%, black 94%, transparent 100%);
+    -webkit-mask-composite: source-in;
+    mask-image:
+      linear-gradient(to right, transparent 0%, black 6%, black 94%, transparent 100%),
+      linear-gradient(to bottom, transparent 0%, black 6%, black 94%, transparent 100%);
+    mask-composite: intersect;
+  }
+
+  .landing-document {
+    animation: landing-document-drift 7s ease-in-out infinite;
+  }
+
+  .landing-agent-core {
+    animation: landing-core-pulse 4.5s ease-in-out infinite;
+  }
+
+  .landing-risk-line {
+    background:
+      linear-gradient(165deg, transparent 46%, color-mix(in oklab, var(--primary) 72%, white 8%) 47%, transparent 48%) 0 0 / 13% 100% repeat-x;
+    filter: drop-shadow(0 0 7px color-mix(in oklab, var(--primary) 50%, transparent));
+    mask-image: linear-gradient(90deg, transparent, black 12%, black 88%, transparent);
+  }
+
+  .landing-primary-button {
+    background-image: linear-gradient(120deg, color-mix(in oklab, var(--primary) 92%, white 8%), var(--primary));
+  }
+
   .risk-output-card {
     --risk-card-color: var(--risk-unknown);
     border-color: color-mix(in oklab, var(--risk-card-color) 30%, transparent);
@@ -207,5 +254,38 @@
 
   .risk-output-card [data-risk-accent] {
     background: var(--risk-card-color);
+  }
+}
+
+@keyframes landing-fade-up {
+  from { opacity: 0; transform: translateY(22px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes landing-fade-through {
+  from { opacity: 0; transform: translateX(22px) scale(.985); }
+  to { opacity: 1; transform: translateX(0) scale(1); }
+}
+
+@keyframes landing-document-drift {
+  0%, 100% { transform: translateY(0) rotate(-5deg); }
+  50% { transform: translateY(-8px) rotate(-4deg); }
+}
+
+@keyframes landing-core-pulse {
+  0%, 100% { box-shadow: 0 0 48px rgba(52, 203, 255, .14); }
+  50% { box-shadow: 0 0 72px rgba(52, 203, 255, .25); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .landing-copy,
+  .landing-visual,
+  .landing-document,
+  .landing-agent-core {
+    animation: none;
+  }
+
+  html {
+    scroll-behavior: auto;
   }
 }

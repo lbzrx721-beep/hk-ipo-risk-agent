@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from threading import RLock
@@ -55,7 +56,13 @@ class BatchWorkspace:
         job.start()
         return segment
 
-    def append_uploads(self, uploads: tuple[BatchUploadSpec, ...]) -> None:
+    def append_uploads(
+        self,
+        uploads: tuple[BatchUploadSpec, ...],
+        *,
+        reasoning_model: Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"] = "deepseek_flash",
+        agent_models: Mapping[str, str] | None = None,
+    ) -> None:
         if not uploads:
             raise ValueError("至少需要上传一份PDF。")
         with self._lock:
@@ -66,6 +73,8 @@ class BatchWorkspace:
                 project_root=self.project_root,
                 experiment_name=experiment_name,
                 uploads=uploads,
+                reasoning_model=reasoning_model,
+                agent_models=agent_models,
             )
         )
 
@@ -117,6 +126,8 @@ class BatchWorkspace:
                     "phase_detail": snapshot.phase_detail,
                     "active": snapshot.active,
                     "error": snapshot.error,
+                    "agent_models": dict(getattr(segment.job, "agent_models", {})),
+                    "model_assignment_locked": True,
                 }
             )
             for company in snapshot.companies:
@@ -264,11 +275,18 @@ class BatchWorkspaceRegistry:
     def create_from_uploads(
         self,
         uploads: tuple[BatchUploadSpec, ...],
+        *,
+        reasoning_model: Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"] = "deepseek_flash",
+        agent_models: Mapping[str, str] | None = None,
     ) -> BatchWorkspace:
         if not uploads:
             raise ValueError("至少需要上传一份PDF。")
         workspace = self._new_workspace()
-        workspace.append_uploads(uploads)
+        workspace.append_uploads(
+            uploads,
+            reasoning_model=reasoning_model,
+            agent_models=agent_models,
+        )
         return workspace
 
     def create_from_catalog(
@@ -338,6 +356,8 @@ def _is_durable_agent_event(stage: str) -> bool:
             "llm_recovery_requested",
             "llm_recovery_retry_selected",
             "llm_recovery_bm25_selected",
+            "analysis_model_selected",
+            "debate_record",
             "features_started",
             "features_completed",
             "features_failed",

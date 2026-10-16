@@ -25,6 +25,14 @@ class FakeBatchJob:
             ),
         )
         self.started = False
+        self.agent_models = {
+            "discovery": "deepseek_flash",
+            "finance": "deepseek_pro",
+            "legal": "deepseek_pro",
+            "business": "deepseek_pro",
+            "market": "deepseek_flash",
+            "decision": "kimi",
+        }
 
     def start(self) -> None:
         self.started = True
@@ -80,6 +88,7 @@ def test_workspace_exposes_stable_company_key_and_events(tmp_path: Path) -> None
     assert job.started is True
     assert snapshot["state"] == "running"
     assert snapshot["companies"][0]["company_key"] == "s01:00001"
+    assert snapshot["segments"][0]["agent_models"]["decision"] == "kimi"
     progress = snapshot["companies"][0]["progress"]
     assert progress["agents"]["discovery"]["state"] == "running"
     assert progress["agents"]["finance"]["state"] == "complete"
@@ -135,6 +144,14 @@ def test_fastapi_reports_endpoint_starts_with_empty_registry(tmp_path: Path) -> 
 
     assert response.status_code == 200
     assert response.json() == {"runs": []}
+
+
+def test_delete_missing_analysis_run_returns_not_found(tmp_path: Path) -> None:
+    client = TestClient(create_app(project_root=tmp_path))
+
+    response = client.delete("/api/reports/runs/RUN-MISSING")
+
+    assert response.status_code == 404
 
 
 def test_upload_inspection_returns_editable_pdf_metadata(tmp_path: Path) -> None:

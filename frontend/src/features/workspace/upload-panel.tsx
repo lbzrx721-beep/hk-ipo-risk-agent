@@ -1,7 +1,9 @@
 import {
   FileText,
   History,
+  LockKeyhole,
   Plus,
+  SlidersHorizontal,
   Sparkles,
   UploadCloud,
   X,
@@ -9,6 +11,7 @@ import {
 import { useCallback, useRef, useState } from "react";
 
 import { appendBatch, createBatch, inspectFiles } from "@/api";
+import type { AgentModelAssignments, AgentRoleKey, ReasoningModel } from "@/api";
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -24,6 +27,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Spinner } from "@/components/ui/spinner";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { cn } from "@/lib/utils";
 import type { BatchSnapshot, PendingUpload } from "@/types";
 
@@ -38,6 +42,36 @@ type UploadPanelProps = {
   onSnapshot: (snapshot: BatchSnapshot) => void;
 };
 
+const agentRoles: Array<{ key: AgentRoleKey; label: string; description: string }> = [
+  { key: "discovery", label: "风险发现 Agent", description: "全文扫描与候选风险发现" },
+  { key: "finance", label: "财务 Agent", description: "财务质量、现金流与集中度" },
+  { key: "legal", label: "法律 Agent", description: "条款、诉讼与合规" },
+  { key: "business", label: "业务 Agent", description: "商业模式、供应链与文本粉饰" },
+  { key: "market", label: "市场 Agent", description: "发行结构、流动性与市场情绪" },
+  { key: "decision", label: "决策 Agent", description: "冲突整合、辩论与最终裁决" },
+];
+
+const modelOptions: Array<{ value: ReasoningModel; label: string; hint: string }> = [
+  { value: "deepseek_flash", label: "DeepSeek Flash", hint: "最快" },
+  { value: "deepseek_pro", label: "DeepSeek Pro", hint: "均衡" },
+  { value: "kimi", label: "Kimi K3", hint: "深度" },
+];
+
+const modelPresets: Record<"fast" | "balanced" | "deep", AgentModelAssignments> = {
+  fast: {
+    discovery: "deepseek_flash", finance: "deepseek_flash", legal: "deepseek_flash",
+    business: "deepseek_flash", market: "deepseek_flash", decision: "deepseek_flash",
+  },
+  balanced: {
+    discovery: "deepseek_flash", finance: "deepseek_pro", legal: "deepseek_pro",
+    business: "deepseek_pro", market: "deepseek_flash", decision: "kimi",
+  },
+  deep: {
+    discovery: "kimi", finance: "kimi", legal: "kimi",
+    business: "kimi", market: "kimi", decision: "kimi",
+  },
+};
+
 export function UploadPanel({
   pending,
   setPending,
@@ -50,6 +84,7 @@ export function UploadPanel({
 }: UploadPanelProps) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
+  const [agentModels, setAgentModels] = useState<AgentModelAssignments>({ ...modelPresets.balanced });
 
   const addFiles = useCallback(async (incoming: File[]) => {
     if (!serviceAvailable) {
@@ -108,8 +143,8 @@ export function UploadPanel({
     setError(null);
     try {
       const snapshot = activeBatch
-        ? await appendBatch(activeBatch.batch_id, pending)
-        : await createBatch(pending);
+        ? await appendBatch(activeBatch.batch_id, pending, agentModels)
+        : await createBatch(pending, agentModels);
       setPending([]);
       onSnapshot(snapshot);
     } catch (error) {
@@ -179,6 +214,46 @@ export function UploadPanel({
 
         {pending.length > 0 && (
           <div className="flex flex-col gap-3">
+            <div className="overflow-hidden rounded-xl border border-primary/15 bg-primary/[0.035]">
+              <div className="flex flex-col gap-3 border-b border-border/60 p-4 lg:flex-row lg:items-center lg:justify-between">
+                <div className="min-w-0">
+                  <p className="flex items-center gap-2 text-sm font-medium"><SlidersHorizontal className="size-4 text-primary" />Agent模型编排</p>
+                  <p className="mt-1 text-xs text-muted-foreground">六个Agent独立选用推理模型；提交任务后立即锁定，本次运行不可切换。</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {([
+                    ["fast", "快速模式"],
+                    ["balanced", "均衡模式"],
+                    ["deep", "深度模式"],
+                  ] as const).map(([key, label]) => (
+                    <Button key={key} type="button" size="sm" variant="outline" disabled={busy} onClick={() => setAgentModels({ ...modelPresets[key] })}>{label}</Button>
+                  ))}
+                </div>
+              </div>
+              <div className="grid gap-px bg-border/60 sm:grid-cols-2 xl:grid-cols-3">
+                {agentRoles.map((role) => (
+                  <div key={role.key} className="flex items-center justify-between gap-3 bg-card/95 p-3">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-medium">{role.label}</p>
+                      <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{role.description}</p>
+                    </div>
+                    <Select
+                      value={agentModels[role.key]}
+                      disabled={busy}
+                      onValueChange={(value) => setAgentModels((current) => ({ ...current, [role.key]: value as ReasoningModel }))}
+                    >
+                      <SelectTrigger size="sm" className="w-40 shrink-0"><SelectValue /></SelectTrigger>
+                      <SelectContent>
+                        {modelOptions.map((model) => <SelectItem key={model.value} value={model.value}>{model.label} · {model.hint}</SelectItem>)}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                ))}
+              </div>
+              <div className="flex items-center gap-2 border-t border-border/60 px-4 py-2.5 text-xs text-muted-foreground">
+                <LockKeyhole className="size-3.5 text-primary" />启动后前端只读，后端同时固化模型分配；异常重试仍使用原模型。
+              </div>
+            </div>
             {pending.map((item) => {
               const historyProtected = Boolean(item.existing_run_id && !item.force_reanalysis);
               return (
@@ -218,7 +293,7 @@ export function UploadPanel({
                         </AlertDescription>
                       </Alert>
                     )}
-                    <FieldGroup className="grid gap-3 md:grid-cols-[160px_minmax(220px,1fr)_180px]">
+                    <FieldGroup className="grid gap-3 md:grid-cols-[140px_minmax(220px,1fr)_170px_170px]">
                       <Field>
                         <FieldLabel htmlFor={`code-${item.id}`}>股票代码</FieldLabel>
                         <Input
@@ -245,6 +320,16 @@ export function UploadPanel({
                           value={item.document_date ?? ""}
                           disabled={historyProtected}
                           onChange={(event) => updatePending(item.id, { document_date: event.target.value })}
+                        />
+                      </Field>
+                      <Field>
+                        <FieldLabel htmlFor={`listing-date-${item.id}`}>预计上市日期</FieldLabel>
+                        <Input
+                          id={`listing-date-${item.id}`}
+                          type="date"
+                          value={item.listing_date ?? ""}
+                          disabled={historyProtected}
+                          onChange={(event) => updatePending(item.id, { listing_date: event.target.value || null })}
                         />
                       </Field>
                     </FieldGroup>

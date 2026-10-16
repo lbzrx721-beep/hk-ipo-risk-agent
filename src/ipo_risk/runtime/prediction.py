@@ -18,6 +18,16 @@ from ipo_risk.modeling.high_risk_guard import (
     evaluate_high_risk_guard,
     load_high_risk_guard_policy,
 )
+from ipo_risk.modeling.market_regime import (
+    MarketRegimeResult,
+    adjust_probability,
+    detect_market_regime,
+)
+from ipo_risk.modeling.dataset import (
+    DEFAULT_MARKET_WINDOWS,
+    build_listing_pre_market_feature_snapshot,
+    build_recent_ipo_feature_snapshot,
+)
 from ipo_risk.modeling.prelisting import (
     load_model_feature_contract,
     project_model_inputs,
@@ -27,10 +37,7 @@ from ipo_risk.storage.files import read_json, write_json
 
 
 DEFAULT_MODEL_PATH = Path(
-    "artifacts/models/unified_all_2020_2025_v1/model.joblib"
-)
-DEFAULT_BASE_MODEL_PATH = Path(
-    "artifacts/models/day5_business_base_v1/business_base_ensemble.joblib"
+    "artifacts/models/unified_h5/model.joblib"
 )
 DEFAULT_RECALL_GUARD_POLICY_PATH = Path("configs/high_risk_recall_guard.json")
 _FEATURE_LABELS = {
@@ -69,6 +76,73 @@ def _resolve_resource(root: Path, environment_name: str, default: Path) -> Path:
 def _load_bundle(path_text: str, modified_ns: int) -> dict[str, Any]:
     del modified_ns
     return load_model_bundle(Path(path_text))
+
+
+def enrich_horizon_prediction_status(
+    *,
+    project_root: Path,
+    prediction: Mapping[str, Any],
+) -> dict[str, Any]:
+    """为新旧预测记录补齐四个时间窗口的阈值和预警结论。"""
+
+    root = project_root.resolve()
+    payload = dict(prediction)
+    raw_values = payload.get("horizon_predictions")
+    values = dict(raw_values) if isinstance(raw_values, Mapping) else {}
+    if values.get("h5") is None and payload.get("probability") is not None:
+        values["h5"] = payload.get("probability")
+
+    raw_thresholds = payload.get("horizon_thresholds")
+    expose_thresholds = isinstance(raw_thresholds, Mapping) or payload.get("threshold") is not None
+    thresholds = dict(raw_thresholds) if isinstance(raw_thresholds, Mapping) else {}
+    if thresholds.get("h5") is None and payload.get("threshold") is not None:
+        thresholds["h5"] = payload.get("threshold")
+
+    model_paths = {
+        "h1": root / "artifacts" / "models" / "unified_h1" / "model.joblib",
+        "h5": _resolve_resource(root, "IPO_RISK_PREDICTION_MODEL", DEFAULT_MODEL_PATH),
+        "h20": root / "artifacts" / "models" / "unified_h20" / "model.joblib",
+        "h60": root / "artifacts" / "models" / "unified_h60" / "model.joblib",
+    }
+    for key, model_path in model_paths.items():
+        if thresholds.get(key) is not None or not model_path.is_file():
+            continue
+        try:
+            bundle = _load_bundle(str(model_path), model_path.stat().st_mtime_ns)
+            thresholds[key] = float(bundle["threshold"])
+        except Exception:  # 单个模型包不可读时，不阻断历史记录页面。
+            thresholds[key] = None
+
+    raw_alerts = payload.get("horizon_alerts")
+    alerts = dict(raw_alerts) if isinstance(raw_alerts, Mapping) else {}
+    for key in ("h1", "h5", "h20", "h60"):
+        value = values.get(key)
+        threshold = thresholds.get(key)
+        try:
+            alerts[key] = (
+                float(value) >= float(threshold)
+                if value is not None and threshold is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            alerts[key] = None
+    if alerts.get("h5") is None and isinstance(
+        payload.get("predicted_significant_drop_5d"), bool
+    ):
+        alerts["h5"] = payload["predicted_significant_drop_5d"]
+
+    if any(isinstance(alerts.get(key), bool) for key in ("h1", "h5", "h20", "h60")):
+        payload["horizon_predictions"] = {
+            key: values.get(key) for key in ("h1", "h5", "h20", "h60")
+        }
+        if expose_thresholds:
+            payload["horizon_thresholds"] = {
+                key: thresholds.get(key) for key in ("h1", "h5", "h20", "h60")
+            }
+        payload["horizon_alerts"] = {
+            key: alerts.get(key) for key in ("h1", "h5", "h20", "h60")
+        }
+    return payload
 
 
 @lru_cache(maxsize=4)
@@ -118,6 +192,68 @@ def _risk_level(decision: str, probability: float) -> str:
         return "low"
     return "high" if probability >= 0.65 else "medium"
 
+def _feature_scalar(raw: Any) -> int | float | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return raw
+    if isinstance(raw, dict):
+        v = raw.get("value")
+        return v if isinstance(v, (int, float)) else None
+    return None
+
+
+def _convert_native_to_hkd_mn(features: dict[str, Any]) -> None:
+    """将 RAG/结构化产出的 _native 财务数值按 fx_to_hkd 换算为 _hkd_mn 契约名。
+
+    不覆盖已有的 _hkd_mn 值。
+    """
+    native_fields = (
+        "fundamental_revenue_latest_native",
+        "fundamental_operating_cash_flow_latest_native",
+        "fundamental_ending_cash_latest_native",
+        "fundamental_net_profit_latest_native",
+        "fundamental_research_development_latest_native",
+    )
+    has_native_value = any(_feature_scalar(features.get(name)) is not None for name in native_fields)
+    fx_value = _feature_scalar(features.get("fundamental_fx_to_hkd"))
+    if has_native_value and (fx_value is None or fx_value <= 0):
+        # 推导汇率：从报账货币推断
+        currency_val = _feature_scalar(features.get("fundamental_reporting_currency"))
+        currency = str(currency_val).upper() if currency_val is not None else ""
+        if currency == "HKD":
+            fx_value = 1.0
+        elif currency == "RMB" or currency == "CNY":
+            fx_value = 1.1  # 近似港币/人民币
+        else:
+            fx_value = 1.0  # 默认港币
+        features["fundamental_fx_to_hkd"] = fx_value
+    for native_name, hkd_name in (
+        ("fundamental_revenue_latest_native", "fundamental_revenue_latest_hkd_mn"),
+        ("fundamental_operating_cash_flow_latest_native", "fundamental_operating_cash_flow_latest_hkd_mn"),
+        ("fundamental_ending_cash_latest_native", "fundamental_ending_cash_latest_hkd_mn"),
+        ("fundamental_net_profit_latest_native", "fundamental_net_profit_latest_hkd_mn"),
+        ("fundamental_research_development_latest_native", "fundamental_research_development_latest_hkd_mn"),
+    ):
+        if hkd_name in features and _feature_scalar(features[hkd_name]) is not None:
+            continue
+        native_val = _feature_scalar(features.get(native_name))
+        if native_val is not None and fx_value is not None:
+            features[hkd_name] = round(float(native_val) * float(fx_value), 4)
+    # Derive engineered ratios from now-available hkd values
+    revenue = _feature_scalar(features.get("fundamental_revenue_latest_hkd_mn"))
+    market_cap = _feature_scalar(features.get("offering_market_cap_mid_hkd"))
+    net_proceeds = _feature_scalar(features.get("offering_net_proceeds_hkd"))
+    ocf = _feature_scalar(features.get("fundamental_operating_cash_flow_latest_hkd_mn"))
+    if revenue and revenue != 0:
+        if market_cap is not None and _feature_scalar(features.get("engineered_price_to_sales")) is None:
+            features["engineered_price_to_sales"] = round(market_cap / revenue, 4)
+        if net_proceeds is not None and _feature_scalar(features.get("engineered_fundraising_to_revenue")) is None:
+            features["engineered_fundraising_to_revenue"] = round(net_proceeds / revenue, 4)
+        if ocf is not None and _feature_scalar(features.get("engineered_operating_cash_flow_margin")) is None:
+            features["engineered_operating_cash_flow_margin"] = round(ocf / revenue, 4)
+
+
 
 def generate_runtime_prediction(
     *,
@@ -151,8 +287,10 @@ def generate_runtime_prediction(
         bundle,
         sidecar_path=model_path.with_name("feature_contract.json"),
     )
+    working_features = dict(features or {})
+    _convert_native_to_hkd_mn(working_features)
     projection = project_model_inputs(
-        features or {},
+        working_features,
         contract,
         prediction_as_of=prediction_as_of,
         feature_units=feature_units,
@@ -162,7 +300,7 @@ def generate_runtime_prediction(
         detail = "；".join(projection.issues) or "模型输入不满足特征契约。"
         raise RuntimePredictionUnavailable(detail)
 
-    candidate_values = _feature_values(features)
+    candidate_values = _feature_values(working_features)
     candidate_feature_count = len(candidate_values)
     available_candidate_feature_count = sum(
         value is not None for value in candidate_values.values()
@@ -175,14 +313,44 @@ def generate_runtime_prediction(
 
     prediction_frame = predict_feature_rows(bundle, pd.DataFrame([values]))
     prediction_row = prediction_frame.iloc[0]
-    probability = float(prediction_row["predicted_probability"])
+    raw_probability = float(prediction_row["predicted_probability"])
+
+    # 市场环境调节
+    listing_date_raw = (
+        prediction_as_of
+        or (values.get("listing_date") or prediction_row.get("listing_date"))
+    )
+    daily_market_path = (
+        root / "data" / "processed" / "modeling" / "daily_market_sentiment.csv"
+    )
+    if (
+        isinstance(listing_date_raw, date)
+        and daily_market_path.is_file()
+    ):
+        market_regime = detect_market_regime(
+            str(daily_market_path), listing_date_raw
+        )
+        probability = adjust_probability(raw_probability, market_regime)
+    else:
+        market_regime = MarketRegimeResult(
+            regime="neutral",
+            label="市场数据不可用",
+            adjustment_factor=1.0,
+            market_return_60d_pct=None,
+            market_volatility_60d_pct=None,
+            market_return_20d_pct=None,
+            description="未提供listing_date或缺少daily_market_sentiment.csv",
+        )
+        probability = raw_probability
+
     predicted = bool(int(prediction_row["predicted_significant_drop_5d"]))
-    decision = str(
+    raw_decision = str(
         prediction_row.get(
             "predicted_decision",
             "high_risk" if predicted else "low_risk",
         )
     )
+    decision = raw_decision
     requires_review = bool(prediction_row.get("prediction_requires_review", False)) or (
         projection.status == "review_required"
     )
@@ -236,6 +404,31 @@ def generate_runtime_prediction(
         }
         warnings.append(recall_guard["note"])
 
+    # 四窗口预测 (h1/h20/h60) — 复用同一特征行，但用各窗口专用模型
+    horizon_predictions: dict[str, float] = {}
+    horizon_thresholds: dict[str, float] = {}
+    horizon_bundles: dict[str, dict[str, Any]] = {}
+    for horizon_name, horizon_key in [
+        ("h1", "unified_h1"),
+        ("h20", "unified_h20"),
+        ("h60", "unified_h60"),
+    ]:
+        horizon_model_path = root / "artifacts" / "models" / horizon_key / "model.joblib"
+        if horizon_model_path.is_file():
+            try:
+                hbundle = _load_bundle(str(horizon_model_path), horizon_model_path.stat().st_mtime_ns)
+                horizon_bundles[horizon_name] = hbundle
+                hframe = predict_feature_rows(hbundle, pd.DataFrame([values]))
+                hrow = hframe.iloc[0]
+                horizon_predictions[horizon_name] = float(hrow["predicted_probability"])
+                horizon_thresholds[horizon_name] = float(hbundle["threshold"])
+            except Exception:
+                horizon_predictions[horizon_name] = None
+                horizon_thresholds[horizon_name] = None
+        else:
+            horizon_predictions[horizon_name] = None
+            horizon_thresholds[horizon_name] = None
+
     payload = {
         "schema_version": "1.0",
         "prediction_type": "significant_drop_5d",
@@ -247,7 +440,30 @@ def generate_runtime_prediction(
         "model_name": str(bundle.get("model_name") or model_path.parent.name),
         "model_path": _display_path(model_path, project_root=root),
         "threshold": float(bundle["threshold"]),
+        "raw_probability": raw_probability,
         "probability": probability,
+        "probability_adjustment": market_regime.adjustment_factor,
+        "market_regime": {
+            "regime": market_regime.regime,
+            "label": market_regime.label,
+            "adjustment_factor": market_regime.adjustment_factor,
+            "market_return_60d_pct": market_regime.market_return_60d_pct,
+            "market_volatility_60d_pct": market_regime.market_volatility_60d_pct,
+            "market_return_20d_pct": market_regime.market_return_20d_pct,
+            "description": market_regime.description,
+        },
+        "horizon_predictions": {
+            "h1": horizon_predictions.get("h1"),
+            "h5": probability,
+            "h20": horizon_predictions.get("h20"),
+            "h60": horizon_predictions.get("h60"),
+        },
+        "horizon_thresholds": {
+            "h1": horizon_thresholds.get("h1"),
+            "h5": float(bundle["threshold"]),
+            "h20": horizon_thresholds.get("h20"),
+            "h60": horizon_thresholds.get("h60"),
+        },
         "predicted_significant_drop_5d": predicted,
         "decision": decision,
         "requires_review": requires_review,
@@ -270,6 +486,10 @@ def generate_runtime_prediction(
         "warnings": warnings,
         "disclaimer": "方向性风险预警，不构成投资建议。",
     }
+    payload = enrich_horizon_prediction_status(
+        project_root=root,
+        prediction=payload,
+    )
     destination = destination_path or report_path.with_name("prediction_5d.json")
     write_json(payload, destination)
     return payload, destination
@@ -283,6 +503,7 @@ def generate_runtime_prediction_from_feature_file(
     feature_path: Path,
     report_path: Path,
     prediction_variant: str,
+    prediction_as_of_fallback: date | None = None,
     model_path: Path | None = None,
     destination_path: Path | None = None,
 ) -> tuple[dict[str, Any], Path]:
@@ -297,10 +518,36 @@ def generate_runtime_prediction_from_feature_file(
         prediction_as_of = (
             date.fromisoformat(prediction_as_of_text)
             if prediction_as_of_text
-            else None
+            else prediction_as_of_fallback
         )
     except ValueError as exc:
         raise RuntimePredictionUnavailable("预测特征中的时点格式无效。") from exc
+    # 早期历史快照没有保存上市日期，因而也没有按上市日前窗口采集市场特征。
+    # 仅在启用日期回退时，从赛事加工数据即时补齐这些客观特征；不重跑PDF或Agent，
+    # 也不改写原始历史快照。
+    if not prediction_as_of_text and prediction_as_of is not None:
+        modeling_dir = project_root / "data" / "processed" / "modeling"
+        market_features = build_listing_pre_market_feature_snapshot(
+            modeling_dir / "daily_market_sentiment.csv",
+            listing_date=prediction_as_of,
+            windows=DEFAULT_MARKET_WINDOWS,
+        )
+        recent_ipo_features = build_recent_ipo_feature_snapshot(
+            project_root
+            / "data"
+            / "processed"
+            / "competition"
+            / "market_labels.csv",
+            listing_date=prediction_as_of,
+        )
+        raw_features = dict(raw_features)
+        raw_features.update(
+            {
+                name: feature.model_dump(mode="json")
+                for name, feature in {**market_features, **recent_ipo_features}.items()
+            }
+        )
+
     units = {
         name: str(value.get("unit"))
         for name, value in raw_features.items()
@@ -329,9 +576,9 @@ def generate_runtime_prediction_from_feature_file(
 
 __all__ = [
     "DEFAULT_MODEL_PATH",
-    "DEFAULT_BASE_MODEL_PATH",
     "DEFAULT_RECALL_GUARD_POLICY_PATH",
     "RuntimePredictionUnavailable",
+    "enrich_horizon_prediction_status",
     "generate_runtime_prediction",
     "generate_runtime_prediction_from_feature_file",
 ]

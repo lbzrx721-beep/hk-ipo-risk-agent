@@ -32,6 +32,17 @@ class AnalysisSummary(ReportModel):
     requires_human_review: bool = True
 
 
+class TextEmbellishmentAssessment(ReportModel):
+    """招股书披露语言与选择性叙述的独立分析结果。"""
+
+    level: Literal["low", "medium", "high", "critical"]
+    detected: bool
+    summary: str = Field(min_length=1)
+    evidence_ids: tuple[str, ...] = ()
+    assessed_by: Literal["business"] = "business"
+    debate_used: bool = False
+
+
 class RiskAnalysisReport(ReportModel):
     """可直接交给 API、界面和报告模块的第一阶段产物。"""
 
@@ -46,6 +57,7 @@ class RiskAnalysisReport(ReportModel):
     risk_findings: tuple[RiskFinding, ...]
     agent_traces: tuple[AgentTrace, ...]
     evidence_display_zh_hans: dict[str, str]
+    text_embellishment: TextEmbellishmentAssessment | None = None
 
     @model_validator(mode="after")
     def validate_references_and_counts(self) -> RiskAnalysisReport:
@@ -66,6 +78,13 @@ class RiskAnalysisReport(ReportModel):
             missing = set(finding.evidence_ids) - known_evidence
             if missing:
                 raise ValueError(f"finding references missing evidence: {sorted(missing)}")
+        if self.text_embellishment is not None:
+            missing = set(self.text_embellishment.evidence_ids) - known_evidence
+            if missing:
+                raise ValueError(
+                    "text embellishment assessment references missing evidence: "
+                    f"{sorted(missing)}"
+                )
 
         if set(self.evidence_display_zh_hans) != known_evidence:
             raise ValueError("simplified display quotes must cover every evidence")
@@ -88,6 +107,6 @@ __all__ = [
     "AnalysisSummary",
     "RiskAnalysisReport",
     "SourceDocument",
+    "TextEmbellishmentAssessment",
     "write_risk_report",
 ]
-

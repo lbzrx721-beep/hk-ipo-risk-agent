@@ -49,6 +49,8 @@ def _chunk(
 def _valid_response(source_id: str) -> RagExtractionResponse:
     fields = []
     numeric_financials = {
+        "fundamental_revenue_latest_native": 500.0,
+        "fundamental_operating_cash_flow_latest_native": 45.0,
         "fundamental_ending_cash_latest_native": 120.0,
         "fundamental_net_profit_latest_native": -20.0,
         "fundamental_research_development_latest_native": 30.0,
@@ -175,6 +177,26 @@ def test_extractor_uses_audited_lexical_fallback_when_vector_index_is_missing() 
 
     assert record["retrieval_mode"] == "lexical_anchor_fallback"
     assert retriever.search_called is False
+
+
+def test_database_connection_failure_does_not_block_lexical_fundamentals() -> None:
+    class BrokenRetriever(_UnavailableSemanticRetriever):
+        def activate_document(self, *_args: object, **_kwargs: object) -> bool:
+            raise ConnectionError("database offline")
+
+    for retriever in (None, BrokenRetriever()):
+        extractor = RagFundamentalExtractor(
+            retriever=retriever,  # type: ignore[arg-type]
+            provider=_MissingFieldsProvider(),  # type: ignore[arg-type]
+            system_prompt="test", retry_policy=RetryPolicy(max_retries=0),
+        )
+        record = extractor.extract(
+            manifest_row={"company_id": "00001", "company_name": "测试公司",
+                          "prospectus_date": "2024-01-01", "source_hash": "a" * 64},
+            document_id="doc-1", chunks=[_chunk(1, text="公司主要业务为测试服务。")],
+            existing_operating_cash_flow=None,
+        )
+        assert record["retrieval_mode"] == "lexical_anchor_fallback"
 
 
 def test_expand_hits_keeps_seed_neighbor_and_same_table() -> None:

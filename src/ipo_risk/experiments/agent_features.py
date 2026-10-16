@@ -18,7 +18,7 @@ from pathlib import Path
 from threading import Lock
 from time import perf_counter
 import traceback
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pandas as pd
 
@@ -427,6 +427,8 @@ def run_agent_feature_experiment(
     risk_scope_review_controllers: (Mapping[str, RiskScopeReviewController] | None) = None,
     llm_failure_recovery_controllers: (Mapping[str, LlmFailureRecoveryController] | None) = None,
     agent_company_concurrency: int | None = None,
+    reasoning_model: Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"] = "deepseek_flash",
+    agent_models: Mapping[str, str] | None = None,
 ) -> AgentFeatureExperimentResult:
     """并行预处理文档并受控并行运行公司Agent；每家公司独立落盘。"""
     root = project_root.resolve()
@@ -456,6 +458,8 @@ def run_agent_feature_experiment(
     status = _load_status(status_path, selected)
     status["queue_state"] = "running"
     status["pause_reason"] = None
+    status["agent_models"] = dict(agent_models or {})
+    status["model_assignment_locked"] = True
     status_lock = Lock()
 
     selected_by_folder = {str(row["company_folder"]): row for row in selected}
@@ -619,6 +623,8 @@ def run_agent_feature_experiment(
                 "project_root": root,
                 "min_findings": min_findings,
                 "progress_callback": events,
+                "reasoning_model": reasoning_model,
+                "agent_models": dict(agent_models) if agent_models is not None else None,
             }
             if controller is not None:
                 analyzer_kwargs["risk_scope_review_controller"] = controller

@@ -69,8 +69,26 @@ def build_listing_pre_market_feature_snapshot(
     if not source.is_file():
         raise FileNotFoundError(source)
     daily_market = pd.read_csv(source)
+    return build_market_feature_snapshot_from_daily_sentiment(
+        daily_market,
+        listing_date=listing_date,
+        windows=windows,
+        source_ref=source.as_posix(),
+    )
+
+
+def build_market_feature_snapshot_from_daily_sentiment(
+    daily_market: pd.DataFrame,
+    *,
+    listing_date: date,
+    windows: tuple[int, ...] = DEFAULT_MARKET_WINDOWS,
+    source_ref: str,
+) -> dict[str, FeatureValue]:
+    """从标准日度市场情绪表生成与训练一致的上市前特征。"""
+
     if "trade_date" not in daily_market:
         raise ValueError("daily market sentiment is missing trade_date")
+    daily_market = daily_market.copy()
     daily_market["trade_date"] = pd.to_datetime(
         daily_market["trade_date"], errors="coerce"
     ).dt.date
@@ -78,7 +96,7 @@ def build_listing_pre_market_feature_snapshot(
         daily_market,
         listing_date,
         windows=windows,
-        source_ref=source.as_posix(),
+        source_ref=source_ref,
     )
 
 
@@ -651,5 +669,6 @@ __all__ = [
     "build_competition_modeling_dataset",
     "build_daily_market_sentiment",
     "build_listing_pre_market_feature_snapshot",
+    "build_market_feature_snapshot_from_daily_sentiment",
     "build_recent_ipo_feature_snapshot",
 ]

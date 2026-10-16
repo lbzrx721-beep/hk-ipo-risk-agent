@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 from ipo_risk.agents.prompting import compose_prompt, prompt_audit, with_correction
 from ipo_risk.agents.usage import ModelPricing, ModelUsageLedger
 from ipo_risk.domain import AgentRole, RiskSeverity
+from ipo_risk.observability.trace import trace_step, wrap_chat_client
 from ipo_risk.retrieval.chunker import DocumentChunk
 from ipo_risk.retrieval.search import RiskRule
 
@@ -91,6 +92,7 @@ class OpenAICompatibleJsonChatProvider:
             from openai import OpenAI
 
             client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
+            client = wrap_chat_client(client, provider_name)
         self.model_name = model_name
         self.provider_name = provider_name
         self._client = client
@@ -105,6 +107,7 @@ class OpenAICompatibleJsonChatProvider:
         self._usage_ledger = usage_ledger
         self._pricing = pricing
 
+    @trace_step("json_response", inputs=("system_prompt", "user_prompt", "temperature", "max_output_tokens"))
     def complete_json(
         self,
         *,

@@ -272,6 +272,7 @@ class FindingReview(ContractModel):
     decision: ReviewDecision
     reviewer: NonEmptyStr
     comment: NonEmptyStr | None = None
+    manual_override: bool = False
     verification: FindingVerification
     resulting_finding: RiskFinding
     created_at: datetime = Field(default_factory=utc_now)
@@ -294,8 +295,14 @@ class FindingReview(ContractModel):
             raise ValueError("resulting finding status does not match review decision")
         if self.decision is not ReviewDecision.CONFIRMED and self.comment is None:
             raise ValueError("rejected and edited reviews require a comment")
-        if self.decision is not ReviewDecision.REJECTED and not self.verification.passed:
+        if (
+            self.decision is not ReviewDecision.REJECTED
+            and not self.verification.passed
+            and not self.manual_override
+        ):
             raise ValueError("a finding cannot be verified when deterministic checks fail")
+        if self.manual_override and self.decision is ReviewDecision.REJECTED:
+            raise ValueError("a rejected review cannot be a manual verification override")
         return self
 
 

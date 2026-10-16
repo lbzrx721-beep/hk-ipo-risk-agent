@@ -11,6 +11,7 @@ from opencc import OpenCC
 from rank_bm25 import BM25Okapi
 
 from ipo_risk.retrieval.chunker import DocumentChunk
+from ipo_risk.observability.trace import retrieval_outputs, trace_step
 
 
 jieba.setLogLevel(logging.WARNING)
@@ -54,6 +55,7 @@ class BM25Retriever:
         tokenized = [tokenize_text(chunk.text) or ["__empty__"] for chunk in chunks]
         self._index = BM25Okapi(tokenized)
 
+    @trace_step("bm25.search", run_type="retriever", inputs=("query", "top_k"), process_outputs=retrieval_outputs)
     def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
         """返回按 BM25 分数降序排列的候选段落。"""
         if top_k < 1:

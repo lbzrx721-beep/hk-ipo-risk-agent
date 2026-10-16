@@ -25,7 +25,6 @@ from ipo_risk.modeling.dataset import (
     build_recent_ipo_feature_snapshot,
 )
 from ipo_risk.modeling.features import build_prelisting_feature_snapshot
-from ipo_risk.modeling.stable_agent_model import add_derived_prediction_features
 from ipo_risk.modeling.structured_fundamentals import (
     extract_structured_fundamental_snapshot,
 )
@@ -273,6 +272,8 @@ def collect_prelisting_candidates(
     chunks_path: Path | None = None,
     listing_date: date | None = None,
     supplemental_features: Mapping[str, FeatureValue] | None = None,
+    market_features_override: Mapping[str, FeatureValue] | None = None,
+    use_local_market_features: bool = True,
     progress_callback: FeatureCollectionProgress | None = None,
 ) -> CandidateFeatureSnapshot:
     """收集本次公司可用的宽候选池，不提前限制为模型的18个字段。"""
@@ -312,7 +313,9 @@ def collect_prelisting_candidates(
     )
     _notify_feature_progress(progress_callback, 3, "文档结构与证据统计已汇总")
 
-    if listing_date is not None:
+    if market_features_override:
+        _merge(features, market_features_override)
+    elif listing_date is not None and use_local_market_features:
         modeling_dir = project_root / "data" / "processed" / "modeling"
         try:
             _merge(
@@ -339,8 +342,10 @@ def collect_prelisting_candidates(
             )
         except Exception as exc:  # noqa: BLE001
             warnings.append(f"recent_ipo_context_failed:{exc}")
-    else:
+    elif listing_date is None:
         warnings.append("listing_date_missing:market_context_not_collected")
+    else:
+        warnings.append("local_market_stale:external_market_context_unavailable")
     _notify_feature_progress(progress_callback, 4, "上市前市场与近期IPO环境已汇总")
 
     _add_derived_candidates(features, prediction_as_of=prediction_as_of)
@@ -833,6 +838,176 @@ def _json_scalar(value: Any) -> Any:
     return value
 
 
+def add_derived_agent_semantic_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """把规模相关计数转换为可跨公司的风险结构比例。"""
+    required = {
+        "agent_finding_count",
+        "agent_unique_risk_type_count",
+        "agent_severity_low_count",
+        "agent_severity_medium_count",
+        "agent_severity_high_count",
+        "agent_severity_critical_count",
+        "agent_role_finance_finding_count",
+        "agent_role_legal_finding_count",
+        "agent_role_business_finding_count",
+        "agent_role_market_finding_count",
+        "agent_uncertainty_count",
+    }
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"cannot derive Agent semantic features; missing: {missing}")
+    result = frame.copy()
+    finding_count = pd.to_numeric(result["agent_finding_count"], errors="coerce").fillna(0)
+    safe_count = finding_count.replace(0, np.nan)
+    high = pd.to_numeric(result["agent_severity_high_count"], errors="coerce").fillna(0)
+    critical = pd.to_numeric(result["agent_severity_critical_count"], errors="coerce").fillna(0)
+    medium = pd.to_numeric(result["agent_severity_medium_count"], errors="coerce").fillna(0)
+    low = pd.to_numeric(result["agent_severity_low_count"], errors="coerce").fillna(0)
+    result["agent_severity_weighted_mean"] = (
+        (low + 2 * medium + 3 * high + 4 * critical).div(safe_count).fillna(0)
+    )
+    result["agent_high_or_critical_share"] = (high + critical).div(safe_count).fillna(0)
+    result["agent_unique_risk_type_share"] = (
+        pd.to_numeric(result["agent_unique_risk_type_count"], errors="coerce")
+        .fillna(0)
+        .div(safe_count)
+        .fillna(0)
+    )
+    for role in ("finance", "legal", "business", "market"):
+        result[f"agent_role_{role}_share"] = (
+            pd.to_numeric(result[f"agent_role_{role}_finding_count"], errors="coerce")
+            .fillna(0)
+            .div(safe_count)
+            .fillna(0)
+        )
+    result["agent_uncertainty_share"] = (
+        pd.to_numeric(result["agent_uncertainty_count"], errors="coerce")
+        .fillna(0)
+        .div(safe_count)
+        .fillna(0)
+    )
+    return result
+
+
+def add_derived_prediction_features(frame: pd.DataFrame) -> pd.DataFrame:
+    """基于现有上市前字段构造可解释比率、缺失标志及跨域交互。"""
+    agent_ratio_sources = {
+        "agent_finding_count",
+        "agent_unique_risk_type_count",
+        "agent_severity_low_count",
+        "agent_severity_medium_count",
+        "agent_severity_high_count",
+        "agent_severity_critical_count",
+        "agent_role_finance_finding_count",
+        "agent_role_legal_finding_count",
+        "agent_role_business_finding_count",
+        "agent_role_market_finding_count",
+        "agent_uncertainty_count",
+    }
+    result = (
+        add_derived_agent_semantic_features(frame)
+        if agent_ratio_sources.issubset(frame.columns)
+        else frame.copy()
+    )
+
+    def numeric(name: str) -> pd.Series:
+        if name not in result:
+            return pd.Series(np.nan, index=result.index, dtype=float)
+        return pd.to_numeric(result[name], errors="coerce")
+
+    def safe_positive_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
+        valid = denominator.gt(0) & numerator.notna()
+        values = pd.Series(np.nan, index=result.index, dtype=float)
+        values.loc[valid] = numerator.loc[valid] / denominator.loc[valid]
+        return values.replace([np.inf, -np.inf], np.nan)
+
+    revenue = numeric("fundamental_revenue_latest_hkd_mn")
+    market_cap = numeric("offering_market_cap_mid_hkd")
+    net_proceeds = numeric("offering_net_proceeds_hkd")
+    operating_cash_flow = numeric("fundamental_operating_cash_flow_latest_hkd_mn")
+    ending_cash_native_mn = numeric("fundamental_ending_cash_latest_native")
+    fx_to_hkd = numeric("fundamental_fx_to_hkd")
+    revenue_cagr = numeric("fundamental_revenue_cagr_3y_pct")
+    share_ratio = numeric("offering_share_ratio_pct")
+
+    for name, values in {
+        "revenue_hkd_mn": revenue,
+        "market_cap_hkd_mn": market_cap,
+        "net_proceeds_hkd_mn": net_proceeds,
+    }.items():
+        result[f"engineered_log_{name}"] = np.log1p(values.clip(lower=0))
+    result["engineered_price_to_sales"] = safe_positive_ratio(market_cap, revenue)
+    result["engineered_fundraising_to_revenue"] = safe_positive_ratio(net_proceeds, revenue)
+    result["engineered_net_proceeds_to_market_cap"] = safe_positive_ratio(net_proceeds, market_cap)
+    result["engineered_operating_cash_flow_margin"] = (
+        operating_cash_flow.div(revenue.where(revenue.abs().gt(1e-9)))
+        .replace([np.inf, -np.inf], np.nan)
+        .clip(-10, 10)
+    )
+    cash_outflow = (-operating_cash_flow).where(operating_cash_flow.lt(0))
+    result["engineered_cash_replenishment_ratio"] = safe_positive_ratio(
+        net_proceeds, cash_outflow
+    ).clip(upper=100)
+    ending_cash_hkd_mn = ending_cash_native_mn.mul(fx_to_hkd)
+    runway_valid = ending_cash_hkd_mn.ge(0) & operating_cash_flow.lt(0)
+    result["engineered_cash_runway_months"] = np.nan
+    result.loc[runway_valid, "engineered_cash_runway_months"] = (
+        ending_cash_hkd_mn.loc[runway_valid]
+        .div(operating_cash_flow.loc[runway_valid].abs())
+        .mul(12.0)
+        .clip(upper=1_200)
+    )
+    positive_growth = revenue_cagr.where(revenue_cagr.gt(0))
+    result["engineered_growth_adjusted_price_to_sales"] = (
+        result["engineered_price_to_sales"]
+        .div(positive_growth)
+        .replace([np.inf, -np.inf], np.nan)
+        .clip(upper=100)
+    )
+    result["engineered_zero_or_negative_revenue"] = revenue.le(0).fillna(False).astype(int)
+    result["engineered_negative_operating_cash_flow"] = (
+        operating_cash_flow.lt(0).fillna(False).astype(int)
+    )
+    for source, target in (
+        (revenue_cagr, "missing_revenue_cagr_3y"),
+        (share_ratio, "missing_offering_share_ratio"),
+        (revenue, "missing_revenue_latest"),
+        (operating_cash_flow, "missing_operating_cash_flow_latest"),
+        (net_proceeds, "missing_net_proceeds"),
+    ):
+        result[target] = source.isna().astype(int)
+
+    financial_share = numeric("agent_semantic_family_financial_share").fillna(0)
+    market_share = numeric("agent_semantic_family_market_liquidity_share").fillna(0)
+    governance_share = numeric("agent_semantic_family_governance_share").fillna(0)
+    related_party = numeric("agent_semantic_has_related_party_transaction").fillna(0)
+    free_float = numeric("agent_semantic_has_free_float_liquidity").fillna(0)
+    cash_burn = numeric("agent_semantic_has_cash_burn_liquidity").fillna(0)
+    supported = numeric("agent_semantic_supported_finding_count").fillna(0)
+    finding_count = numeric("agent_finding_count").fillna(0)
+    high_share = numeric("agent_high_or_critical_share").fillna(0)
+    distinct = numeric("agent_semantic_distinct_subtype_count").fillna(0)
+    volatility_20d = numeric("market_volatility_20d_pct").fillna(0)
+    result["agent_interaction_financial_risk_negative_cash_flow"] = (
+        financial_share * result["engineered_negative_operating_cash_flow"]
+    )
+    result["agent_interaction_market_liquidity_volatility_20d"] = market_share * volatility_20d
+    result["agent_interaction_related_party_governance"] = related_party * governance_share
+    result["agent_interaction_free_float_low_issue_ratio"] = free_float * (
+        1.0 - share_ratio.fillna(0).clip(0, 100).div(100)
+    )
+    result["agent_interaction_cash_burn_fundraising_intensity"] = cash_burn * result[
+        "engineered_fundraising_to_revenue"
+    ].fillna(0).clip(0, 100)
+    result["agent_interaction_supported_high_severity_share"] = (
+        supported.div(finding_count.replace(0, np.nan)).fillna(0) * high_share
+    )
+    result["agent_interaction_semantic_risk_density"] = distinct.div(
+        finding_count.replace(0, np.nan)
+    ).fillna(0)
+    return result
+
+
 __all__ = [
     "CANDIDATE_SCHEMA_VERSION",
     "CONTRACT_SCHEMA_VERSION",
@@ -846,4 +1021,5 @@ __all__ = [
     "feature_unit",
     "load_model_feature_contract",
     "project_model_inputs",
+    "add_derived_prediction_features",
 ]

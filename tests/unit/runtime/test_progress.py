@@ -14,6 +14,19 @@ def _event(stage: str, detail: str) -> AnalysisProgressEvent:
     )
 
 
+def test_bm25_skip_is_terminal_and_profile_payload_is_not_activity_text() -> None:
+    snapshot = build_analysis_progress_snapshot((
+        _event("embedding_skipped", "使用BM25检索，无需向量化"),
+        _event("agent:discovery:started", "正在提取画像"),
+        _event("company_review_plan", '{"profile":{"facts":[]}}'),
+        _event("agent:discovery:completed", "画像与审查问题已就绪"),
+    ), status="running")
+    assert snapshot["background_tasks"]["embedding"]["state"] == "skipped"
+    assert snapshot["agents"]["discovery"]["state"] == "complete"
+    assert "profile" not in snapshot["current_activity"]
+    assert not any('"facts"' in event for event in snapshot["events"])
+
+
 def test_discovery_batch_scans_refresh_one_dynamic_line_without_flooding_history() -> None:
     events = (
         _event("agents_started", "开始运行专业Agent与决策Agent。"),
@@ -157,6 +170,51 @@ def test_progress_snapshot_is_monotonic_when_a_later_event_reports_less_progress
     assert full["max_percent"] >= earlier["max_percent"]
     assert full["agents"]["discovery"]["progress"] == 56
     assert full["agents"]["finance"]["progress"] == 22
+
+
+def test_specialist_returns_to_complete_after_successful_debate_response() -> None:
+    events = (
+        _event("agent:finance:started", "财务Agent开始分析。"),
+        _event("agent:finance:completed", "财务Agent首轮分析完成。"),
+        _event("agent:finance:debate_retrieval", "财务Agent开始定向补证。"),
+        _event("agent:finance:delta", '{"assessments":['),
+        _event("agent:finance:debate_response", "财务Agent已提交补证回应。"),
+    )
+
+    snapshot = build_analysis_progress_snapshot(events, status="running")
+
+    assert snapshot["agents"]["finance"]["state"] == "complete"
+    assert snapshot["agents"]["finance"]["progress"] == 100
+    assert snapshot["agents"]["finance"]["progress_text"] == "定向补证完成"
+
+
+def test_specialist_returns_to_complete_when_debate_fails() -> None:
+    events = (
+        _event("agent:legal:completed", "法律Agent首轮分析完成。"),
+        _event("agent:legal:debate_retrieval", "法律Agent开始定向补证。"),
+        _event("agent:legal:delta", '{"assessments":['),
+        _event("agent:legal:debate_failed", "本轮补证未完成，保留首轮结论。"),
+    )
+
+    snapshot = build_analysis_progress_snapshot(events, status="running")
+
+    assert snapshot["agents"]["legal"]["state"] == "complete"
+    assert snapshot["agents"]["legal"]["progress"] == 100
+    assert snapshot["agents"]["legal"]["progress_text"] == "补证已结束，保留首轮结论"
+
+
+def test_decision_completion_closes_stale_specialist_state_from_legacy_debate_events() -> None:
+    events = (
+        _event("agent:finance:completed", "财务Agent首轮分析完成。"),
+        _event("agent:finance:delta", '{"assessments":['),
+        _event("agent:decision:debate_completed", "决策Agent已完成第二轮裁决。"),
+        _event("agent:decision:completed", "决策Agent完成最终整合。"),
+    )
+
+    snapshot = build_analysis_progress_snapshot(events, status="completed")
+
+    assert snapshot["agents"]["finance"]["state"] == "complete"
+    assert snapshot["agents"]["finance"]["progress_text"] == "定向补证已结束"
 
 
 def test_pdf_parsing_reports_page_progress_without_flooding_event_history() -> None:

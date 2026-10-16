@@ -22,6 +22,7 @@ class SearchPlanningProvider:
 
     def __init__(self) -> None:
         self.user_prompt = ""
+        self.calls = 0
 
     def complete_json(
         self,
@@ -32,6 +33,7 @@ class SearchPlanningProvider:
         max_output_tokens: int,
         on_text_delta: object | None = None,
     ) -> dict[str, object]:
+        self.calls += 1
         self.user_prompt = user_prompt
         return {
             "role": "finance",
@@ -64,3 +66,21 @@ def test_deepseek_role_agent_generates_queries_without_fixed_search_terms() -> N
     assert "现金消耗与融资依赖" in provider.user_prompt
     assert "FIXED_QUERY_MUST_NOT_DRIVE_AGENT_PLAN" not in provider.user_prompt
     assert "FIXED_ANCHOR" not in provider.user_prompt
+
+
+def test_role_search_planner_uses_the_model_assigned_to_that_agent() -> None:
+    default_provider = SearchPlanningProvider()
+    finance_provider = SearchPlanningProvider()
+    finance_provider.model_name = "deepseek-v4-pro"
+    planner = DeepSeekRoleSearchPlanner(
+        default_provider,
+        temperature=0.1,
+        max_output_tokens=2048,
+        providers_by_role={AgentRole.FINANCE: finance_provider},
+    )
+
+    planner.plan([_rule()])
+
+    assert default_provider.calls == 0
+    assert finance_provider.calls == 1
+    assert planner.model_name_for(AgentRole.FINANCE) == "deepseek-v4-pro"

@@ -290,7 +290,13 @@ def _extract_borderless_artifacts(
     ]
     if len(left_aligned_groups) < 2:
         return []
-    column_count = Counter(len(group) for group in left_aligned_groups).most_common(1)[0][0]
+    width_counts = Counter(len(group) for group in left_aligned_groups)
+    column_count = width_counts.most_common(1)[0][0]
+    widest = max(width_counts)
+    # 财务表的“附注”列通常只在少数行有值，导致多数行比真实列数少一列。
+    # 至少两行出现该可选列时保留它，避免第一期数值被误当附注并丢失。
+    if widest == column_count + 1 and width_counts[widest] >= 2:
+        column_count = widest
     if column_count < 3:
         return []
     core_groups = [
@@ -514,32 +520,57 @@ def _borderless_headers(
             re.IGNORECASE,
         )
     ]
+    label_blocks = [
+        block
+        for block in header_blocks
+        if re.fullmatch(r"(?:附註|附注|Note)", _normalize_cell(block.text), re.IGNORECASE)
+    ]
     headers = ["项目"]
     for anchor in anchors[1:]:
-        year_block = _nearest_header_block(anchor, year_blocks)
+        unit = _nearest_header_value(anchor, unit_blocks, max_distance=30.0)
+        # 多级表头中的年份可能跨两个“金额/%”子列，因此允许在存在单位
+        # 表头时匹配较远的年份；没有单位的可选“附注”列不会误领年份。
+        year_block = _nearest_header_block(
+            anchor,
+            year_blocks,
+            max_distance=None if unit else 28.0,
+        )
         year = _normalize_cell(year_block.text) if year_block is not None else ""
         period = (
-            _nearest_header_value(_block_center(year_block), period_blocks)
+            _nearest_header_value(_block_center(year_block), period_blocks, max_distance=90.0)
             if year_block is not None
             else ""
         )
-        unit = _nearest_header_value(anchor, unit_blocks)
         parts = tuple(part for part in (period, year, unit) if part)
-        headers.append(" / ".join(parts) if parts else f"列{len(headers) + 1}")
+        label = _nearest_header_value(anchor, label_blocks, max_distance=30.0)
+        headers.append(" / ".join(parts) if parts else label or f"列{len(headers) + 1}")
     return tuple(headers)
 
 
-def _nearest_header_value(anchor: float, blocks: Sequence[Any]) -> str:
-    block = _nearest_header_block(anchor, blocks)
+def _nearest_header_value(
+    anchor: float,
+    blocks: Sequence[Any],
+    *,
+    max_distance: float | None = None,
+) -> str:
+    block = _nearest_header_block(anchor, blocks, max_distance=max_distance)
     if block is None:
         return ""
     return _normalize_cell(block.text)
 
 
-def _nearest_header_block(anchor: float, blocks: Sequence[Any]) -> Any | None:
+def _nearest_header_block(
+    anchor: float,
+    blocks: Sequence[Any],
+    *,
+    max_distance: float | None = None,
+) -> Any | None:
     if not blocks:
         return None
-    return min(blocks, key=lambda item: abs(_block_center(item) - anchor))
+    nearest = min(blocks, key=lambda item: abs(_block_center(item) - anchor))
+    if max_distance is not None and abs(_block_center(nearest) - anchor) > max_distance:
+        return None
+    return nearest
 
 
 def _is_structural_header(value: object) -> bool:
@@ -586,13 +617,31 @@ def _looks_like_table_of_contents(
 ) -> bool:
     """识别目录中的点线页码布局，避免把它当成无边框业务表格。"""
     candidate_rect = fitz.Rect(candidate.bbox)
-    values = [
-        _normalize_cell(block.text)
+    candidate_blocks = [
+        block
         for block in text_blocks
         if _block_center_in_rect(block, candidate_rect)
         and _normalize_cell(block.text)
     ]
+    values = [_normalize_cell(block.text) for block in candidate_blocks]
     if len(values) < 6:
+        return False
+    # 财务附注也常使用“项目名称 + 点线 + 多期数值”。若存在多行密集
+    # 数值列，应按业务表格处理；目录通常只有标题与一个页码列。
+    dense_numeric_rows = 0
+    for group in _group_blocks_by_y(candidate_blocks):
+        numeric_cells = sum(
+            bool(
+                re.fullmatch(
+                    r"(?:[-–—]|\(?[+-]?[\d,.]+\)?%?)",
+                    _normalize_cell(block.text),
+                )
+            )
+            for block in group
+        )
+        if len(group) >= 4 and numeric_cells >= 3:
+            dense_numeric_rows += 1
+    if dense_numeric_rows >= 3:
         return False
     dotted_lines = sum(
         value.count(".") >= 8

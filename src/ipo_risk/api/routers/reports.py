@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
+import re
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException
@@ -14,6 +16,7 @@ from ipo_risk.reviewing import (
     IncompleteReviewError,
     ReviewBlockedError,
     ReviewService,
+    build_evidence_table_preview,
 )
 from ipo_risk.retrying import FindingRetryService, finding_has_retryable_failure
 
@@ -22,6 +25,7 @@ class FindingReviewRequest(BaseModel):
     decision: ReviewDecision
     reviewer: str = Field(min_length=1)
     comment: str | None = None
+    manual_override: bool = False
     title: str | None = None
     severity: str | None = None
     claim: str | None = None
@@ -54,6 +58,42 @@ def create_reports_router(
     def list_runs() -> dict[str, object]:
         return {"runs": [summary.__dict__ for summary in service.list_runs()]}
 
+    @router.get("/runs/{run_id}/audit-materials")
+    def audit_materials(run_id: str) -> dict[str, object]:
+        try:
+            return service.audit_materials(run_id)
+        except (KeyError, FileNotFoundError) as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @router.delete("/runs/{run_id}")
+    def delete_run(run_id: str) -> dict[str, object]:
+        active_jobs = [
+            job
+            for job in retry_service.list_jobs(run_id)
+            if job.get("state") in {"queued", "running"}
+        ]
+        if active_jobs:
+            raise HTTPException(
+                status_code=409,
+                detail="该分析正在重新处理，请等待任务结束后再删除。",
+            )
+        try:
+            result = service.delete_analysis_run(run_id)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(
+                status_code=500,
+                detail=f"分析记录删除失败，文件已保留：{exc}",
+            ) from exc
+        return {
+            "deleted": True,
+            "run_id": result.run_id,
+            "recovery_available": result.recovery_path is not None,
+            "moved_file_count": len(result.moved_paths),
+            "shared_file_count": len(result.skipped_paths),
+        }
+
     @router.post("/runs/{run_id}/prediction")
     def rerun_historical_prediction(
         run_id: str,
@@ -83,10 +123,20 @@ def create_reports_router(
             detail = service.get_finding_detail(run_id, finding_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        evidence_payloads: list[dict[str, object]] = []
+        for item in detail.evidences:
+            payload = item.model_dump(mode="json")
+            preview = build_evidence_table_preview(
+                item,
+                project_root=service.project_root,
+            )
+            if preview is not None:
+                payload["display_table"] = preview
+            evidence_payloads.append(payload)
         return {
             "finding": detail.finding.model_dump(mode="json"),
             "retryable_failure": finding_has_retryable_failure(detail.finding),
-            "evidences": [item.model_dump(mode="json") for item in detail.evidences],
+            "evidences": evidence_payloads,
             "verification": detail.verification.model_dump(mode="json"),
             "reviews": [item.model_dump(mode="json") for item in detail.reviews],
             "agent_traces": [item.model_dump(mode="json") for item in detail.agent_traces],
@@ -173,6 +223,7 @@ def create_reports_router(
                 reviewer=request.reviewer.strip(),
                 comment=request.comment.strip() if request.comment else None,
                 edited_finding=edited_finding,
+                manual_override=request.manual_override,
             )
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
@@ -180,7 +231,7 @@ def create_reports_router(
             raise HTTPException(
                 status_code=409,
                 detail={
-                    "message": "确定性核验未通过，可驳回或先补充证据。",
+                    "message": "该风险未通过原文一致性校验，不能直接确认；请重新分析该风险或选择驳回。",
                     "verification": exc.verification.model_dump(mode="json"),
                 },
             ) from exc
@@ -198,24 +249,38 @@ def create_reports_router(
                 detail={"message": "仍有风险未复核。", "finding_ids": exc.finding_ids},
             ) from exc
         except (KeyError, FileNotFoundError) as exc:
-            raise HTTPException(status_code=404, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "message": "该历史记录对应的分析文件已不存在，请重新分析该公司后再导出报告。",
+                    "reason": str(exc),
+                },
+            ) from exc
         return {
             "files": {
                 "pdf": f"/api/reports/runs/{run_id}/downloads/pdf",
+                "audit_pdf": f"/api/reports/runs/{run_id}/downloads/audit_pdf",
                 "json": f"/api/reports/runs/{run_id}/downloads/json",
                 "audit": f"/api/reports/runs/{run_id}/downloads/audit",
+                "prediction_csv": f"/api/reports/runs/{run_id}/downloads/prediction_csv",
+                "trace_json": f"/api/reports/runs/{run_id}/downloads/trace_json",
+                "evidence_json": f"/api/reports/runs/{run_id}/downloads/evidence_json",
             },
             "paths": {
                 "pdf": str(bundle.pdf_path),
+                "audit_pdf": str(bundle.audit_pdf_path),
                 "json": str(bundle.json_path),
                 "audit": str(bundle.audit_path),
+                "prediction_csv": str(bundle.prediction_path),
+                "trace_json": str(bundle.trace_path),
+                "evidence_json": str(bundle.evidence_path),
             },
         }
 
     @router.get("/runs/{run_id}/downloads/{kind}")
     def download_run(
         run_id: str,
-        kind: Literal["pdf", "json", "audit"],
+        kind: Literal["pdf", "audit_pdf", "json", "audit", "prediction_csv", "trace_json", "evidence_json"],
     ) -> FileResponse:
         reference = service.repository.get_verified_report_path(run_id)
         if not reference:
@@ -223,18 +288,64 @@ def create_reports_router(
         verified_json = _resolve_project_file(service.project_root, reference)
         names = {
             "pdf": "verified_risk_report.pdf",
+            "audit_pdf": "analysis_audit_report.pdf",
             "json": "verified_risk_analysis.json",
             "audit": "analysis_audit_bundle.json",
+            "prediction_csv": "final_prediction_results.csv",
+            "trace_json": "agent_reasoning_log.json",
+            "evidence_json": "key_evidence_snippets.json",
         }
         target = verified_json.with_name(names[kind])
+        if kind in {"pdf", "audit_pdf"}:
+            pattern = (
+                "*_IPO风险穿透预警报告_*.pdf"
+                if kind == "pdf"
+                else "*_IPO分析完整审计报告_*.pdf"
+            )
+            matches = sorted(
+                verified_json.parent.glob(pattern),
+                key=lambda path: path.stat().st_mtime_ns,
+                reverse=True,
+            )
+            if matches:
+                target = matches[0]
         if not target.is_file():
             raise HTTPException(status_code=404, detail="导出文件不存在。")
         media_types = {
             "pdf": "application/pdf",
+            "audit_pdf": "application/pdf",
             "json": "application/json",
             "audit": "application/json",
+            "prediction_csv": "text/csv",
+            "trace_json": "application/json",
+            "evidence_json": "application/json",
         }
-        return FileResponse(target, media_type=media_types[kind], filename=target.name)
+        # 生成带股票代码和公司名的下载文件名
+        run = service.repository.get_analysis_run(run_id)
+        company_id = run.company_id if run else "unknown"
+        company = service.repository.get_company(company_id) if run else None
+        company_name = company.company_name_zh if company else company_id
+        kind_labels = {
+            "pdf": "正式风险报告",
+            "audit_pdf": "完整审计报告",
+            "json": "精简风险分析",
+            "audit": "完整审计包",
+            "prediction_csv": "最终预测结果",
+            "trace_json": "多智能体推理日志",
+            "evidence_json": "关键证据片段",
+        }
+        safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', "_", company_name).strip(" ._")
+        safe_name = safe_name or company_id
+        pdf_labels = {
+            "pdf": "IPO风险穿透预警报告",
+            "audit_pdf": "IPO分析完整审计报告",
+        }
+        download_name = (
+            f"{company_id}_{safe_name}_{pdf_labels[kind]}_{date.today():%Y%m%d}.pdf"
+            if kind in {"pdf", "audit_pdf"}
+            else f"{company_id}_{safe_name}_{kind_labels[kind]}.{target.suffix.lstrip('.')}"
+        )
+        return FileResponse(target, media_type=media_types[kind], filename=download_name)
 
     @router.get("/runs/{run_id}/evidence/{evidence_id}/image")
     def evidence_image(run_id: str, evidence_id: str) -> FileResponse:

@@ -6,7 +6,7 @@ import asyncio
 from collections.abc import AsyncIterator
 import json
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
@@ -17,6 +17,7 @@ from ipo_risk.agents.intervention import (
     LlmFailureRecoveryDecision,
     RiskScopeReviewDecision,
 )
+from ipo_risk.agents.model_routing import normalize_agent_models
 from ipo_risk.api.batch_service import BatchWorkspaceRegistry
 from ipo_risk.api.schemas import CatalogBatchRequest, PredictionRequest, UploadMetadata
 from ipo_risk.runtime.batch_analysis_job import BatchUploadSpec
@@ -36,6 +37,18 @@ def _parse_metadata(raw: str) -> list[UploadMetadata]:
         return _UPLOAD_METADATA_ADAPTER.validate_json(raw)
     except ValidationError as exc:
         raise HTTPException(status_code=422, detail=exc.errors()) from exc
+
+
+def _parse_agent_models(raw: str | None, legacy_model: str) -> dict[str, str]:
+    if not raw:
+        return dict(normalize_agent_models(None, legacy_reasoning_model=legacy_model))
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError("Agent模型分配不是有效JSON。") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("Agent模型分配必须是角色到模型的对象。")
+    return dict(normalize_agent_models(payload, legacy_reasoning_model=legacy_model))
 
 
 async def _read_uploads(files: list[UploadFile]) -> list[tuple[str, bytes]]:
@@ -78,6 +91,7 @@ def _build_upload_specs(
                 company_id=item.company_id,
                 company_name=item.company_name,
                 document_date=item.document_date,
+                listing_date=item.listing_date or suggestion.listing_date,
                 source_hash=suggestion.source_hash,
                 page_count=suggestion.page_count,
             )
@@ -135,6 +149,11 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
                             if suggestion.document_date
                             else None
                         ),
+                        "listing_date": (
+                            suggestion.listing_date.isoformat()
+                            if suggestion.listing_date
+                            else None
+                        ),
                         "source": suggestion.source,
                         "page_count": suggestion.page_count,
                         "source_hash": suggestion.source_hash,
@@ -155,6 +174,8 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
     async def create_batch(
         files: Annotated[list[UploadFile], File()],
         metadata: Annotated[str, Form()],
+        reasoning_model: Annotated[Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"], Form()] = "deepseek_flash",
+        agent_models: Annotated[str | None, Form()] = None,
     ) -> dict[str, Any]:
         payloads = await _read_uploads(files)
         parsed = _parse_metadata(metadata)
@@ -165,7 +186,11 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
                 payloads,
                 parsed,
             )
-            workspace = registry.create_from_uploads(specs)
+            workspace = registry.create_from_uploads(
+                specs,
+                reasoning_model=reasoning_model,
+                agent_models=_parse_agent_models(agent_models, reasoning_model),
+            )
             return workspace.snapshot_payload()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -192,6 +217,8 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
         batch_id: str,
         files: Annotated[list[UploadFile], File()],
         metadata: Annotated[str, Form()],
+        reasoning_model: Annotated[Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"], Form()] = "deepseek_flash",
+        agent_models: Annotated[str | None, Form()] = None,
     ) -> dict[str, Any]:
         workspace = registry.require(batch_id)
         payloads = await _read_uploads(files)
@@ -203,7 +230,11 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
                 payloads,
                 parsed,
             )
-            workspace.append_uploads(specs)
+            workspace.append_uploads(
+                specs,
+                reasoning_model=reasoning_model,
+                agent_models=_parse_agent_models(agent_models, reasoning_model),
+            )
             return workspace.snapshot_payload()
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -282,7 +313,7 @@ def create_analysis_router(registry: BatchWorkspaceRegistry) -> APIRouter:
                     last_snapshot = serialized
                 for company in snapshot["companies"]:
                     company_key = str(company["company_key"])
-                    recent = workspace.events_payload(company_key)[-120:]
+                    recent = workspace.events_payload(company_key)
                     event_json = json.dumps(recent, ensure_ascii=False, default=str)
                     if event_json != last_events.get(company_key, ""):
                         yield _sse(

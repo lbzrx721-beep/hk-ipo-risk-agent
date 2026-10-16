@@ -18,6 +18,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { AnalysisWorkspace } from "@/features/workspace/analysis-workspace";
 import { PredictionsWorkspace } from "@/features/predictions/predictions-workspace";
 import { ReportsWorkspace } from "@/features/reports/reports-workspace";
+import { LandingPage } from "@/features/landing/landing-page";
 import { batchAction, checkApiHealth, connectBatchStream, getBatch } from "@/api";
 import {
   ACTIVE_BATCH_KEY,
@@ -29,6 +30,7 @@ import {
 import type { AnalysisEvent, BatchSnapshot, PendingUpload } from "@/types";
 
 function App() {
+  const [isWelcome, setIsWelcome] = useState(() => window.location.pathname === "/");
   const [view, setView] = useState<AppView>(() => viewFromPath(window.location.pathname));
   const [visitedViews, setVisitedViews] = useState<Set<AppView>>(() => new Set([
     "workspace",
@@ -62,6 +64,12 @@ function App() {
     setRouteFindingId(findingId ?? null);
     setVisitedViews((current) => new Set(current).add(nextView));
     setView(nextView);
+    setIsWelcome(false);
+  }, []);
+
+  const showWelcome = useCallback(() => {
+    window.history.pushState({}, "", "/");
+    setIsWelcome(true);
   }, []);
 
   const updateRouteSelection = useCallback((nextView: AppView, runId?: string | null, findingId?: string | null) => {
@@ -84,12 +92,11 @@ function App() {
   }, [updateRouteSelection]);
 
   useEffect(() => {
-    if (window.location.pathname === "/") {
-      applyRoute("workspace", null, null, true);
-    }
     const onPopState = () => {
+      const welcome = window.location.pathname === "/";
       const nextView = viewFromPath(window.location.pathname);
       const search = new URLSearchParams(window.location.search);
+      setIsWelcome(welcome);
       setView(nextView);
       setVisitedViews((current) => new Set(current).add(nextView));
       setRouteRunId(search.get("run_id"));
@@ -152,7 +159,7 @@ function App() {
     [eventsByCompany, selected],
   );
   const visibleEvents = useMemo(
-    () => selectedEvents.filter((event) => !event.stage.endsWith(":delta")).slice(-40).reverse(),
+    () => selectedEvents.filter((event) => !event.stage.endsWith(":delta")),
     [selectedEvents],
   );
 
@@ -179,12 +186,20 @@ function App() {
 
   const serviceAvailable = serviceStatus === "online";
 
+  if (isWelcome) {
+    return (
+      <TooltipProvider>
+        <LandingPage onEnter={() => applyRoute("workspace")} />
+      </TooltipProvider>
+    );
+  }
+
   return (
     <TooltipProvider>
       <div className="min-h-screen bg-background text-foreground">
         <header className="sticky top-0 z-40 border-b border-border/60 bg-background/85 backdrop-blur-xl">
           <div className="mx-auto flex h-16 w-full max-w-[1920px] items-center gap-4 px-4 lg:px-6 2xl:px-8">
-            <div className="flex min-w-0 flex-1 items-center gap-3">
+            <button type="button" className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={showWelcome} aria-label="返回系统首页">
               <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-primary/30 bg-primary/10 text-primary shadow-sm">
                 <ShieldCheck className="size-5" />
               </span>
@@ -192,14 +207,14 @@ function App() {
                 <strong className="block truncate text-sm">IPO 风险操作系统</strong>
                 <span className="hidden text-[10px] uppercase tracking-[0.18em] text-muted-foreground sm:block">Agentic Intelligence Workspace</span>
               </div>
-            </div>
+            </button>
 
             <nav className="flex rounded-xl border bg-card/70 p-1" aria-label="主导航">
               <Button variant={view === "workspace" ? "secondary" : "ghost"} size="sm" onClick={() => applyRoute("workspace")}>
                 <LayoutDashboard data-icon="inline-start" />分析工作台
               </Button>
               <Button variant={view === "predictions" ? "secondary" : "ghost"} size="sm" onClick={() => applyRoute("predictions", selected?.run_id)}>
-                <ChartNoAxesCombined data-icon="inline-start" />五日预测
+                <ChartNoAxesCombined data-icon="inline-start" />风险预测
               </Button>
               <Button variant={view === "results" ? "secondary" : "ghost"} size="sm" onClick={() => applyRoute("results", selected?.run_id)}>
                 <FileCheck2 data-icon="inline-start" />结果与复核
@@ -282,6 +297,7 @@ function App() {
             <div hidden={view !== "results"}>
             <div className="mx-auto w-full max-w-[1920px] px-4 py-6 lg:px-6 2xl:px-8">
               <ReportsWorkspace
+                active={view === "results"}
                 serviceAvailable={serviceAvailable}
                 initialRunId={routeRunId}
                 initialFindingId={routeFindingId}

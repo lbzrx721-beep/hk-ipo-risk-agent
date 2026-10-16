@@ -161,3 +161,17 @@ risks:
     required_keywords: ["依賴"]
     claim: 核验公司的收入或业务发展是否高度依赖少数核心产品或服务，以及替代产品和收入来源是否充足。
     max_evidence: 2
+
+  - id: disclosure_embellishment
+    name: 招股书文本粉饰与选择性披露
+    owner: business
+    severity: medium
+    evidence_fields: [promotional_language, quantitative_support, adverse_disclosure, period_consistency]
+    query: 行业领先 显著优势 强劲增长 广阔前景 风险因素 不利影响 历史业绩
+    query_variants:
+      - 宣传性表述 绝对化表述 缺少量化依据 选择性披露 有利期间
+      - 业务概览 正面描述 风险因素 亏损 现金流 客户集中 对照
+      - 快速增长 市场领导者 核心优势 重大不确定性 可能无法
+    required_keywords: ["風險"]
+    claim: 核验招股书是否使用大量宣传性、绝对化或模糊表述弱化重大不利事实，是否存在正面叙述缺少量化支撑、选择有利期间或与风险章节及财务披露明显不一致的情况。
+    max_evidence: 6

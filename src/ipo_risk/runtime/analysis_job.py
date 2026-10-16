@@ -30,6 +30,10 @@ AnalysisJobStatus = Literal[
     "failed",
 ]
 
+_PROGRESS_SNAPSHOT_STAGES = frozenset(
+    {"parsing_progress", "embedding_progress", "rag_features_progress", "features_progress"}
+)
+
 
 class UploadService(Protocol):
     project_root: Path
@@ -112,6 +116,15 @@ class AnalysisJob:
             occurred_at=datetime.now().astimezone(),
         )
         with self._lock:
+            if stage in _PROGRESS_SNAPSHOT_STAGES:
+                stream_key = f"progress|{stage}"
+                existing_index = self._delta_event_indexes.get(stream_key)
+                if existing_index is not None:
+                    self._events[existing_index] = event
+                    return
+                self._delta_event_indexes[stream_key] = len(self._events)
+                self._events.append(event)
+                return
             if stage.endswith(":prompt"):
                 role_prefix = stage.rsplit(":", maxsplit=1)[0] + ":delta|"
                 for key in tuple(self._delta_event_indexes):

@@ -628,6 +628,279 @@ class AcceptingOpenDecisionAnalyzer:
         )
 
 
+class DebateEmbeddingProvider:
+    model_name = "debate-semantic"
+    dimensions = 2
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return [
+            [1.0, 0.0] if "反证条款" in text else [0.0, 1.0]
+            for text in texts
+        ]
+
+
+class TwoRoundDecisionAnalyzer:
+    provider_name = "deepseek"
+    model_name = "deepseek-v4-pro"
+    prompt_version = "decision-adjudication-v4"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def adjudicate(self, proposals: list[object]) -> DecisionBatch:
+        self.calls += 1
+        if self.calls == 1:
+            proposal = proposals[0]
+            analyzed = proposal.analyzed_risk
+            return DecisionBatch(
+                decisions=(
+                    DecisionVerdict(
+                        risk_type=analyzed.rule.id,
+                        accepted=True,
+                        claim=analyzed.analysis.claim,
+                        severity=analyzed.analysis.severity,
+                        confidence=0.62,
+                        evidence_chunk_ids=analyzed.analysis.evidence_chunk_ids,
+                        uncertainty="缓释条款尚未完成对照。",
+                        rationale="需要法律Agent检索反证条款后再作终局判断。",
+                        source_proposal_ids=(proposal.proposal_id,),
+                        needs_debate=True,
+                        challenge="现有结论是否忽略已经生效的终止或缓释条款？",
+                        challenge_role=AgentRole.LEGAL,
+                        challenge_queries=("反证条款 终止 缓释 已生效",),
+                    ),
+                )
+            )
+        debate = next(proposal for proposal in proposals if proposal.proposal_id.startswith("P-debate"))
+        analyzed = debate.analyzed_risk
+        return DecisionBatch(
+            decisions=(
+                DecisionVerdict(
+                    risk_type=analyzed.rule.id,
+                    accepted=True,
+                    claim="补证显示相关风险仍存在，但已受到终止条款缓释。",
+                    severity=RiskSeverity.MEDIUM,
+                    confidence=0.84,
+                    evidence_chunk_ids=analyzed.analysis.evidence_chunk_ids,
+                    uncertainty="结论仅适用于招股书披露的条款状态。",
+                    rationale="法律Agent补充的反证条款支持收窄结论并下调严重程度。",
+                    source_proposal_ids=(debate.proposal_id,),
+                ),
+            )
+        )
+
+
+def test_decision_challenge_triggers_targeted_retrieval_and_second_round() -> None:
+    original = _chunk("C-ORIGINAL", "现金消耗持续增加，相关融资风险仍然存在。")
+    rebuttal = _chunk("C-REBUTTAL", "反证条款：相关义务已设置终止和缓释安排。")
+    rule = _rule("cash_burn", AgentRole.FINANCE, "现金消耗")
+    analyzer = TwoRoundDecisionAnalyzer()
+    engine = GroundedAnalysisEngine(
+        [original, rebuttal],
+        [rule],
+        embedding_provider=DebateEmbeddingProvider(),
+        evidence_analyzer=OwnerAwareAnalyzer(),
+        lexical_top_k=4,
+        semantic_top_k=4,
+        rerank_top_k=1,
+    )
+    events: list[tuple[str, str]] = []
+
+    result = MultiAgentOrchestrator(
+        engine,
+        [rule],
+        decision_analyzer=analyzer,
+    ).run(
+        run_id="RUN-DEBATE",
+        source_ref="prospectus.pdf",
+        progress_callback=lambda stage, detail: events.append((stage, detail)),
+    )
+
+    assert analyzer.calls == 2
+    assert result.decisions[0].analysis.severity is RiskSeverity.MEDIUM
+    assert result.decisions[0].analysis.evidence_chunk_ids == ("C-REBUTTAL",)
+    assert any(proposal.proposal_id.startswith("P-debate-1-legal") for proposal in result.proposals)
+    stages = [stage for stage, _detail in events]
+    assert "agent:decision:debate_requested" in stages
+    assert "agent:legal:debate_retrieval" in stages
+    assert "agent:legal:debate_response" in stages
+    assert "agent:decision:debate_completed" in stages
+    debate_event = next(detail for stage, detail in events if stage == "debate_record")
+    assert '"risk_name":"cash_burn"' in debate_event
+    decision_trace = next(trace for trace in result.traces if trace.agent is AgentRole.DECISION)
+    debate_call = next(
+        call for call in decision_trace.tool_calls
+        if call.tool_name == "risk_debate_verification"
+    )
+    assert debate_call.output["challenge_role"] == "legal"
+    assert debate_call.output["status"] == "completed"
+    assert debate_call.output["recalled_evidence_count"] == 1
+    assert debate_call.output["new_evidence_count"] == 1
+
+
+class SelectiveDebateDecisionAnalyzer(TwoRoundDecisionAnalyzer):
+    def adjudicate(self, proposals: list[object]) -> DecisionBatch:
+        self.calls += 1
+        if self.calls == 1:
+            verdicts: list[DecisionVerdict] = []
+            for proposal in proposals:
+                analyzed = proposal.analyzed_risk
+                debate = analyzed.rule.id == "cash_burn"
+                verdicts.append(
+                    DecisionVerdict(
+                        risk_type=analyzed.rule.id,
+                        accepted=True,
+                        claim=analyzed.analysis.claim,
+                        severity=analyzed.analysis.severity,
+                        confidence=analyzed.analysis.confidence,
+                        evidence_chunk_ids=analyzed.analysis.evidence_chunk_ids,
+                        uncertainty=analyzed.analysis.uncertainty,
+                        rationale=(
+                            "现金消耗风险需要补证。"
+                            if debate
+                            else "现有证据已经支持结论，无需参与辩论。"
+                        ),
+                        source_proposal_ids=(proposal.proposal_id,),
+                        needs_debate=debate,
+                        challenge=("是否存在缓释安排？" if debate else ""),
+                        challenge_role=(AgentRole.LEGAL if debate else None),
+                        challenge_queries=(("反证条款 缓释",) if debate else ()),
+                    )
+                )
+            return DecisionBatch(decisions=tuple(verdicts))
+        debate = next(proposal for proposal in proposals if proposal.proposal_id.startswith("P-debate"))
+        analyzed = debate.analyzed_risk
+        return DecisionBatch(
+            decisions=(
+                DecisionVerdict(
+                    risk_type=analyzed.rule.id,
+                    accepted=True,
+                    claim="现金消耗风险经补证后已收窄。",
+                    severity=RiskSeverity.MEDIUM,
+                    confidence=0.84,
+                    evidence_chunk_ids=analyzed.analysis.evidence_chunk_ids,
+                    uncertainty="结论以补证披露为限。",
+                    rationale="仅替换存在歧义的现金消耗风险。",
+                    source_proposal_ids=(debate.proposal_id,),
+                ),
+            )
+        )
+
+
+def test_targeted_debate_replaces_only_challenged_risk() -> None:
+    rules = [
+        _rule("cash_burn", AgentRole.FINANCE, "现金消耗"),
+        _rule("customer_concentration", AgentRole.BUSINESS, "客户集中"),
+    ]
+    engine = GroundedAnalysisEngine(
+        [
+            _chunk("C-CASH", "公司经营活动现金流持续流出，现金消耗持续增加并形成显著融资压力。"),
+            _chunk("C-STABLE", "公司前五大客户收入占比较高，客户集中程度持续上升且风险明确。"),
+            _chunk("C-MITIGATION", "反证条款显示现金消耗风险已经设置后续融资及明确缓释安排。"),
+        ],
+        rules,
+        embedding_provider=DebateEmbeddingProvider(),
+        evidence_analyzer=OwnerAwareAnalyzer(),
+        lexical_top_k=5,
+        semantic_top_k=5,
+        rerank_top_k=2,
+    )
+
+    analyzer = SelectiveDebateDecisionAnalyzer()
+    result = MultiAgentOrchestrator(
+        engine,
+        rules,
+        decision_analyzer=analyzer,
+    ).run(run_id="RUN-SELECTIVE-DEBATE", source_ref="prospectus.pdf")
+
+    decisions = {decision.risk_type: decision for decision in result.decisions}
+    assert set(decisions) == {"cash_burn", "customer_concentration"}
+    assert decisions["cash_burn"].analysis.claim == "现金消耗风险经补证后已收窄。", (
+        analyzer.calls,
+        decisions["cash_burn"],
+        result.conflicts,
+    )
+    assert decisions["customer_concentration"].analysis.claim == (
+        "business agent identified customer_concentration."
+    )
+
+
+class MaterialReviewDecisionAnalyzer(TwoRoundDecisionAnalyzer):
+    def adjudicate(self, proposals: list[object]) -> DecisionBatch:
+        self.calls += 1
+        if self.calls == 1:
+            proposal = proposals[0]
+            analyzed = proposal.analyzed_risk
+            return DecisionBatch(
+                decisions=(
+                    DecisionVerdict(
+                        risk_type=analyzed.rule.id,
+                        accepted=True,
+                        claim=analyzed.analysis.claim,
+                        severity=RiskSeverity.HIGH,
+                        confidence=0.78,
+                        evidence_chunk_ids=analyzed.analysis.evidence_chunk_ids,
+                        uncertainty="尚需检查招股书是否披露缓释或期后变化。",
+                        rationale="现有证据支持重大风险，但第一轮未主动提出辩论。",
+                        source_proposal_ids=(proposal.proposal_id,),
+                    ),
+                )
+            )
+        debate = next(proposal for proposal in proposals if proposal.proposal_id.startswith("P-debate"))
+        analyzed = debate.analyzed_risk
+        return DecisionBatch(
+            decisions=(
+                DecisionVerdict(
+                    risk_type=analyzed.rule.id,
+                    accepted=True,
+                    claim=analyzed.analysis.claim,
+                    severity=RiskSeverity.MEDIUM,
+                    confidence=0.86,
+                    evidence_chunk_ids=analyzed.analysis.evidence_chunk_ids,
+                    uncertainty="结论以补证检索范围为限。",
+                    rationale="对抗性补证发现缓释安排，因此下调严重程度。",
+                    source_proposal_ids=(debate.proposal_id,),
+                ),
+            )
+        )
+
+
+def test_high_risk_without_model_challenge_gets_limited_material_review() -> None:
+    original = _chunk("C-MATERIAL", "现金消耗持续增加，融资风险重大。")
+    rebuttal = _chunk("C-MITIGATION", "反证条款：现金消耗风险已设置缓释及期后融资安排。")
+    rule = _rule("cash_burn", AgentRole.FINANCE, "现金消耗")
+    analyzer = MaterialReviewDecisionAnalyzer()
+    engine = GroundedAnalysisEngine(
+        [original, rebuttal],
+        [rule],
+        embedding_provider=DebateEmbeddingProvider(),
+        evidence_analyzer=OwnerAwareAnalyzer(),
+        lexical_top_k=4,
+        semantic_top_k=4,
+        rerank_top_k=1,
+    )
+    events: list[tuple[str, str]] = []
+
+    MultiAgentOrchestrator(
+        engine,
+        [rule],
+        decision_analyzer=analyzer,
+        material_debate_max_items=1,
+    ).run(
+        run_id="RUN-MATERIAL-REVIEW",
+        source_ref="prospectus.pdf",
+        progress_callback=lambda stage, detail: events.append((stage, detail)),
+    )
+
+    assert analyzer.calls == 2
+    debate_event = next(detail for stage, detail in events if stage == "debate_record")
+    assert '"trigger":"material_risk_review"' in debate_event
+    assert any(
+        stage == "agent:decision:debate_requested" and "对抗性复核" in detail
+        for stage, detail in events
+    )
+
+
 class RecordingDynamicScopePlanner:
     provider_name = "deepseek"
     model_name = "deepseek-v4-flash"

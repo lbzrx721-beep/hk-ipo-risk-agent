@@ -38,6 +38,7 @@ _AGENT_STEP_LABELS = {
     "skipped": "未启用",
 }
 _STAGE_LABELS = {
+    "analysis_model_selected": "分析模型路由",
     "upload_started": "资料登记",
     "upload_completed": "资料登记",
     "parsing_started": "PDF解析",
@@ -217,6 +218,15 @@ class AnalysisProgressState:
         agent["progress"] = bounded
         agent["progress_text"] = text
 
+    def _close_stale_debate_specialists(self) -> None:
+        """兼容旧事件：决策已收尾时关闭被补证流误留在运行态的专业Agent。"""
+        for role in _PARALLEL_AGENT_ROLES:
+            agent = self._agents[role]
+            if agent["state"] == "running" and _as_int(agent["progress"]) >= 100:
+                agent["state"] = "complete"
+                agent["progress_text"] = "定向补证已结束"
+                agent["message"] = "决策Agent已完成本轮辩论，专业结论已收尾。"
+
     def _append_event(
         self,
         label: str,
@@ -368,6 +378,15 @@ class AnalysisProgressState:
         elif action == "completed":
             agent["state"] = "complete"
             self._set_agent_progress(role, 100, "任务完成")
+        elif action == "debate_retrieval":
+            agent["state"] = "running"
+            self._set_agent_progress(role, 100, "正在执行定向补证")
+        elif action == "debate_response":
+            agent["state"] = "complete"
+            self._set_agent_progress(role, 100, "定向补证完成")
+        elif action == "debate_failed":
+            agent["state"] = "complete"
+            self._set_agent_progress(role, 100, "补证已结束，保留首轮结论")
         elif action == "failed":
             agent["state"] = "failed"
             self._set_agent_progress(role, 100, "已降级继续分析")
@@ -493,6 +512,10 @@ class AnalysisProgressState:
                     return
                 agent["sequence_current"] = current
         self._update_funnel(stage, detail)
+        if stage == "company_review_plan":
+            # The structured payload is stored in the event log; never put raw
+            # profile JSON into the user-facing activity line.
+            return
         if stage == "embedding_join_wait":
             self._current_activity = f"证据检索准备 · {detail}"
             self._append_event("证据检索准备", detail, occurred_at)
@@ -523,6 +546,9 @@ class AnalysisProgressState:
             elif stage == "embedding_fallback":
                 embedding["state"] = "degraded"
                 embedding["progress"] = 100
+            elif stage == "embedding_skipped":
+                embedding["state"] = "skipped"
+                embedding["progress"] = 100
             embedding["message"] = detail
             if stage not in {"embedding_progress"}:
                 self._append_event(
@@ -533,6 +559,8 @@ class AnalysisProgressState:
             return
         if len(parts) == 3 and parts[0] == "agent":
             role, action = parts[1], parts[2]
+            if role == "decision" and action in {"debate_completed", "debate_failed", "completed"}:
+                self._close_stale_debate_specialists()
             if action == "risk_catalog":
                 self._update_agent(role, action, detail)
                 return

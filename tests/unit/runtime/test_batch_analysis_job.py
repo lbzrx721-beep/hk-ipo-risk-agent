@@ -7,6 +7,8 @@ from threading import Event, Thread
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from ipo_risk.agents.intervention import (
     LlmFailureRecoveryRequest,
     RiskScopeCandidate,
@@ -108,6 +110,33 @@ def test_batch_job_coalesces_incremental_model_stream_events(
     assert len(first) == 1
     assert first[0].detail == ('[[batch:1/1]]{"assessments":[{"risk_type":"cash"}]}')
     assert second == first
+
+
+def test_batch_job_keeps_only_latest_embedding_progress_event(tmp_path: Path) -> None:
+    job = BatchAnalysisJob(
+        project_root=tmp_path,
+        experiment_name="progress-event-test",
+        companies=(_company(),),
+    )
+    event_path = job.experiment_dir / "events" / "00001.jsonl"
+    event_path.parent.mkdir(parents=True)
+    timestamp = datetime.now(timezone.utc).isoformat()
+    event_path.write_text(
+        "\n".join(
+            json.dumps(
+                {"timestamp": timestamp, "stage": "embedding_progress", "detail": detail},
+                ensure_ascii=False,
+            )
+            for detail in ("预向量化 [32/100] · 32%", "预向量化 [100/100] · 100%")
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    events = job.events_for("00001_测试公司")
+
+    assert len(events) == 1
+    assert events[0].detail == "预向量化 [100/100] · 100%"
 
 
 def test_batch_job_retry_failed_resets_interrupted_companies(
@@ -354,6 +383,7 @@ def test_uploaded_batch_prepares_documents_before_running_experiment(
         experiment_name="upload-test",
         uploads=(upload,),
         runner=runner,
+        reasoning_model="kimi",
     )
 
     job._run()
@@ -370,6 +400,17 @@ def test_uploaded_batch_prepares_documents_before_running_experiment(
     runner_kwargs = captured["runner_kwargs"]
     assert runner_kwargs["company_folders"] == ("00001_上传公司",)
     assert runner_kwargs["company_rows"][0]["source_hash"] == "a" * 64
+    assert runner_kwargs["reasoning_model"] == "kimi"
+    assert runner_kwargs["agent_models"] == {
+        "discovery": "kimi",
+        "finance": "deepseek_flash",
+        "legal": "deepseek_flash",
+        "business": "deepseek_flash",
+        "market": "deepseek_flash",
+        "decision": "kimi",
+    }
+    with pytest.raises(TypeError):
+        job.agent_models["decision"] = "deepseek_flash"  # type: ignore[index]
 
 
 def test_uploaded_batch_exposes_registration_progress_immediately(

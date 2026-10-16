@@ -31,7 +31,7 @@ export const stateLabel: Record<string, string> = {
 };
 
 export const roleMeta = [
-  ["discovery", "风险发现 Agent", "定位原文并形成候选风险"],
+  ["discovery", "风险发现 Agent", "检索公司画像并规划专业审查问题"],
   ["finance", "财务 Agent", "财务质量、现金流与集中度"],
   ["legal", "法律 Agent", "条款、诉讼、合规与权利义务"],
   ["business", "业务 Agent", "商业模式、客户与供应链"],
@@ -143,6 +143,14 @@ function durableEvent(event: AnalysisEvent): boolean {
 }
 
 function eventIdentity(event: AnalysisEvent): string {
+  if ([
+    "parsing_progress",
+    "embedding_progress",
+    "rag_features_progress",
+    "features_progress",
+  ].includes(event.stage)) {
+    return `progress:${event.stage}`;
+  }
   const marker = /^\[\[(?:batch|consolidation):\d+\/\d+]]/.exec(event.detail)?.[0];
   const isModelStream = event.stage.endsWith(":delta") || event.stage.endsWith(":structured");
   if (isModelStream) {
@@ -167,7 +175,7 @@ export function mergeAnalysisEvents(
     (left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime(),
   );
   const durable = ordered.filter(durableEvent);
-  const transient = ordered.filter((event) => !durableEvent(event)).slice(-240);
+  const transient = ordered.filter((event) => !durableEvent(event));
   return [...durable, ...transient].sort(
     (left, right) => new Date(left.occurred_at).getTime() - new Date(right.occurred_at).getTime(),
   );
@@ -236,9 +244,10 @@ export function formatDuration(seconds?: number | null): string {
 }
 
 export function downloadFromUrl(url: string): void {
-  const anchor = document.createElement("a");
-  anchor.href = url;
-  anchor.target = "_blank";
-  anchor.rel = "noreferrer";
-  anchor.click();
+  // 用 iframe 触发下载，避免浏览器拦截多个连续下载
+  const iframe = document.createElement("iframe");
+  iframe.style.display = "none";
+  iframe.src = url;
+  document.body.appendChild(iframe);
+  setTimeout(() => document.body.removeChild(iframe), 2000);
 }

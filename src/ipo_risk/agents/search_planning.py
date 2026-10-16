@@ -80,6 +80,7 @@ class DeepSeekRoleSearchPlanner:
         max_output_tokens: int,
         system_prompt: str | None = None,
         role_prompts: Mapping[AgentRole, str] | None = None,
+        providers_by_role: Mapping[AgentRole, JsonChatProvider] | None = None,
         prompt_version: str | None = None,
         progress_callback: Callable[[str, str], None] | None = None,
     ) -> None:
@@ -89,6 +90,7 @@ class DeepSeekRoleSearchPlanner:
         self._max_output_tokens = max_output_tokens
         self._progress_callback = progress_callback
         self._role_prompts = dict(role_prompts or {})
+        self._providers_by_role = dict(providers_by_role or {})
         if prompt_version is not None:
             self.prompt_version = prompt_version
         self._system_prompt = system_prompt or (
@@ -104,6 +106,9 @@ class DeepSeekRoleSearchPlanner:
         """返回该角色搜索规划实际使用的提示词审计信息。"""
         prompt = compose_prompt(self._system_prompt, self._role_prompts.get(role))
         return prompt_audit(prompt=prompt, version=self.prompt_version)
+
+    def model_name_for(self, role: AgentRole) -> str:
+        return self._providers_by_role.get(role, self.provider).model_name
 
     def plan(
         self,
@@ -177,7 +182,8 @@ class DeepSeekRoleSearchPlanner:
         }
         if on_text_delta is not None:
             request["on_text_delta"] = on_text_delta
-        plan = RoleSearchPlan.model_validate(self.provider.complete_json(**request))
+        provider = self._providers_by_role.get(role, self.provider)
+        plan = RoleSearchPlan.model_validate(provider.complete_json(**request))
         if plan.role is not role:
             raise ValueError("search planner returned another Agent role")
         expected = {rule.id for rule in selected_rules}

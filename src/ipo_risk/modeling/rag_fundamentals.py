@@ -23,6 +23,8 @@ from ipo_risk.storage.files import read_jsonl, write_json, write_jsonl
 
 
 RAG_FUNDAMENTAL_FEATURE_NAMES = (
+    "fundamental_revenue_latest_native",
+    "fundamental_operating_cash_flow_latest_native",
     "fundamental_ending_cash_latest_native",
     "fundamental_net_profit_latest_native",
     "fundamental_research_development_latest_native",
@@ -40,6 +42,8 @@ RAG_FUNDAMENTAL_FEATURE_NAMES = (
 )
 
 _MODEL_FIELD_NAMES = (
+    "fundamental_revenue_latest_native",
+    "fundamental_operating_cash_flow_latest_native",
     "fundamental_ending_cash_latest_native",
     "fundamental_net_profit_latest_native",
     "fundamental_research_development_latest_native",
@@ -57,6 +61,8 @@ _MODEL_FIELD_NAMES = (
 )
 
 _FINANCIAL_FIELDS = {
+    "fundamental_revenue_latest_native",
+    "fundamental_operating_cash_flow_latest_native",
     "fundamental_ending_cash_latest_native",
     "fundamental_net_profit_latest_native",
     "fundamental_research_development_latest_native",
@@ -110,6 +116,15 @@ _EXPLICIT_R_AND_D_ZERO_PATTERNS = tuple(
 )
 
 _QUERY_SPECS: dict[str, str] = {
+    "fundamental_revenue_latest_native": (
+        "最近完整财政年度 合并损益表 收入 总收入 收益 "
+        "revenue total revenue"
+    ),
+    "fundamental_operating_cash_flow_latest_native": (
+        "最近完整财政年度 合并现金流量表 经营活动现金净额 "
+        "经营活动所得现金净额 经营业务所得现金净额 "
+        "net cash from operating activities operating cash flow"
+    ),
     "fundamental_ending_cash_latest_native": (
         "最近完整财政年度 合并财务状况表 现金及现金等价物 银行结余及现金 "
         "cash and cash equivalents 年末余额 千元"
@@ -155,6 +170,14 @@ _QUERY_SPECS: dict[str, str] = {
 }
 
 _FIELD_ANCHORS: dict[str, tuple[str, ...]] = {
+    "fundamental_revenue_latest_native": (
+        "收入", "總收入", "总收入", "收益", "Revenue", "Total revenue",
+    ),
+    "fundamental_operating_cash_flow_latest_native": (
+        "經營活動所得", "经营活动所得", "經營業務所得", "经营业务所得",
+        "net cash from operating activities", "operating cash flow",
+        "經營活動現金流入", "经营活动现金流入",
+    ),
     "fundamental_ending_cash_latest_native": (
         "現金及現金等價物",
         "现金及现金等价物",
@@ -302,7 +325,7 @@ class RagFundamentalExtractor:
     def __init__(
         self,
         *,
-        retriever: PgVectorRetriever,
+        retriever: PgVectorRetriever | None,
         provider: JsonChatProvider,
         system_prompt: str,
         max_output_tokens: int = 12_000,
@@ -338,11 +361,16 @@ class RagFundamentalExtractor:
     ) -> dict[str, Any]:
         if not chunks:
             raise ValueError("RAG extraction requires parsed document chunks")
-        semantic_ready = self.retriever.activate_document(
-            document_id,
-            source_hash=str(manifest_row["source_hash"]),
-            expected_chunk_count=len(chunks),
-        )
+        semantic_ready = False
+        if self.retriever is not None:
+            try:
+                semantic_ready = self.retriever.activate_document(
+                    document_id,
+                    source_hash=str(manifest_row["source_hash"]),
+                    expected_chunk_count=len(chunks),
+                )
+            except Exception:  # noqa: BLE001 - database outage must not disable lexical RAG
+                semantic_ready = False
         retrieval_mode = (
             "hybrid_semantic_lexical"
             if semantic_ready
@@ -356,11 +384,15 @@ class RagFundamentalExtractor:
         for index, (group, query) in enumerate(_QUERY_SPECS.items(), start=1):
             if progress is not None:
                 progress(f"RAG检索 {index}/{len(_QUERY_SPECS)}：{group}")
-            semantic_hits = (
-                self.retriever.search(query, top_k=self.semantic_top_k)
-                if semantic_ready
-                else []
-            )
+            semantic_hits = []
+            if semantic_ready and self.retriever is not None:
+                try:
+                    semantic_hits = self.retriever.search(query, top_k=self.semantic_top_k)
+                except Exception:  # noqa: BLE001
+                    semantic_ready = False
+                    retrieval_mode = "lexical_anchor_fallback"
+                    if progress is not None:
+                        progress("语义检索中断，后续字段继续使用BM25与字段锚点检索")
             lexical_hits = lexical.search(query, top_k=self.lexical_top_k)
             anchor_hits = _anchor_search(chunks, field_name=group, top_k=8)
             selected = _expand_hits(
@@ -691,6 +723,31 @@ def _anchor_search(
                 marker in text for marker in ("包括", "定義", "定义", "comprise")
             ):
                 score -= 250.0
+        elif field_name == "fundamental_revenue_latest_native":
+            if any(
+                marker in text
+                for marker in ("收入", "Revenue", "總收入", "总收入", "收益合計", "收益合计")
+            ):
+                score += 800.0
+            if any(marker in text for marker in ("綜合收益", "综合收益", "損益", "损益")):
+                score += 500.0
+            if any(marker in text for marker in _APPENDIX_MARKERS):
+                score -= 450.0
+            if _SEPARATE_APPENDIX_SUBJECT.search(text):
+                score -= 1400.0
+        elif field_name == "fundamental_operating_cash_flow_latest_native":
+            if any(
+                marker in text
+                for marker in (
+                    "經營活動", "经营活动", "operating activities",
+                    "現金流量表", "现金流量表", "cash flow statement",
+                )
+            ):
+                score += 800.0
+            if any(marker in text for marker in ("增加╱", "减少）净额", "net cash")):
+                score += 300.0
+            if any(marker in text for marker in _APPENDIX_MARKERS):
+                score -= 350.0
         elif field_name == "fundamental_net_profit_latest_native":
             if any(marker in text for marker in _ISSUER_FINANCIAL_MARKERS):
                 score += 900.0
@@ -1083,6 +1140,8 @@ def _build_company_record(
         )
 
     for name in (
+        "fundamental_revenue_latest_native",
+        "fundamental_operating_cash_flow_latest_native",
         "fundamental_ending_cash_latest_native",
         "fundamental_net_profit_latest_native",
         "fundamental_research_development_latest_native",

@@ -8,6 +8,57 @@ import pytest
 from ipo_risk.runtime import prediction as prediction_module
 
 
+def test_enrich_horizon_prediction_status_recovers_thresholds_for_legacy_record(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    for model_name in ("unified_h1", "unified_h20", "unified_h60"):
+        model_path = tmp_path / "artifacts" / "models" / model_name / "model.joblib"
+        model_path.parent.mkdir(parents=True, exist_ok=True)
+        model_path.write_bytes(b"test")
+
+    thresholds = {
+        "unified_h1": 0.10,
+        "unified_h20": 0.30,
+        "unified_h60": 0.40,
+    }
+    monkeypatch.setattr(
+        prediction_module,
+        "_load_bundle",
+        lambda path, _modified_ns: {
+            "threshold": thresholds[Path(path).parent.name],
+        },
+    )
+
+    enriched = prediction_module.enrich_horizon_prediction_status(
+        project_root=tmp_path,
+        prediction={
+            "probability": 0.20,
+            "threshold": 0.25,
+            "predicted_significant_drop_5d": False,
+            "horizon_predictions": {
+                "h1": 0.12,
+                "h5": 0.20,
+                "h20": 0.29,
+                "h60": 0.45,
+            },
+        },
+    )
+
+    assert enriched["horizon_alerts"] == {
+        "h1": True,
+        "h5": False,
+        "h20": False,
+        "h60": True,
+    }
+    assert enriched["horizon_thresholds"] == {
+        "h1": 0.10,
+        "h5": 0.25,
+        "h20": 0.30,
+        "h60": 0.40,
+    }
+
+
 def test_runtime_prediction_uses_current_agent_features_and_drops_targets(
     tmp_path: Path,
     monkeypatch,
@@ -57,6 +108,7 @@ def test_runtime_prediction_uses_current_agent_features_and_drops_targets(
     assert destination.is_file()
     assert payload["probability"] == 0.72
     assert payload["decision"] == "high_risk"
+    assert payload["horizon_alerts"]["h5"] is True
     assert payload["feature_snapshot"]["agent_score"] == 3.0
     assert payload["used_historical_feature_backfill"] is False
     assert payload["matched_reference_features"] is False

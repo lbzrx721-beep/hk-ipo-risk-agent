@@ -29,11 +29,94 @@ _CHINESE_DATE_PATTERN = re.compile(
     r"(?P<year>20\d{2})\s*年\s*(?P<month>\d{1,2})\s*月\s*"
     r"(?P<day>\d{1,2})\s*日"
 )
+_DATE_TOKEN = (
+    r"(?P<year>20\d{2}|[二〇零一二三四五六七八九]{4})\s*年\s*"
+    r"(?P<month>\d{1,2}|[一二三四五六七八九十]{1,3})\s*月\s*"
+    r"(?P<day>\d{1,2}|[一二三四五六七八九十]{1,3})\s*日"
+)
+_MONTH_DAY_TOKEN = (
+    r"(?P<month>\d{1,2}|[一二三四五六七八九十]{1,3})\s*月\s*"
+    r"(?P<day>\d{1,2}|[一二三四五六七八九十]{1,3})\s*日"
+)
+_TRADING_DATE_SEPARATOR = r"[\s.…·．。:：（）()0-9、,，附註注]{0,120}?"
+_LISTING_DATE_PATTERNS = (
+    # 預期股份開始在聯交所買賣……2025年8月20日
+    re.compile(
+        r"(?:預期|预期|預計|预计)?(?:A類普通股|A类普通股|普通股|H股|股份|股票|發售股份|发售股份)"
+        r"[\s\S]{0,40}?(?:開始|开始)[\s\S]{0,12}?"
+        r"(?:香港)?(?:聯交所|联交所)[\s\S]{0,12}?(?:買賣|买卖)"
+        + _TRADING_DATE_SEPARATOR
+        + _DATE_TOKEN,
+        re.IGNORECASE,
+    ),
+    # 預期股份於2025年8月20日開始在聯交所買賣
+    re.compile(
+        r"(?:預期|预期|預計|预计)[\s\S]{0,24}?"
+        r"(?:A類普通股|A类普通股|普通股|H股|股份|股票|發售股份|发售股份)[\s\S]{0,30}?"
+        + _DATE_TOKEN
+        + r"[\s\S]{0,80}?(?:(?:聯交所|联交所)[\s\S]{0,12}?"
+        r"(?:開始買賣|开始买卖)|(?:開始|开始)[\s\S]{0,12}?"
+        r"(?:香港)?(?:聯交所|联交所)[\s\S]{0,12}?(?:買賣|买卖))",
+        re.IGNORECASE,
+    ),
+    # 股份於聯交所開始買賣……2025年8月20日
+    re.compile(
+        r"(?:預期|预期|預計|预计)?(?:A類普通股|A类普通股|普通股|H股|股份|股票|發售股份|发售股份)"
+        r"[\s\S]{0,120}?(?:聯交所|联交所)[\s\S]{0,60}?"
+        r"(?:開始買賣|开始买卖)(?:的日期)?[\s.…·．。:：]*" + _DATE_TOKEN,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:上市日期|上市日)[\s\S]{0,30}?(?:預期|预期|預計|预计)"
+        r"(?:將|将)?(?:為|为)?[\s:：]*" + _DATE_TOKEN,
+        re.IGNORECASE,
+    ),
+)
+_LISTING_MONTH_DAY_PATTERNS = (
+    re.compile(
+        r"(?:預期|预期|預計|预计)?(?:A類普通股|A类普通股|普通股|H股|股份|股票|發售股份|发售股份)"
+        r"[\s\S]{0,40}?(?:開始|开始)[\s\S]{0,12}?"
+        r"(?:香港)?(?:聯交所|联交所)[\s\S]{0,12}?(?:買賣|买卖)"
+        + _TRADING_DATE_SEPARATOR
+        + _MONTH_DAY_TOKEN,
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"(?:預期|预期|預計|预计)?(?:A類普通股|A类普通股|普通股|H股|股份|股票|發售股份|发售股份)"
+        r"[\s\S]{0,120}?(?:聯交所|联交所)[\s\S]{0,60}?"
+        r"(?:開始買賣|开始买卖)(?:的日期)?"
+        + _TRADING_DATE_SEPARATOR
+        + _MONTH_DAY_TOKEN,
+        re.IGNORECASE,
+    ),
+)
 _FILE_DATE_PATTERN = re.compile(
     r"(?P<year>20\d{2})[-_](?P<month>\d{1,2})[-_](?P<day>\d{1,2})"
 )
+_FILE_DMY_DATE_PATTERN = re.compile(
+    r"(?:^|_)(?P<day>\d{1,2})[-_](?P<month>\d{1,2})[-_]"
+    r"(?P<year>20\d{2})(?:_|$)"
+)
 _COMPANY_NAME_PATTERN = re.compile(
     r"^\s*(?P<name>[\u3400-\u9fff]{2,20})(?=\s+[A-Za-z])"
+)
+_OFFICIAL_FILE_PATTERN = re.compile(
+    r"^\d{4,5}_\d{2}-\d{2}-\d{4}_(?P<body>.+)\.pdf$",
+    re.IGNORECASE,
+)
+_OFFERING_SUFFIX_PATTERN = re.compile(
+    r"_(?:全球發售|全球发售|股份發售|股份发售)(?:_\d+)?$",
+    re.IGNORECASE,
+)
+_INVALID_COMPANY_NAME_TERMS = (
+    "招股章程",
+    "招股说明书",
+    "聯交所網站",
+    "联交所网站",
+    "公司網站",
+    "公司网站",
+    "指定網站",
+    "指定网站",
 )
 _GENERIC_COVER_HEADINGS = {
     "招股章程",
@@ -53,6 +136,7 @@ class ProspectusMetadataSuggestion:
     company_id: str | None
     company_name: str | None
     document_date: date | None
+    listing_date: date | None
     source: str
     page_count: int
     source_hash: str
@@ -154,6 +238,7 @@ class ProspectusUploadService:
                         or None
                     ),
                     document_date=self._parse_iso_date(declared.get("document_date")),
+                    listing_date=self._parse_iso_date(metadata.get("listing_date")),
                     source="registered_document",
                     page_count=page_count,
                     source_hash=source_hash,
@@ -181,7 +266,74 @@ class ProspectusUploadService:
             return None
 
     @staticmethod
-    def _cover_text(content: bytes, *, page_limit: int = 3) -> str:
+    def _date_part(value: str) -> int:
+        value = value.strip()
+        if value.isdigit():
+            return int(value)
+        digits = {
+            "〇": 0,
+            "零": 0,
+            "一": 1,
+            "二": 2,
+            "三": 3,
+            "四": 4,
+            "五": 5,
+            "六": 6,
+            "七": 7,
+            "八": 8,
+            "九": 9,
+        }
+        if "十" in value:
+            left, _, right = value.partition("十")
+            tens = digits.get(left, 1) if left else 1
+            units = digits.get(right, 0) if right else 0
+            return tens * 10 + units
+        return int("".join(str(digits[character]) for character in value))
+
+    @classmethod
+    def _listing_date_from_text(
+        cls,
+        text: str,
+        *,
+        document_date: date | None,
+    ) -> date | None:
+        candidates: list[date] = []
+        for pattern in _LISTING_DATE_PATTERNS:
+            for match in pattern.finditer(text):
+                try:
+                    candidate = date(
+                        cls._date_part(match.group("year")),
+                        cls._date_part(match.group("month")),
+                        cls._date_part(match.group("day")),
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if document_date is not None and not (
+                    document_date <= candidate <= date.fromordinal(
+                        document_date.toordinal() + 180
+                    )
+                ):
+                    continue
+                candidates.append(candidate)
+        if not candidates and document_date is not None:
+            for pattern in _LISTING_MONTH_DAY_PATTERNS:
+                for match in pattern.finditer(text):
+                    try:
+                        month = cls._date_part(match.group("month"))
+                        day = cls._date_part(match.group("day"))
+                        candidate = date(document_date.year, month, day)
+                        if candidate.toordinal() < document_date.toordinal() - 30:
+                            candidate = date(document_date.year + 1, month, day)
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    if document_date <= candidate <= date.fromordinal(
+                        document_date.toordinal() + 180
+                    ):
+                        candidates.append(candidate)
+        return min(candidates) if candidates else None
+
+    @staticmethod
+    def _cover_text(content: bytes, *, page_limit: int = 8) -> str:
         document = fitz.open(stream=content, filetype="pdf")
         try:
             return "\n".join(
@@ -199,8 +351,26 @@ class ProspectusUploadService:
                 continue
             match = _COMPANY_NAME_PATTERN.match(line)
             if match is not None:
-                return match.group("name")
+                candidate = match.group("name")
+                if any(term in candidate for term in _INVALID_COMPANY_NAME_TERMS):
+                    continue
+                return candidate
         return None
+
+    @staticmethod
+    def _company_name_from_filename(file_name: str) -> str | None:
+        match = _OFFICIAL_FILE_PATTERN.match(Path(file_name).name)
+        if match is None:
+            return None
+        candidate = _OFFERING_SUFFIX_PATTERN.sub("", match.group("body")).strip(" _")
+        return candidate or None
+
+    @classmethod
+    def _document_date_from_filename(cls, file_name: str) -> date | None:
+        name = Path(file_name).name
+        return cls._date_from_match(
+            _FILE_DMY_DATE_PATTERN.search(name)
+        ) or cls._date_from_match(_FILE_DATE_PATTERN.search(name))
 
     def inspect(
         self,
@@ -221,10 +391,16 @@ class ProspectusUploadService:
         cover_text = self._cover_text(content)
         code_match = _STOCK_CODE_PATTERN.search(cover_text)
         company_id = code_match.group(1).zfill(5) if code_match else None
-        company_name = self._company_name_from_cover(cover_text)
-        document_date = self._date_from_match(
-            _CHINESE_DATE_PATTERN.search(cover_text)
-        ) or self._date_from_match(_FILE_DATE_PATTERN.search(file_name))
+        company_name = self._company_name_from_filename(
+            file_name
+        ) or self._company_name_from_cover(cover_text)
+        document_date = self._document_date_from_filename(
+            file_name
+        ) or self._date_from_match(_CHINESE_DATE_PATTERN.search(cover_text))
+        listing_date = self._listing_date_from_text(
+            cover_text,
+            document_date=document_date,
+        )
         source = (
             "cover_text"
             if company_id and company_name and document_date
@@ -234,6 +410,7 @@ class ProspectusUploadService:
             company_id=company_id,
             company_name=company_name,
             document_date=document_date,
+            listing_date=listing_date,
             source=source,
             page_count=page_count,
             source_hash=source_hash,
@@ -288,6 +465,7 @@ class ProspectusUploadService:
         company_id: str,
         company_name: str,
         document_date: date,
+        listing_date: date | None = None,
     ) -> UploadedProspectus:
         """校验并幂等登记上传PDF；同一哈希不会复制原始文件。"""
         normalized_id, normalized_name = self._validate_company(
@@ -324,6 +502,10 @@ class ProspectusUploadService:
                     "market_dir": f"{self.config.paths.market_dir}/{company_folder}",
                 },
             }
+
+        if listing_date is not None and not metadata.get("listing_date"):
+            metadata["listing_date"] = listing_date.isoformat()
+            metadata["listing_date_source"] = "prospectus_expected_schedule"
 
         documents = metadata.setdefault("documents", {})
         if not isinstance(documents, dict):

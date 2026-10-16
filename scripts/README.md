@@ -66,9 +66,6 @@ React批量分析工作台；开发模式说明见 `frontend/README.md`。
   PDF解析超时隔离、Embedding批次断点、失败重试和断点续跑；持久化导入由pgvector脚本负责。
 - `init_pgvector.py`：在PostgreSQL中创建 `vector` 扩展、项目专用schema、1024维招股书
   向量表和独立历史IPO案例表；全量导入完成后可选择创建HNSW索引。
-- `import_embeddings_to_pgvector.py`：只读取现有切片和 `vectors.npy`，以公司为事务并发迁移到
-  pgvector；支持连接退避重试、断点续传、重复运行快速跳过完整文档和全量完整性核验，
-  不会重新调用向量模型。
 - `verify_pgvector_retrieval.py`：对指定公司执行一次真实查询向量生成和pgvector文档内召回，
   用于确认数据库、模型维度、文档隔离和证据元数据均可正常使用。
 - `register_company_data.py`：把一家公司或全部公司的文档、数据版本登记到

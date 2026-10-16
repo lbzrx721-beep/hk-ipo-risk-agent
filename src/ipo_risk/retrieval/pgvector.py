@@ -10,6 +10,7 @@ from typing import Any
 
 import numpy as np
 
+from ipo_risk.observability.trace import retrieval_outputs, trace_step
 from ipo_risk.retrieval.chunker import DocumentChunk
 from ipo_risk.retrieval.lexical import SearchHit
 from ipo_risk.retrieval.semantic import EmbeddingProvider
@@ -356,6 +357,7 @@ class PgVectorRetriever:
             complete=complete,
         )
 
+    @trace_step("pgvector.search", run_type="retriever", inputs=("query", "top_k"), process_outputs=retrieval_outputs)
     def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
         """在当前文档内按余弦距离检索，并还原完整DocumentChunk。"""
         if top_k < 1 or not query.strip():

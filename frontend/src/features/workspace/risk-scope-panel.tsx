@@ -80,6 +80,8 @@ export function RiskScopePanel({ batch, company, serviceAvailable, onSnapshot, s
   if (!review) return null;
 
   const recommendedCount = candidates.filter((candidate) => candidate.ai_recommended).length;
+  const isReviewPlan = candidates.some((candidate) =>
+    candidate.source === "mandatory_review" || candidate.source === "profile_review_question");
   const selectedCount = candidates.filter((candidate) => included[candidate.risk_type]).length;
 
   const updateOwner = (index: number, owner: string | null) => {
@@ -150,13 +152,13 @@ export function RiskScopePanel({ batch, company, serviceAvailable, onSnapshot, s
         </div>
 
         <div className="flex flex-wrap gap-2">
-          <Badge variant="secondary">候选风险 {candidates.length} 条</Badge>
+          <Badge variant="secondary">{isReviewPlan ? "待查事项" : "候选风险"} {candidates.length} 条</Badge>
           <Badge variant="outline">AI 建议纳入 {recommendedCount} 条</Badge>
           <Badge variant="outline">当前选中 {selectedCount} 条</Badge>
-          {review.funnel?.raw_candidates != null && (
+          {!isReviewPlan && review.funnel?.raw_candidates != null && (
             <Badge variant="outline">原始发现 {review.funnel.raw_candidates} 条</Badge>
           )}
-          {review.funnel?.consolidated_candidates != null && (
+          {!isReviewPlan && review.funnel?.consolidated_candidates != null && (
             <Badge variant="outline">语义合并 {review.funnel.consolidated_candidates} 条</Badge>
           )}
         </div>
@@ -172,6 +174,7 @@ export function RiskScopePanel({ batch, company, serviceAvailable, onSnapshot, s
                 <Checkbox
                   id={`${company.company_key}-${candidate.risk_type}`}
                   checked={included[candidate.risk_type] ?? false}
+                  disabled={candidate.source === "mandatory_review"}
                   onCheckedChange={(checked) => setIncluded((current) => ({
                     ...current,
                     [candidate.risk_type]: checked === true,
@@ -182,11 +185,11 @@ export function RiskScopePanel({ batch, company, serviceAvailable, onSnapshot, s
                     {candidate.title}
                   </FieldLabel>
                   <div className="flex flex-wrap gap-1">
-                    <Badge variant={severityVariant(candidate.severity)}>{severityLabels[candidate.severity]}</Badge>
-                    {candidate.confidence != null && (
+                    {isReviewPlan ? <Badge variant="outline">{candidate.source === "mandatory_review" ? "基础必查" : "专项查证"}</Badge> : <Badge variant={severityVariant(candidate.severity)}>{severityLabels[candidate.severity]}</Badge>}
+                    {!isReviewPlan && candidate.confidence != null && (
                       <Badge variant="outline">置信度 {Math.round(candidate.confidence * 100)}%</Badge>
                     )}
-                    <Badge variant="outline">已有证据 {candidate.evidence_count ?? 0} 条</Badge>
+                    {!isReviewPlan && <Badge variant="outline">已有证据 {candidate.evidence_count ?? 0} 条</Badge>}
                     <Badge variant="outline">{candidate.ai_recommended ? "AI 建议纳入" : "AI 建议排除"}</Badge>
                   </div>
                   <p className="text-xs leading-relaxed text-muted-foreground">{candidate.rationale}</p>

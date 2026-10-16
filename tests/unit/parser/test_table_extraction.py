@@ -68,6 +68,25 @@ def _write_borderless_multilevel_table_pdf(path: Path) -> None:
     document.close()
 
 
+def _write_dotted_financial_table_pdf(path: Path) -> None:
+    document = fitz.open()
+    page = document.new_page(width=595, height=842)
+    for index, year in enumerate(("2021", "2022", "2023", "2024")):
+        page.insert_text((230 + index * 75, 90), year, fontsize=9)
+    rows = (
+        ("R&D cost. . . . . . . . . . . .", "13,703", "14,548", "23,975", "15,267"),
+        ("Listing expense. . . . . . . . .", "-", "-", "950", "15,559"),
+        ("Staff benefits. . . . . . . . . .", "32,636", "41,652", "46,252", "25,109"),
+        ("Total. . . . . . . . . . . . . .", "343,100", "413,887", "548,426", "333,214"),
+    )
+    for row_index, row in enumerate(rows):
+        for column_index, value in enumerate(row):
+            x = 72 if column_index == 0 else 230 + (column_index - 1) * 75
+            page.insert_text((x, 125 + row_index * 22), value, fontsize=9)
+    document.save(path)
+    document.close()
+
+
 def test_table_becomes_traceable_vector_ready_chunk(tmp_path: Path) -> None:
     pdf_path = tmp_path / "table.pdf"
     _write_financial_table_pdf(pdf_path)
@@ -117,6 +136,17 @@ def test_borderless_table_restores_year_and_unit_hierarchy(tmp_path: Path) -> No
     )
     assert table.rows[0] == ("Revenue", "200", "100", "240", "100")
     assert table.rows[-1] == ("Operating cash flow", "(10)", "(5)", "24", "10")
+
+
+def test_dotted_financial_rows_are_not_mistaken_for_table_of_contents(tmp_path: Path) -> None:
+    pdf_path = tmp_path / "dotted-financial-table.pdf"
+    _write_dotted_financial_table_pdf(pdf_path)
+
+    page = next(parse_document(pdf_path, min_chars=1, page_range=(0, 1)))
+
+    assert len(page.tables) == 1
+    assert page.tables[0].rows[0][0] == "R&D cost"
+    assert page.tables[0].rows[-1][-1] == "333,214"
 
 
 def test_aligned_text_false_positive_never_falls_back_to_find_tables() -> None:

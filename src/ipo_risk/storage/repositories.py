@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 from ipo_risk.domain import (
+    AgentTrace,
     CompanyRecord,
     DatasetRecord,
     DocumentRecord,
@@ -776,6 +777,21 @@ class CatalogRepository:
         with self._connection() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return tuple(Evidence.model_validate(_json_loads(row["payload_json"])) for row in rows)
+
+    def list_agent_traces(self, run_id: str) -> tuple[AgentTrace, ...]:
+        """Return durable Agent traces, including their recorded tool calls."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT payload_json FROM agent_traces
+                WHERE run_id = ?
+                ORDER BY started_at, trace_id
+                """,
+                (run_id,),
+            ).fetchall()
+        return tuple(
+            AgentTrace.model_validate(_json_loads(row["payload_json"])) for row in rows
+        )
 
     def save_review(self, review: FindingReview) -> None:
         """Atomically persist an immutable review and its resulting finding state."""

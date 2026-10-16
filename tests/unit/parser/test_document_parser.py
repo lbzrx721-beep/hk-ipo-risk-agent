@@ -181,10 +181,10 @@ class TestConfig:
         assert config.project_name == "hk-ipo-risk-agent"
         assert config.parser.min_text_chars_before_ocr == 80
         assert config.parser.render_dpi == 150
-        assert config.embedding.provider == "zhipu"
-        assert config.embedding.model_name == "embedding-3-pro"
-        assert config.embedding.batch_size == 64
-        assert config.llm.provider == "deepseek"
+        assert config.embedding.provider == "siliconflow"
+        assert config.embedding.model_name == "qwen3-embedding:4b"
+        assert config.embedding.batch_size == 32
+        assert config.llm.provider == "ark"
         assert config.llm.model_name == "deepseek-v4-flash"
         assert not config.embedding.is_configured
         assert not config.llm.is_configured

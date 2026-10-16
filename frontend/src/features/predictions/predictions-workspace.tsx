@@ -72,15 +72,49 @@ const agentLabel: Record<string, string> = {
   discovery: "风险发现 Agent",
 };
 
+type HorizonKey = "h1" | "h5" | "h20" | "h60";
+
+const horizonOrder: HorizonKey[] = ["h1", "h5", "h20", "h60"];
+const horizonMeta: Record<HorizonKey, { label: string; description: string }> = {
+  h1: { label: "上市首日", description: "观察挂牌首日的即时定价压力" },
+  h5: { label: "5个交易日", description: "比赛重点关注的核心预警窗口" },
+  h20: { label: "20个交易日", description: "观察上市后一个月内的风险延续" },
+  h60: { label: "60个交易日", description: "观察中期价格承压风险" },
+};
+
 function percent(value: number | undefined): string {
   return `${Math.round((value ?? 0) * 100)}%`;
+}
+
+function horizonProbability(prediction: RuntimePrediction, key: HorizonKey): number | null {
+  const value = prediction.horizon_predictions?.[key];
+  if (value != null) return value;
+  return key === "h5" ? prediction.probability : null;
+}
+
+function horizonTriggered(prediction: RuntimePrediction, key: HorizonKey): boolean | null {
+  const storedAlert = prediction.horizon_alerts?.[key];
+  if (storedAlert != null) return storedAlert;
+  const value = horizonProbability(prediction, key);
+  if (value == null) return null;
+  if (key === "h5" && prediction.horizon_thresholds?.h5 == null) {
+    return prediction.predicted_significant_drop_5d;
+  }
+  const threshold = prediction.horizon_thresholds?.[key];
+  return threshold == null ? null : value >= threshold;
+}
+
+function horizonStatus(prediction: RuntimePrediction, key: HorizonKey): string {
+  const triggered = horizonTriggered(prediction, key);
+  if (triggered == null) return "暂不可用";
+  return triggered ? "触发预警" : "未触发预警";
 }
 
 function riskLabel(prediction: RuntimePrediction): string {
   if (prediction.decision === "high_risk") return "显著下跌预警";
   if (prediction.recall_guard?.watchlist) return "风险观察名单";
   if (prediction.decision === "low_risk") return "低风险";
-  return "边界信号 · 暂不预警";
+  return "未触发显著下跌预警";
 }
 
 function riskBadge(prediction: RuntimePrediction): "destructive" | "secondary" | "outline" {
@@ -108,7 +142,7 @@ function PredictionResultCard({ prediction, pendingText, findings, findingsLoadi
     return (
       <Card className="min-h-80 border-dashed bg-card/50">
         <CardHeader>
-          <CardTitle className="flex items-center gap-2"><Sparkles className="size-4 text-primary" />统一五日风险预测</CardTitle>
+          <CardTitle className="flex items-center gap-2"><Sparkles className="size-4 text-primary" />上市后多时间窗风险预测</CardTitle>
           <CardDescription>融合发行、财务、市场与多 Agent 风险特征。</CardDescription>
           <CardAction><Badge variant="outline"><Clock3 data-icon="inline-start" />等待预测</Badge></CardAction>
         </CardHeader>
@@ -129,21 +163,47 @@ function PredictionResultCard({ prediction, pendingText, findings, findingsLoadi
   return (
     <Card className="overflow-hidden border-primary/30 bg-gradient-to-br from-primary/8 via-card to-card">
       <CardHeader className="border-b border-border/60">
-        <CardTitle className="flex items-center gap-2"><Sparkles className="size-4 text-primary" />统一五日风险预测</CardTitle>
+        <CardTitle className="flex items-center gap-2"><Sparkles className="size-4 text-primary" />上市后多时间窗风险预测</CardTitle>
         <CardDescription>最终模型给出方向性预警，风险卡片用于解释公司的主要风险背景。</CardDescription>
         <CardAction><Badge variant={riskBadge(prediction)}>{riskLabel(prediction)}</Badge></CardAction>
       </CardHeader>
       <CardContent className="flex flex-col gap-6">
-        <section className="grid gap-4 rounded-2xl border bg-background/50 p-5 md:grid-cols-[220px_minmax(0,1fr)] md:items-center">
-          <div>
-            <p className="text-sm text-muted-foreground">上市后五日显著下跌概率</p>
-            <strong className="mt-2 block text-5xl tabular-nums tracking-tight">{percent(prediction.probability)}</strong>
-            <p className="mt-2 text-xs text-muted-foreground">模型置信度 {percent(prediction.confidence)}</p>
+        <section className="rounded-2xl border bg-background/50 p-5">
+          <div className="flex items-center gap-3">
+            <Badge variant="secondary">核心窗口</Badge>
+            <p className="text-sm font-semibold">上市后5日显著下跌预测</p>
           </div>
-          <div className="flex flex-col gap-3">
-            <div className="flex justify-between text-xs text-muted-foreground"><span>低风险</span><span>高风险</span></div>
-            <Progress value={prediction.probability * 100} aria-label="五日显著下跌概率" className="h-3" />
-            <p className="text-sm leading-6 text-muted-foreground">该概率用于风险排序和预警，不代表收益率预测；正式结论仍需结合原文证据与人工复核。</p>
+          <p className="mt-2 text-sm leading-6 text-muted-foreground">
+            显著下跌定义：第5个交易日收盘价相对发行价收益率 ≤ -10%。五日为比赛核心预警窗口；该结果不代表具体收益率。
+          </p>
+        </section>
+
+        <section className="flex flex-col gap-3">
+          <div>
+            <h3 className="font-semibold">四个独立预测窗口</h3>
+            <p className="mt-1 text-xs text-muted-foreground">每个时间窗口由独立模型判断，并使用各自的预警标准。</p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+            {horizonOrder.map((key) => {
+              const triggered = horizonTriggered(prediction, key);
+              const isPrimary = key === "h5";
+              return (
+                <Card key={key} size="sm" className={cn("bg-background/55", isPrimary && "border-primary/50 bg-primary/5")}>
+                  <CardHeader>
+                    <CardTitle className="text-base">{horizonMeta[key].label}</CardTitle>
+                    <CardDescription>{horizonMeta[key].description}</CardDescription>
+                    <CardAction>
+                      <Badge variant={triggered === true ? "destructive" : triggered === false ? "secondary" : "outline"}>
+                        {horizonStatus(prediction, key)}
+                      </Badge>
+                    </CardAction>
+                  </CardHeader>
+                  <CardContent>
+                    <p className="text-xs text-muted-foreground">{horizonMeta[key].description}</p>
+                  </CardContent>
+                </Card>
+              );
+            })}
           </div>
         </section>
 
@@ -182,7 +242,7 @@ function PredictionResultCard({ prediction, pendingText, findings, findingsLoadi
         </section>
 
         <div className="flex flex-wrap items-center gap-2 border-t pt-4 text-xs text-muted-foreground">
-          <Badge variant="outline">{prediction.model_name}</Badge>
+          <Badge variant="outline">正式预测模型</Badge>
           <Badge variant="outline">{new Date(prediction.generated_at).toLocaleString("zh-CN")}</Badge>
         </div>
         {prediction.warnings.length > 0 && <Alert><FileWarning /><AlertTitle>预测提示</AlertTitle><AlertDescription>{prediction.warnings.join("；")}</AlertDescription></Alert>}
@@ -300,17 +360,17 @@ export function PredictionsWorkspace({ batch, selectedKey, busy, serviceAvailabl
         const result = await rerunStoredPrediction(selectedEntry.runId, "agent_enhanced");
         setHistoryRuns((runs) => runs.map((run) => run.run_id === result.run.run_id ? result.run : run));
       }
-    } catch (error) { setError(error instanceof Error ? error.message : "五日预测未完成。"); }
+    } catch (error) { setError(error instanceof Error ? error.message : "风险预测未完成。"); }
     finally { setBusy(false); }
   };
 
   return (
     <div className="mx-auto flex w-full max-w-[1920px] flex-col gap-5 px-4 py-6 lg:px-6 2xl:px-8">
       <section className="flex flex-col justify-between gap-4 lg:flex-row lg:items-end">
-        <div><Badge variant="outline" className="mb-3">Day-5 downside intelligence</Badge><h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">上市后五日风险预测</h1><p className="mt-2 text-sm text-muted-foreground">选择任意已分析公司，复用保存的特征直接运行统一最终模型。</p></div>
+        <div><Badge variant="outline" className="mb-3">IPO downside intelligence</Badge><h1 className="text-2xl font-semibold tracking-tight sm:text-3xl">上市后多时间窗口风险预测</h1><p className="mt-2 text-sm text-muted-foreground">选择任意已分析公司，复用已保存特征运行1日、5日、20日和60日模型。</p></div>
         <div className="flex flex-wrap gap-2">
           <Button variant="outline" disabled={historyLoading || !serviceAvailable} onClick={() => void refreshHistory()}><RefreshCw data-icon="inline-start" className={historyLoading ? "animate-spin" : ""} />刷新历史记录</Button>
-          {selectedEntry && <Button disabled={busy || !serviceAvailable || !selectedEntry.featureAvailable} onClick={() => void runPrediction()}><Sparkles data-icon="inline-start" />重新运行五日预测</Button>}
+          {selectedEntry && <Button disabled={busy || !serviceAvailable || !selectedEntry.featureAvailable} onClick={() => void runPrediction()}><Sparkles data-icon="inline-start" />重新运行全部预测</Button>}
         </div>
       </section>
 
@@ -337,9 +397,9 @@ export function PredictionsWorkspace({ batch, selectedKey, busy, serviceAvailabl
           {selectedEntry ? (
             <div className="flex min-w-0 flex-col gap-4">
               <Card size="sm" className="bg-card/70"><CardHeader><CardTitle>{selectedEntry.companyId} · {selectedEntry.companyName}</CardTitle><CardDescription>招股书日期 {selectedEntry.asOfDate || "待识别"}{selectedEntry.runId ? ` · ${selectedEntry.runId}` : ""}</CardDescription><CardAction><Badge variant="outline">{selectedEntry.source === "history" ? "历史特征复用" : selectedEntry.status}</Badge></CardAction></CardHeader></Card>
-              {selectedEntry.predictionError && !selectedEntry.prediction && <Alert variant="destructive"><ShieldAlert /><AlertTitle>五日预测未完成</AlertTitle><AlertDescription>{selectedEntry.predictionError}</AlertDescription></Alert>}
+              {selectedEntry.predictionError && !selectedEntry.prediction && <Alert variant="destructive"><ShieldAlert /><AlertTitle>风险预测未完成</AlertTitle><AlertDescription>{selectedEntry.predictionError}</AlertDescription></Alert>}
               <PredictionResultCard prediction={selectedEntry.prediction} pendingText={selectedEntry.featureAvailable ? "特征已就绪，可立即预测" : "暂无统一模型所需特征"} findings={selectedRunId ? findingsByRun[selectedRunId] ?? [] : []} findingsLoading={findingsLoadingRunId === selectedRunId} onOpenFinding={(findingId) => onOpenResults(selectedRunId, findingId)} />
-              <Alert><ShieldAlert /><AlertTitle>预测与正式报告分工</AlertTitle><AlertDescription>本页负责五日预警；证据确认、人工复核与报告导出在“结果与复核”完成。</AlertDescription><Button variant="outline" size="sm" onClick={() => onOpenResults(selectedRunId)}>前往结果与复核<ArrowRight data-icon="inline-end" /></Button></Alert>
+              <Alert><ShieldAlert /><AlertTitle>预测与正式报告分工</AlertTitle><AlertDescription>本页负责多时间窗口预警；证据确认、人工复核与报告导出在“结果与复核”完成。</AlertDescription><Button variant="outline" size="sm" onClick={() => onOpenResults(selectedRunId)}>前往结果与复核<ArrowRight data-icon="inline-end" /></Button></Alert>
             </div>
           ) : (
             <Empty className="min-h-[620px] border"><EmptyHeader><EmptyMedia variant="icon"><Search /></EmptyMedia><EmptyTitle>没有匹配的分析记录</EmptyTitle><EmptyDescription>调整筛选条件或搜索关键词后重试。</EmptyDescription></EmptyHeader></Empty>

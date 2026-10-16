@@ -7,14 +7,16 @@ from hashlib import sha256
 import os
 from pathlib import Path
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
 import shutil
 from typing import Any, Protocol
 from threading import Lock
 from uuid import uuid4
 
 import numpy as np
+from langsmith.utils import ContextThreadPoolExecutor as ThreadPoolExecutor
 
+from ipo_risk.observability.trace import retrieval_outputs, trace_step, wrap_embedding_client
 from ipo_risk.retrieval.chunker import DocumentChunk
 from ipo_risk.retrieval.lexical import BM25Retriever, SearchHit
 from ipo_risk.resilience import RetryExhaustedError, RetryPolicy
@@ -83,6 +85,7 @@ class OpenAICompatibleEmbeddingProvider:
                 max_retries=0,
                 timeout=timeout_seconds,
             )
+            client = wrap_embedding_client(client)
         # model_name是缓存与pgvector使用的稳定索引标识；api_model_name允许
         # 兼容供应商使用不同的请求模型名，而不迫使已验证兼容的向量重新生成。
         self.model_name = model_name
@@ -360,6 +363,7 @@ class SemanticRetriever:
         """返回当前文档只读向量，供后台持久化复用而不再次调用模型。"""
         return self._vectors
 
+    @trace_step("semantic.search", run_type="retriever", inputs=("query", "top_k"), process_outputs=retrieval_outputs)
     def search(self, query: str, top_k: int = 20) -> list[SearchHit]:
         """返回按余弦相似度降序排列的语义候选段落。"""
         if top_k < 1 or not query.strip():
@@ -514,6 +518,7 @@ class HybridRetriever:
         self._semantic_top_k = semantic_top_k
         self._rrf_constant = rrf_constant
 
+    @trace_step("hybrid.search", run_type="retriever", inputs=("query", "top_k"), process_outputs=retrieval_outputs)
     def search(self, query: str, top_k: int = 20) -> list[HybridSearchHit]:
         """返回两路候选的并集，并给出可解释的融合排名。"""
         if top_k < 1 or not query.strip():

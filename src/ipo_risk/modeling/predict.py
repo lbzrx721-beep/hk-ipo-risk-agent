@@ -27,12 +27,13 @@ def load_model_bundle(path: Path) -> dict[str, Any]:
     )
     base_models = bundle.get("models")
     is_base_ensemble = (
-        isinstance(base_models, list)
-        and bool(base_models)
-        and all(isinstance(model, Pipeline) for model in base_models)
-        and isinstance(bundle.get("features"), list)
-        and isinstance(bundle.get("threshold"), (int, float))
-    )
+        (
+            isinstance(base_models, list)
+            and bool(base_models)
+            and all(isinstance(model, Pipeline) for model in base_models)
+        )
+        or _is_unified_dict_ensemble(base_models)
+    ) and isinstance(bundle.get("features"), list) and isinstance(bundle.get("threshold"), (int, float))
     is_blend3 = (
         isinstance(bundle.get("lgb_models"), list)
         and isinstance(bundle.get("hgb_models"), list)
@@ -54,6 +55,18 @@ def load_model_bundle(path: Path) -> dict[str, Any]:
     if not (is_single or is_ensemble or is_base_ensemble or is_supported_blend):
         raise ValueError(f"invalid model bundle: {path}")
     return bundle
+
+
+def _is_unified_dict_ensemble(models: Any) -> bool:
+    """Check for unified model dict format: {seed_str: model_with_predict_proba, ...}."""
+    if not isinstance(models, dict) or not models:
+        return False
+    return all(
+        isinstance(model, object)
+        and hasattr(model, "predict_proba")
+        and callable(getattr(model, "predict_proba", None))
+        for model in models.values()
+    )
 
 
 def predict_feature_rows(
@@ -81,10 +94,15 @@ def predict_feature_rows(
         probabilities = _predict_blend3_rf(bundle, frame)
     elif bundle.get("lgb_models") is not None:
         probabilities = _predict_blend3(bundle, frame, feature_columns)
-    elif isinstance(bundle.get("models"), list):
+    elif isinstance(bundle.get("models"), (list, dict)):
+        models_iter = (
+            bundle["models"]
+            if isinstance(bundle["models"], list)
+            else list(bundle["models"].values())
+        )
         per_model = [
             model.predict_proba(frame[feature_columns])[:, 1]
-            for model in bundle["models"]
+            for model in models_iter
         ]
         if bundle.get("score_mode") == "percentile":
             references = bundle.get("reference_probabilities")
@@ -256,7 +274,7 @@ def _prepare_derived_features(frame: pd.DataFrame, *, required_features: set[str
     )
     if needs_agent_derived and "agent_finding_count" not in frame:
         return frame
-    from ipo_risk.modeling.stable_agent_model import (
+    from ipo_risk.modeling.prelisting import (
         add_derived_prediction_features,
     )
 

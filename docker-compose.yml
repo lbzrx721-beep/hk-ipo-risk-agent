@@ -1,0 +1,49 @@
+name: hk-ipo-risk-agent
+
+services:
+  db:
+    image: pgvector/pgvector:pg17
+    environment:
+      - POSTGRES_USER=ipo_risk
+      - POSTGRES_PASSWORD=ipo_risk_2025
+      - POSTGRES_DB=ipo_risk
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ipo_risk -d ipo_risk"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - ./configs/providers.local.yaml:/app/configs/providers.local.yaml:ro
+      - app_data:/app/data
+      - analysis_artifacts:/app/artifacts/analysis
+      - evidence_artifacts:/app/artifacts/evidence
+      - output:/app/output
+    environment:
+      - IPO_RISK_POSTGRES_DSN=postgresql://ipo_risk:ipo_risk_2025@db:5432/ipo_risk
+      - IPO_RISK_TWELVE_DATA_API_KEY=${IPO_RISK_TWELVE_DATA_API_KEY:-}
+      - LANGSMITH_TRACING=${LANGSMITH_TRACING:-false}
+      - LANGSMITH_API_KEY=${LANGSMITH_API_KEY:-}
+      - LANGSMITH_PROJECT=${LANGSMITH_PROJECT:-hk-ipo-risk-agent}
+      - LANGSMITH_ENDPOINT=${LANGSMITH_ENDPOINT:-https://api.smith.langchain.com}
+      - LANGSMITH_WORKSPACE_ID=${LANGSMITH_WORKSPACE_ID:-}
+      - LANGSMITH_HIDE_INPUTS=${LANGSMITH_HIDE_INPUTS:-false}
+      - LANGSMITH_HIDE_OUTPUTS=${LANGSMITH_HIDE_OUTPUTS:-false}
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  app_data:
+  analysis_artifacts:
+  evidence_artifacts:
+  output:

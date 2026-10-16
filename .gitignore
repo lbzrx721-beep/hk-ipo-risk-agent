@@ -22,6 +22,8 @@ frontend/vite.config.d.ts
 
 # Secrets and local settings
 .env
+.env.*
+!.env.example
 configs/providers.local.yaml
 *.key
 *.pem
@@ -76,3 +78,7 @@ tmp/
 
 # Internal document review output
 .docx_review/
+
+# Locally packaged submission materials
+/delivery/
+/*.zip

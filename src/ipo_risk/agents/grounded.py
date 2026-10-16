@@ -354,6 +354,62 @@ class GroundedAnalysisEngine:
             )
         )
 
+    @property
+    def profile_retrieval_mode(self) -> str:
+        return "hybrid" if self._semantic is not None else "bm25"
+
+    def retrieve_profile_context(
+        self,
+        queries: Sequence[str],
+        *,
+        top_k: int = 4,
+        max_chars: int = 24000,
+        neighbor_radius: int = 1,
+    ) -> tuple[DocumentChunk, ...]:
+        """按主题均衡取回原文；标题仅用于定位，不随机抽样、不截断证据。"""
+        buckets: list[list[DocumentChunk]] = []
+        for query in dict.fromkeys(queries):
+            query_tokens = set(tokenize_text(query))
+            lexical = [hit for hit in self._lexical.search(query, top_k=top_k)
+                       if query_tokens & set(tokenize_text(hit.chunk.text))]
+            semantic: list[SearchHit] = []
+            if self._semantic is not None:
+                try:
+                    semantic = self._semantic.search(query, top_k=top_k)
+                except Exception as exc:  # noqa: BLE001 - preserve lexical retrieval
+                    self.enable_bm25_fallback(str(exc))
+            # Both channels contribute without comparing incompatible score scales.
+            seeds: list[DocumentChunk] = []
+            for rank in range(max(len(lexical), len(semantic))):
+                for hits in (lexical, semantic):
+                    if rank < len(hits) and hits[rank].chunk.chunk_id in self._chunk_by_id:
+                        seeds.append(self._chunk_by_id[hits[rank].chunk.chunk_id])
+            neighbors: list[DocumentChunk] = []
+            for seed in seeds:
+                index = self._chunk_index[seed.chunk_id]
+                for offset in range(-neighbor_radius, neighbor_radius + 1):
+                    position = index + offset
+                    if 0 <= position < len(self._chunks):
+                        neighbor = self._chunks[position]
+                        if (neighbor.document_id == seed.document_id
+                                and abs(neighbor.page - seed.page) <= 1):
+                            neighbors.append(neighbor)
+            buckets.append([*seeds, *neighbors])
+        selected: dict[str, DocumentChunk] = {}
+        used = 0
+        for rank in range(max((len(bucket) for bucket in buckets), default=0)):
+            for bucket in buckets:
+                if rank >= len(bucket):
+                    continue
+                candidate = bucket[rank]
+                if candidate.is_heading or candidate.chunk_id in selected:
+                    continue
+                if used + len(candidate.text) > max_chars:
+                    continue
+                selected[candidate.chunk_id] = candidate
+                used += len(candidate.text)
+        return tuple(selected.values())
+
     def _hybrid_candidates(self, rule: RiskRule) -> list[RetrievalCandidate]:
         if self._hybrid is None:
             return []
@@ -473,14 +529,26 @@ class GroundedAnalysisEngine:
                         candidates = self._semantic_candidates(planned_queries)
                     except Exception as exc:
                         retrieval_error = str(exc)
+                        self.enable_bm25_fallback(retrieval_error)
                 if candidates:
                     retrieval_mode = "agentic_semantic"
                 else:
-                    candidates = self._lexical_candidates(rule)
-                    retrieval_mode = "fixed_query_fallback"
+                    candidates = self._lexical_candidates(rule.model_copy(update={
+                        "query": planned_queries[0], "query_variants": planned_queries[1:]
+                    }))
+                    retrieval_mode = "agentic_bm25"
+                    if not candidates:
+                        candidates = self._lexical_candidates(rule)
+                        retrieval_mode = "fixed_query_fallback"
             elif self._hybrid is not None:
                 retrieval_mode = "hybrid_multi_query" if len(rule.search_queries) > 1 else "hybrid"
-                candidates = self._hybrid_candidates(rule)
+                try:
+                    candidates = self._hybrid_candidates(rule)
+                except Exception as exc:  # noqa: BLE001
+                    retrieval_error = str(exc)
+                    self.enable_bm25_fallback(retrieval_error)
+                    candidates = self._lexical_candidates(rule)
+                    retrieval_mode = "bm25_fallback"
             else:
                 retrieval_mode = "bm25_multi_query" if len(rule.search_queries) > 1 else "bm25"
                 candidates = self._lexical_candidates(rule)
@@ -543,14 +611,14 @@ class GroundedAnalysisEngine:
                     analysis_attempts = error.attempts
                     analysis_error = str(error.last_error)
                     analysis_retry_errors = (analysis_error,)
-                    if rule.id.startswith("open_"):
+                    if rule.requires_model_verification or rule.id.startswith(("open_", "check_")):
                         analysis = _open_risk_fail_closed(rule, analysis_error)
                         analysis_mode = "open_fail_closed"
                     else:
                         analysis = _deterministic_analysis(rule, exact_hits)
                         analysis_mode = "rule_fallback"
             else:
-                if rule.id.startswith("open_"):
+                if rule.requires_model_verification or rule.id.startswith(("open_", "check_")):
                     analysis_error = (
                         "专业证据模型不可用"
                         if analyzer is None

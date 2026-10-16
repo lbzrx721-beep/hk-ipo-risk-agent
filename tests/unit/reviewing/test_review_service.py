@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import json
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -28,8 +29,9 @@ from ipo_risk.reporting import (
     RiskAnalysisReport,
     SourceDocument,
     write_risk_report,
+    write_verified_pdf_report,
 )
-from ipo_risk.reviewing import IncompleteReviewError, ReviewService
+from ipo_risk.reviewing import IncompleteReviewError, ReviewBlockedError, ReviewService
 from ipo_risk.storage.files import sha256_file
 from ipo_risk.storage.repositories import CatalogRepository
 from scripts.review_findings import app as review_app
@@ -155,6 +157,30 @@ def test_confirmed_finding_is_verified_and_review_is_retrievable(tmp_path: Path)
     assert repository.get_review(review.review_id) == review
 
 
+def test_run_summary_restores_prediction_from_database_when_file_is_missing(
+    tmp_path: Path,
+) -> None:
+    service, repository, _ = _prepared_run(tmp_path)
+    payload = {
+        "prediction_type": "significant_drop_multi_horizon",
+        "probability": 0.42,
+        "model_name": "unified_all_2020_2025_v1",
+        "decision": "low_risk",
+        "horizon_predictions": {"h1": 0.31, "h5": 0.42, "h20": 0.48, "h60": 0.53},
+    }
+    repository.save_prediction(
+        run_id="RUN-TEST-001",
+        company_id="TEST",
+        as_of_date=date(2025, 1, 1),
+        payload=payload,
+    )
+
+    summaries = service.list_runs()
+
+    assert len(summaries) == 1
+    assert summaries[0].prediction == payload
+
+
 def test_rejected_finding_keeps_failed_verification_in_the_audit_log(
     tmp_path: Path,
 ) -> None:
@@ -173,6 +199,47 @@ def test_rejected_finding_keeps_failed_verification_in_the_audit_log(
     assert review.verification.passed is False
     assert review.resulting_finding.status is VerificationStatus.REJECTED
     assert repository.list_reviews("RUN-TEST-001", finding_id=finding.finding_id) == (review,)
+
+
+def test_confirmed_finding_with_failed_verification_returns_business_error(
+    tmp_path: Path,
+) -> None:
+    service, repository, finding = _prepared_run(tmp_path)
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(source_path.read_bytes() + b"tampered")
+
+    with pytest.raises(ReviewBlockedError) as exc_info:
+        service.review_finding(
+            run_id="RUN-TEST-001",
+            finding_id=finding.finding_id,
+            decision=ReviewDecision.CONFIRMED,
+            reviewer="analyst@example.com",
+        )
+
+    assert exc_info.value.verification.passed is False
+    assert repository.list_reviews("RUN-TEST-001", finding_id=finding.finding_id) == ()
+
+
+def test_human_can_confirm_failed_automatic_check_with_audited_override(
+    tmp_path: Path,
+) -> None:
+    service, repository, finding = _prepared_run(tmp_path)
+    source_path = tmp_path / "source.pdf"
+    source_path.write_bytes(source_path.read_bytes() + b"tampered")
+
+    review = service.review_finding(
+        run_id="RUN-TEST-001",
+        finding_id=finding.finding_id,
+        decision=ReviewDecision.CONFIRMED,
+        reviewer="张明",
+        comment="已人工核对原文并确认。",
+        manual_override=True,
+    )
+
+    assert review.manual_override is True
+    assert review.verification.passed is False
+    assert review.resulting_finding.status is VerificationStatus.VERIFIED
+    assert repository.get_review(review.review_id) == review
 
 
 def test_edited_finding_replaces_payload_and_preserves_identity(tmp_path: Path) -> None:
@@ -281,6 +348,18 @@ def test_verified_export_bundle_separates_pdf_report_and_full_audit(
                 "probability": 0.72,
                 "decision": "high_risk",
                 "confidence": 0.72,
+                "horizon_predictions": {
+                    "h1": 0.21,
+                    "h5": 0.72,
+                    "h20": 0.44,
+                    "h60": 0.39,
+                },
+                "horizon_thresholds": {
+                    "h1": 0.3,
+                    "h5": 0.6,
+                    "h20": 0.4,
+                    "h60": 0.5,
+                },
                 "feature_completeness": 0.875,
                 "disclaimer": "方向性风险预警，不构成投资建议。",
             },
@@ -302,21 +381,145 @@ def test_verified_export_bundle_separates_pdf_report_and_full_audit(
     )
     audit = json.loads(bundle.audit_path.read_text(encoding="utf-8"))
 
-    assert bundle.pdf_path.name == "verified_risk_report.pdf"
+    assert bundle.pdf_path.name.startswith("TEST_测试公司_")
+    assert "_IPO风险穿透预警报告_" in bundle.pdf_path.name
+    assert bundle.pdf_path.suffix == ".pdf"
     assert bundle.pdf_path.read_bytes().startswith(b"%PDF")
+    assert bundle.audit_pdf_path.name.startswith("TEST_测试公司_")
+    assert "_IPO分析完整审计报告_" in bundle.audit_pdf_path.name
+    assert bundle.audit_pdf_path.suffix == ".pdf"
+    assert bundle.audit_pdf_path.read_bytes().startswith(b"%PDF")
     assert compact_report.agent_traces == ()
     assert audit["export_type"] == "analysis_audit_bundle"
     assert len(audit["candidate_report"]["agent_traces"]) == 1
     assert len(audit["reviews"]) == 1
     assert audit["prediction"]["probability"] == 0.72
+    assert "feature_audit" in audit
+    with bundle.prediction_path.open(encoding="utf-8-sig", newline="") as stream:
+        prediction_rows = list(csv.DictReader(stream))
+    assert [row["window"] for row in prediction_rows] == ["1d", "5d", "20d", "60d"]
+    assert [row["risk_level"] for row in prediction_rows] == [
+        "未触发显著下跌预警",
+        "触发显著下跌预警",
+        "触发显著下跌预警",
+        "未触发显著下跌预警",
+    ]
 
     document = fitz.open(bundle.pdf_path)
     pdf_text = "".join(page.get_text() for page in document)
     document.close()
     assert "客户集中度风险" in pdf_text
-    assert "上市后五日风险预警" in pdf_text
+    assert "多时间窗风险预警" in pdf_text
+    assert "技术分析链路" in pdf_text
+    assert "招股书 PDF 解析" in pdf_text
+    assert "多 Agent 专业分析" in pdf_text
+    assert "特征提取与确定性计算" in pdf_text
     assert finding.claim in pdf_text
     assert "Customer concentration remains material" in pdf_text
+    assert "模型输入完整度" not in pdf_text
+    assert "5日显著下跌概率" not in pdf_text
+    assert "方向置信度" not in pdf_text
+    assert "72.0%" not in pdf_text
+    assert "触发显著下跌预警" in pdf_text
+    assert "上市首日" in pdf_text
+    assert "5个交易日" in pdf_text
+    assert "20个交易日" in pdf_text
+    assert "60个交易日" in pdf_text
+
+    audit_document = fitz.open(bundle.audit_pdf_path)
+    audit_pdf_text = "".join(page.get_text() for page in audit_document)
+    audit_document.close()
+    assert "完整分析审计报告" in audit_pdf_text
+    assert "审计摘要" in audit_pdf_text
+    assert "全部风险、证据与人工复核" in audit_pdf_text
+    assert "人工复核记录" in audit_pdf_text
+    assert "Agent与关键工具链" in audit_pdf_text
+    assert "特征构建与确定性计算" in audit_pdf_text
+    assert "模型路径" not in audit_pdf_text
+    assert "2026-07-19 17:00:00" in audit_pdf_text
+    assert finding.claim in audit_pdf_text
+    assert "Customer concentration remains material" in audit_pdf_text
+    assert "原文、期间和风险表述一致。" in audit_pdf_text
+    assert finding.finding_id in audit_pdf_text
+
+
+def test_verified_pdf_renders_table_evidence_as_simplified_structured_table(
+    tmp_path: Path,
+) -> None:
+    evidence = Evidence(
+        evidence_id="E-TABLE-0001",
+        company_id="TEST",
+        document_id="doc_test_prospectus_2025-01-01_aaaaaaaa",
+        source_file="source.pdf",
+        source_hash="a" * 64,
+        page=12,
+        printed_page_label="I-8",
+        bbox=(10.0, 20.0, 280.0, 160.0),
+        quote=(
+            "[表格证据]\n"
+            "| 項目 | 2022年 | 2023年 |\n"
+            "|---|---:|---:|\n"
+            "| 服務成本 | (1,250) | (1,480) |\n"
+            "| 毛利 | 520 | 610 |"
+        ),
+        evidence_type=EvidenceType.TABLE,
+        extractor=AgentRole.DOCUMENT_PARSER,
+        confidence=0.96,
+        available_at=date(2025, 1, 1),
+        table_id="T-P0012-001",
+        table_cell_refs=(
+            "T-P0012-001:R1:C1",
+            "T-P0012-001:R1:C2",
+            "T-P0012-001:R1:C3",
+            "T-P0012-001:R2:C1",
+            "T-P0012-001:R2:C2",
+            "T-P0012-001:R2:C3",
+        ),
+        table_cell_values=("服務成本", "(1,250)", "(1,480)", "毛利", "520", "610"),
+        created_at=NOW,
+    )
+    finding = RiskFinding(
+        finding_id="F-TABLE-0001",
+        company_id="TEST",
+        risk_type="cost_pressure",
+        title="服务成本上升风险",
+        severity=RiskSeverity.HIGH,
+        claim="服务成本上升可能压缩盈利空间。",
+        evidence_ids=(evidence.evidence_id,),
+        status=VerificationStatus.VERIFIED,
+        confidence=0.9,
+        created_by=AgentRole.FINANCE,
+        created_at=NOW,
+    )
+    report = RiskAnalysisReport(
+        run_id="RUN-TABLE-001",
+        company_id="TEST",
+        company_name="测试公司",
+        generated_at=NOW,
+        source_document=SourceDocument(
+            document_id=evidence.document_id,
+            source_file=evidence.source_file,
+            source_hash=evidence.source_hash,
+            available_at=date(2025, 1, 1),
+            page_count=20,
+            chunk_count=30,
+        ),
+        summary=AnalysisSummary(evidence_count=1, finding_count=1, screenshot_count=0),
+        evidences=(evidence,),
+        risk_findings=(finding,),
+        agent_traces=(),
+        evidence_display_zh_hans={evidence.evidence_id: evidence.quote},
+    )
+    destination = tmp_path / "table_report.pdf"
+    write_verified_pdf_report(report, destination, project_root=tmp_path)
+
+    document = fitz.open(destination)
+    pdf_text = "".join(page.get_text() for page in document)
+    document.close()
+    assert "结构化表格（简体中文）" in pdf_text
+    assert "服务成本" in pdf_text
+    assert "(1,250)" in pdf_text
+    assert "|---|" not in pdf_text
 
 
 def test_verified_report_is_blocked_while_any_finding_is_pending(tmp_path: Path) -> None:
@@ -441,6 +644,54 @@ def test_historical_run_can_rerun_prediction_from_saved_features(
     assert records[0].risk_probability == 0.63
 
 
+def test_historical_prediction_uses_company_listing_date_when_snapshot_omits_it(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    service, repository, _ = _prepared_run(tmp_path)
+    company = repository.get_company("TEST")
+    assert company is not None
+    repository.upsert_company(company.model_copy(update={"listing_date": date(2025, 1, 8)}))
+    feature_path = tmp_path / "artifacts" / "prelisting_features.json"
+    feature_path.write_text(
+        json.dumps(
+            {
+                "run_id": "RUN-TEST-001",
+                "company_id": "TEST",
+                "features": {"agent_score": {"value": 2.0, "unit": "score"}},
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    def fake_prediction(**kwargs):
+        assert kwargs["prediction_as_of_fallback"] == date(2025, 1, 8)
+        destination = kwargs["destination_path"]
+        payload = {
+            "prediction_type": "significant_drop_5d",
+            "prediction_variant": "agent_enhanced",
+            "run_id": "RUN-TEST-001",
+            "company_id": "TEST",
+            "model_name": "test-model",
+            "probability": 0.51,
+        }
+        destination.write_text(json.dumps(payload), encoding="utf-8")
+        return payload, destination
+
+    monkeypatch.setattr(
+        "ipo_risk.reviewing.generate_runtime_prediction_from_feature_file",
+        fake_prediction,
+    )
+
+    prediction, _ = service.rerun_prediction(
+        "RUN-TEST-001",
+        variant="agent_enhanced",
+    )
+
+    assert prediction["probability"] == 0.51
+
+
 def test_delete_analysis_run_removes_derived_state_but_preserves_source(
     tmp_path: Path,
 ) -> None:
@@ -466,12 +717,14 @@ def test_delete_analysis_run_removes_derived_state_but_preserves_source(
     assert source_path.is_file()
     assert not report_path.exists()
     assert not bundle.pdf_path.exists()
+    assert not bundle.audit_pdf_path.exists()
     assert not bundle.json_path.exists()
     assert not bundle.audit_path.exists()
     recovered_names = {path.name for path in result.recovery_path.rglob("*")}
     assert {
         report_path.name,
         bundle.pdf_path.name,
+        bundle.audit_pdf_path.name,
         bundle.json_path.name,
         bundle.audit_path.name,
     } <= recovered_names

@@ -8,6 +8,7 @@ import {
   Search,
   ShieldAlert,
   RefreshCw,
+  Trash2,
   UserCheck,
   WifiOff,
   XCircle,
@@ -34,6 +35,14 @@ import {
   EmptyTitle,
 } from "@/components/ui/empty";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -51,14 +60,17 @@ import { Spinner } from "@/components/ui/spinner";
 import { Textarea } from "@/components/ui/textarea";
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group";
 import { VirtualList } from "@/components/virtual-list";
+import { DebateTimeline } from "@/components/debate-timeline";
 import {
   TableEvidenceViewer,
   tableEvidenceReviewLabel,
   type TableEvidenceReview,
 } from "@/features/reports/table-evidence-viewer";
 import {
+  deleteAnalysisRun,
   evidenceImageUrl,
   exportRun,
+  getAuditMaterials,
   getFindingDetail,
   listReviewRuns,
   listRetryJobs,
@@ -76,9 +88,10 @@ import {
   type FindingFilter,
 } from "@/lib/presentation";
 import { cn } from "@/lib/utils";
-import type { FindingDetail, RetryItem, RetryJob, ReviewRun, StoredFinding } from "@/types";
+import type { AuditMaterials, AuditToolCall, FindingDetail, RetryItem, RetryJob, ReviewRun, StoredFinding } from "@/types";
 
 type ReportsWorkspaceProps = {
+  active: boolean;
   serviceAvailable: boolean;
   initialRunId?: string | null;
   initialFindingId?: string | null;
@@ -99,6 +112,22 @@ function hasTechnicalFailure(finding: StoredFinding): boolean {
   return (uncertainty.includes("专业Agent批量核验失败") || uncertainty.includes("Agent技术失败"))
     && ["incomplete chunked read", "peer closed connection", "connection reset", "server overloaded", "serveroverloaded", "too many requests", "error code: 429"]
       .some((marker) => uncertainty.toLowerCase().includes(marker));
+}
+
+function summarizeToolCalls(calls: AuditToolCall[]) {
+  const grouped = new Map<string, { count: number; failed: number; first: string; last: string; error?: string | null }>();
+  for (const call of calls) {
+    const current = grouped.get(call.tool_name);
+    if (current) {
+      current.count += 1;
+      current.failed += call.status === "failed" ? 1 : 0;
+      current.last = call.ended_at;
+      current.error ||= call.error;
+    } else {
+      grouped.set(call.tool_name, { count: 1, failed: call.status === "failed" ? 1 : 0, first: call.started_at, last: call.ended_at, error: call.error });
+    }
+  }
+  return [...grouped.entries()].map(([tool, summary]) => ({ tool, ...summary }));
 }
 
 type FindingRetryStatus = RetryItem & {
@@ -204,9 +233,9 @@ function FindingItem({ finding, index, retry, selected, onSelect }: {
   );
 }
 
-function SummaryCard({ label, value, suffix = "" }: { label: string; value: number; suffix?: string }) {
+function SummaryCard({ label, value, suffix = "", emphasized = false }: { label: string; value: number | string; suffix?: string; emphasized?: boolean }) {
   return (
-    <div className="rounded-xl border bg-muted/15 px-3 py-2">
+    <div className={cn("rounded-xl border bg-muted/15 px-3 py-2", emphasized && "border-primary/45 bg-primary/5")}>
       <span className="text-xs text-muted-foreground">{label}</span>
       <strong className="mt-1 block text-xl tabular-nums">{value}{suffix}</strong>
     </div>
@@ -216,43 +245,114 @@ function SummaryCard({ label, value, suffix = "" }: { label: string; value: numb
 function PredictionSummary({ run }: { run: ReviewRun }) {
   const prediction = run.prediction;
   if (!prediction) return null;
+  const horizons = [
+    ["h1", "上市首日", prediction.horizon_predictions?.h1, false],
+    ["h5", "5个交易日", prediction.horizon_predictions?.h5 ?? prediction.probability, true],
+    ["h20", "20个交易日", prediction.horizon_predictions?.h20, false],
+    ["h60", "60个交易日", prediction.horizon_predictions?.h60, false],
+  ] as const;
+  const horizonStatus = (key: "h1" | "h5" | "h20" | "h60", value: number | null | undefined) => {
+    if (value == null) return "暂不可用";
+    const alert = prediction.horizon_alerts?.[key];
+    if (alert != null) return alert ? "触发预警" : "未触发预警";
+    const threshold = prediction.horizon_thresholds?.[key];
+    if (threshold != null) return value >= threshold ? "触发预警" : "未触发预警";
+    if (key === "h5") return prediction.predicted_significant_drop_5d ? "触发预警" : "未触发预警";
+    return "暂不可用";
+  };
   const decisionLabel = prediction.decision === "high_risk"
     ? "高风险预警"
     : prediction.recall_guard?.watchlist
       ? "风险观察名单"
     : prediction.decision === "low_risk"
       ? "低风险"
-      : "边界信号 · 暂不预警";
+      : "未触发显著下跌预警";
   return (
     <Card className="border-primary/25 bg-primary/5">
       <CardHeader className="border-b border-border/60">
-        <CardTitle>上市后五日显著下跌预测</CardTitle>
-        <CardDescription>这是决策Agent之后生成的方向性预测；人工复核用于确认风险证据，不会倒推修改本次预测。</CardDescription>
+        <CardTitle>上市后多时间窗口风险预测</CardTitle>
+        <CardDescription>四个模型独立判断不同时间窗口；5个交易日为核心预警窗口。</CardDescription>
         <CardAction>
           <Badge variant={prediction.decision === "high_risk" ? "destructive" : prediction.decision === "low_risk" ? "secondary" : "outline"}>
             {decisionLabel}
           </Badge>
         </CardAction>
       </CardHeader>
-      <CardContent className="grid gap-3 sm:grid-cols-2">
-        <SummaryCard label="下跌风险概率" value={Math.round(prediction.probability * 100)} suffix="%" />
-        <SummaryCard label="模型置信度" value={Math.round(prediction.confidence * 100)} suffix="%" />
+      <CardContent className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        {horizons.map(([key, label, value, emphasized]) => (
+          <SummaryCard
+            key={key}
+            label={label}
+            value={horizonStatus(key, value)}
+            emphasized={emphasized}
+          />
+        ))}
         {prediction.recall_guard?.watchlist && (
-          <Alert className="border-amber-500/35 bg-amber-500/10 sm:col-span-2">
+          <Alert className="sm:col-span-2 xl:col-span-4">
             <ShieldAlert />
             <AlertTitle>高风险召回保护层已命中</AlertTitle>
             <AlertDescription>
-              {prediction.recall_guard.reasons.join("、") || "多项稳定风险因子叠加"}。该标记用于减少漏报，不会覆盖主模型概率。
+              {prediction.recall_guard.reasons.join("、") || "多项稳定风险因子叠加"}。该标记用于减少漏报，不会覆盖主模型结论。
             </AlertDescription>
           </Alert>
         )}
-        <p className="text-xs text-muted-foreground sm:col-span-2">{prediction.disclaimer}</p>
+        <p className="text-xs text-muted-foreground sm:col-span-2 xl:col-span-4">{prediction.disclaimer}</p>
       </CardContent>
     </Card>
   );
 }
 
-export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindingId, onReconnect, onSelectionChange, setError }: ReportsWorkspaceProps) {
+function TextEmbellishmentSummary({ assessment }: { assessment: NonNullable<AuditMaterials["text_embellishment"]> }) {
+  if (assessment.evidence_ids.length === 0) return null;
+  const levelLabel = { low: "低", medium: "中", high: "高", critical: "严重" }[assessment.level];
+  return (
+    <Card className="border-border/70 bg-card/75">
+      <CardHeader className="border-b border-border/60">
+        <CardTitle>招股书文本粉饰分析</CardTitle>
+        <CardDescription>对照业务概览、风险因素与财务披露，识别宣传性表述和选择性披露。</CardDescription>
+        <CardAction>
+          <Badge variant={assessment.detected ? "destructive" : "secondary"}>粉饰程度：{levelLabel}</Badge>
+        </CardAction>
+      </CardHeader>
+      <CardContent className="grid gap-3 md:grid-cols-[minmax(0,1fr)_auto] md:items-center">
+        <p className="text-sm leading-6 text-muted-foreground">{assessment.summary}</p>
+        <div className="flex flex-wrap gap-2 text-xs">
+          <Badge variant="outline">原文证据 {assessment.evidence_ids.length} 条</Badge>
+          {assessment.debate_used && <Badge variant="outline">已完成补证辩论</Badge>}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function AgentModelRoutingSummary({ assignments }: { assignments: Record<string, string> }) {
+  const roles = {
+    discovery: "风险发现 Agent", finance: "财务 Agent", legal: "法律 Agent",
+    business: "业务 Agent", market: "市场 Agent", decision: "决策 Agent",
+  } as const;
+  const models: Record<string, string> = {
+    deepseek_flash: "DeepSeek Flash", deepseek_pro: "DeepSeek Pro", kimi: "Kimi K3",
+  };
+  return (
+    <Card className="border-border/70 bg-card/75">
+      <CardHeader className="border-b border-border/60">
+        <CardTitle>Agent模型编排</CardTitle>
+        <CardDescription>本次分析启动前已固化模型分配，重试与补证均沿用原模型。</CardDescription>
+        <CardAction><Badge variant="secondary">运行中不可切换</Badge></CardAction>
+      </CardHeader>
+      <CardContent className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {Object.entries(roles).map(([role, label]) => (
+          <div key={role} className="flex items-center justify-between gap-3 rounded-xl border bg-background/35 px-3 py-2.5">
+            <span className="text-sm font-medium">{label}</span>
+            <Badge variant="outline">{models[assignments[role]] ?? assignments[role] ?? "历史记录未保存"}</Badge>
+          </div>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+export function ReportsWorkspace({ active, serviceAvailable, initialRunId, initialFindingId, onReconnect, onSelectionChange, setError }: ReportsWorkspaceProps) {
   const [runs, setRuns] = useState<ReviewRun[]>([]);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   const [loadedRunId, setLoadedRunId] = useState<string | null>(null);
@@ -264,6 +364,8 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
   const [loadingDetail, setLoadingDetail] = useState(false);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [exportingKind, setExportingKind] = useState<"pdf" | "audit_pdf" | "audit" | "prediction_csv" | "trace_json" | null>(null);
+  const [reviewJustCompleted, setReviewJustCompleted] = useState(false);
   const [query, setQuery] = useState("");
   const [reviewer, setReviewer] = useState("张明");
   const [comment, setComment] = useState("无");
@@ -274,7 +376,13 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
   const [findingFilter, setFindingFilter] = useState<FindingFilter>("all");
   const [retryJobs, setRetryJobs] = useState<RetryJob[]>([]);
   const [retrySubmitting, setRetrySubmitting] = useState(false);
+  const [deleteDialogOpen, setDeleteDialogOpen] = useState(false);
+  const [deletingRun, setDeletingRun] = useState(false);
   const [tableEvidenceReviews, setTableEvidenceReviews] = useState<Record<string, TableEvidenceReview>>({});
+  const [auditMaterials, setAuditMaterials] = useState<AuditMaterials | null>(null);
+  const [auditView, setAuditView] = useState<"toolchain" | "evidence">("toolchain");
+  const [auditQuery, setAuditQuery] = useState("");
+  const [loadingAuditMaterials, setLoadingAuditMaterials] = useState(false);
   const requestedRunIdRef = useRef(initialRunId);
   const requestedFindingIdRef = useRef(initialFindingId);
   const selectedRunIdRef = useRef<string | null>(null);
@@ -288,13 +396,15 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
   useEffect(() => {
     requestedRunIdRef.current = initialRunId;
     requestedFindingIdRef.current = initialFindingId;
-    if (initialRunId && runs.some((run) => run.run_id === initialRunId)) {
+    if (!initialRunId && !initialFindingId) return;
+    if (initialRunId && runs.length > 0 && runs.some((run) => run.run_id === initialRunId)) {
       setSelectedRunId(initialRunId);
     }
-    if (initialFindingId && findings.some((finding) => finding.finding_id === initialFindingId)) {
+    if (initialFindingId && findings.length > 0 && findings.some((finding) => finding.finding_id === initialFindingId)) {
       setSelectedFindingId(initialFindingId);
     }
-  }, [findings, initialFindingId, initialRunId, runs]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only react to external navigation, not internal state
+  }, [initialFindingId, initialRunId]);
 
   const refreshRuns = useCallback(async () => {
     const rows = await listReviewRuns();
@@ -307,11 +417,12 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
   }, []);
 
   useEffect(() => {
+    if (!active) return;
     setLoadingRuns(true);
     void refreshRuns()
       .catch((error) => setError(error instanceof Error ? error.message : "分析记录加载失败。"))
       .finally(() => setLoadingRuns(false));
-  }, [refreshRuns, setError]);
+  }, [active, refreshRuns, setError]);
 
   useEffect(() => {
     if (!selectedRunId) {
@@ -343,6 +454,22 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
       .catch((error) => active && setError(error instanceof Error ? error.message : "风险结论加载失败。"))
       .finally(() => active && setLoadingFindings(false));
     return () => { active = false; };
+  }, [selectedRunId, setError]);
+
+  useEffect(() => {
+    if (!selectedRunId) {
+      setAuditMaterials(null);
+      return;
+    }
+    setReviewJustCompleted(false);
+    let mounted = true;
+    setLoadingAuditMaterials(true);
+    setAuditMaterials(null);
+    void getAuditMaterials(selectedRunId)
+      .then((payload) => mounted && setAuditMaterials(payload))
+      .catch((error) => mounted && setError(error instanceof Error ? error.message : "审计材料加载失败。"))
+      .finally(() => mounted && setLoadingAuditMaterials(false));
+    return () => { mounted = false; };
   }, [selectedRunId, setError]);
 
   useEffect(() => {
@@ -495,6 +622,16 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
     if (findingFilter === "pending") return !["verified", "rejected"].includes(finding.status);
     return finding.status === findingFilter;
   }), [findingFilter, findings]);
+  const filteredAuditEvidence = useMemo(() => {
+    const normalized = auditQuery.trim().toLowerCase();
+    return (auditMaterials?.evidences ?? []).filter((evidence) => !normalized || [
+      evidence.evidence_id,
+      evidence.quote,
+      evidence.evidence_type,
+      String(evidence.page),
+      ...evidence.findings.flatMap((finding) => [finding.title, finding.risk_type]),
+    ].join(" ").toLowerCase().includes(normalized));
+  }, [auditMaterials, auditQuery]);
 
   const selectRun = useCallback((runId: string) => {
     if (runId === selectedRunId) return;
@@ -529,7 +666,11 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
       const status = tableEvidenceReviews[evidence.evidence_id];
       return status !== undefined && status !== "matched";
     }) ?? false;
-    const finalComment = [comment.trim(), ...tableReviewLines].filter(Boolean).join("\n");
+    const manualOverride = decision !== "rejected" && detail?.verification.passed === false;
+    const overrideNote = manualOverride
+      ? "[人工确认] 自动一致性校验存在待核项，复核人已查看原文证据并确认该风险结论。"
+      : "";
+    const finalComment = [comment.trim(), overrideNote, ...tableReviewLines].filter(Boolean).join("\n");
     if (decision !== "confirmed" && !comment.trim() && !hasTableIssue) {
       return setError("驳回或编辑结论时必须填写复核意见，或标记具体的表格问题。");
     }
@@ -540,6 +681,7 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
         decision,
         reviewer: reviewer.trim(),
         comment: finalComment || undefined,
+        manual_override: manualOverride,
         ...(decision === "edited" ? {
           title: editTitle.trim(),
           claim: editClaim.trim(),
@@ -551,13 +693,20 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
       const rows = await listRunFindings(selectedRunId);
       setFindings(rows);
       const next = rows.find((row) => !["verified", "rejected"].includes(row.status));
+      setReviewJustCompleted(!next && rows.length > 0);
+      if (!next && rows.length > 0) setFindingFilter("all");
       const nextId = next?.finding_id ?? selectedFindingId;
       setSelectedFindingId(nextId);
       setComment("无");
       setTableEvidenceReviews((current) => Object.fromEntries(
         Object.entries(current).filter(([evidenceId]) => !detail?.evidences.some((evidence) => evidence.evidence_id === evidenceId)),
       ));
-      setDetail(await getFindingDetail(selectedRunId, nextId));
+      const nextDetail = await getFindingDetail(selectedRunId, nextId);
+      setDetail(nextDetail);
+      setEditTitle(nextDetail.finding.title);
+      setEditClaim(nextDetail.finding.claim);
+      setEditSeverity(nextDetail.finding.severity);
+      setEditConfidence(nextDetail.finding.confidence);
     } catch (error) {
       setError(error instanceof Error ? error.message : "复核提交失败。");
     } finally {
@@ -565,18 +714,46 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
     }
   };
 
-  const handleExport = async () => {
+  const handleExport = async (kind: "pdf" | "audit_pdf" | "audit" | "prediction_csv" | "trace_json") => {
     if (!selectedRunId) return;
     if (!serviceAvailable) return setError("分析服务当前未连接，重新连接后才能导出报告。");
-    setSubmitting(true);
+    setExportingKind(kind);
+    setError(null);
     try {
       const files = await exportRun(selectedRunId);
-      if (files.pdf) downloadFromUrl(files.pdf);
+      if (files[kind]) downloadFromUrl(files[kind]);
       await refreshRuns();
     } catch (error) {
       setError(error instanceof Error ? error.message : "正式报告导出失败。");
     } finally {
-      setSubmitting(false);
+      setExportingKind(null);
+    }
+  };
+
+  const handleDeleteRun = async () => {
+    if (!selectedRunId) return;
+    if (!serviceAvailable) return setError("分析服务当前未连接，重新连接后才能删除记录。");
+    if (retryActive) return setError("该分析正在重新处理，请等待任务结束后再删除。");
+    const deletedRunId = selectedRunId;
+    setDeletingRun(true);
+    setError(null);
+    try {
+      await deleteAnalysisRun(deletedRunId);
+      requestedRunIdRef.current = null;
+      requestedFindingIdRef.current = null;
+      setRuns((current) => current.filter((run) => run.run_id !== deletedRunId));
+      setSelectedRunId(null);
+      setLoadedRunId(null);
+      setFindings([]);
+      setSelectedFindingId(null);
+      setDetail(null);
+      setRetryJobs([]);
+      setDeleteDialogOpen(false);
+      await refreshRuns();
+    } catch (error) {
+      setError(error instanceof Error ? error.message : "分析记录删除失败。");
+    } finally {
+      setDeletingRun(false);
     }
   };
 
@@ -608,6 +785,9 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
   const activeRetryItem = selectedRetryItem && ["queued", "running"].includes(selectedRetryItem.state)
     ? selectedRetryItem
     : undefined;
+  const findingConfirmed = detail?.finding.status === "verified";
+  const findingRejected = detail?.finding.status === "rejected";
+  const reviewComplete = reviewJustCompleted || Boolean(selectedRun?.complete);
 
   return (
     <div className="space-y-5">
@@ -619,6 +799,27 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge variant="secondary">{runs.length} 次分析运行</Badge>
+          <Button
+            variant="outline"
+            disabled={!serviceAvailable || loadingRuns}
+            onClick={() => {
+              setLoadingRuns(true);
+              void refreshRuns()
+                .catch((error) => setError(error instanceof Error ? error.message : "分析记录加载失败。"))
+                .finally(() => setLoadingRuns(false));
+            }}
+          >
+            {loadingRuns ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}
+            刷新结果
+          </Button>
+          <Button
+            variant="outline"
+            disabled={!serviceAvailable || !selectedRun || deletingRun || retryActive}
+            onClick={() => setDeleteDialogOpen(true)}
+          >
+            <Trash2 data-icon="inline-start" />
+            删除当前记录
+          </Button>
           {technicalFailureCount > 0 && (
             <Button variant="outline" disabled={!serviceAvailable || retrySubmitting || retryActive} onClick={() => void startRetry("run")}>
               {retrySubmitting || retryActive ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}
@@ -629,6 +830,15 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
       </section>
 
       {selectedRun && <PredictionSummary run={selectedRun} />}
+      {auditMaterials?.text_embellishment && (
+        <TextEmbellishmentSummary assessment={auditMaterials.text_embellishment} />
+      )}
+      {auditMaterials?.agent_models && Object.keys(auditMaterials.agent_models).length > 0 && (
+        <AgentModelRoutingSummary assignments={auditMaterials.agent_models} />
+      )}
+      {selectedRun && !loadingAuditMaterials && (
+        <DebateTimeline records={auditMaterials?.debates ?? []} />
+      )}
 
       <div className="grid min-w-0 gap-4 2xl:grid-cols-[280px_390px_minmax(520px,1fr)]">
         <Card className="min-w-0 bg-card/75">
@@ -749,34 +959,7 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
                     </div>
                     <h2 className="text-xl font-semibold leading-tight">{detail.finding.title}</h2>
                     <p className="mt-3 text-sm leading-7 text-foreground/90">{detail.finding.claim}</p>
-                    {detail.finding.uncertainty && (
-                      <Alert variant={detail.retryable_failure ? "destructive" : "default"} className="mt-4">
-                        <ShieldAlert />
-                        <AlertTitle>{detail.retryable_failure ? "模型连接中断，风险结论尚未完成" : "证据边界"}</AlertTitle>
-                        <AlertDescription className="space-y-3">
-                          <p>{detail.finding.uncertainty}</p>
-                          {activeRetryItem ? (
-                            <div className="rounded-lg border border-current/15 bg-background/30 p-3">
-                              <div className="flex items-center gap-2 font-medium"><Spinner />{activeRetryItem.stage}</div>
-                              <Progress className="mt-2" value={Math.min(100, (activeRetryItem.attempt / activeRetryItem.maxAttempts) * 100)} />
-                              <p className="mt-2 text-xs">第 {Math.max(1, activeRetryItem.attempt)} / {activeRetryItem.maxAttempts} 次尝试 · 复用现有证据，不重新解析PDF或向量化</p>
-                            </div>
-                          ) : detail.retryable_failure && (
-                            <div className="flex flex-wrap gap-2">
-                              <Button size="sm" disabled={!serviceAvailable || retrySubmitting} onClick={() => void startRetry("finding")}>
-                                {retrySubmitting ? <Spinner data-icon="inline-start" /> : <RefreshCw data-icon="inline-start" />}重试当前风险
-                              </Button>
-                              <Button size="sm" variant="outline" disabled={!serviceAvailable || retrySubmitting} onClick={() => void startRetry("agent")}>
-                                重试该 Agent 的失败项
-                              </Button>
-                              <Button size="sm" variant="outline" disabled={!serviceAvailable || retrySubmitting} onClick={() => void startRetry("run")}>
-                                重试本公司全部技术失败
-                              </Button>
-                            </div>
-                          )}
-                        </AlertDescription>
-                      </Alert>
-                    )}
+                    {/* 证据边界区块已移除 */}
                   </section>
                   <Separator />
                   <section className="space-y-4">
@@ -789,7 +972,7 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
                           <CardAction><Badge variant="outline">{Math.round(evidence.confidence * 100)}%</Badge></CardAction>
                         </CardHeader>
                         <CardContent className="space-y-3">
-                          {evidence.table_id || evidence.table_cell_refs.length > 0 || evidence.evidence_type === "table" ? (
+                          {evidence.display_table || evidence.table_id || evidence.table_cell_refs.length > 0 || evidence.evidence_type === "table" ? (
                             <TableEvidenceViewer
                               evidence={evidence}
                               imageUrl={evidence.screenshot_path ? evidenceImageUrl(selectedRunId, evidence.evidence_id) : undefined}
@@ -831,6 +1014,15 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
                   <Separator />
                   <section className="space-y-4">
                     <div className="flex items-center justify-between"><h3 className="font-semibold">人工复核</h3><Badge variant="outline">{findingStatusLabel[detail.finding.status] ?? detail.finding.status}</Badge></div>
+                    {reviewComplete && (
+                      <div className="flex gap-3 rounded-xl border border-emerald-500/25 bg-emerald-500/[0.06] p-4">
+                        <CheckCircle2 className="mt-0.5 size-5 shrink-0 text-emerald-500" />
+                        <div>
+                          <p className="text-sm font-semibold text-emerald-600 dark:text-emerald-400">本次复核已完成</p>
+                          <p className="mt-1 text-xs leading-5 text-muted-foreground">所有风险均已确认或驳回，可以导出正式报告；已复核结论仍可通过“保存编辑”继续修改。</p>
+                        </div>
+                      </div>
+                    )}
                     <FieldGroup>
                       <Field><FieldLabel>复核人</FieldLabel><Input value={reviewer} onChange={(event) => setReviewer(event.target.value)} placeholder="姓名或工号" /></Field>
                       <Field><FieldLabel>复核意见</FieldLabel><Textarea value={comment} onChange={(event) => setComment(event.target.value)} placeholder="驳回或编辑时必填" /></Field>
@@ -847,8 +1039,8 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
                       </details>
                     </FieldGroup>
                     <div className="grid gap-2 sm:grid-cols-3">
-                      <Button disabled={!serviceAvailable || submitting || Boolean(activeRetryItem)} onClick={() => void submitDecision("confirmed")}>{submitting ? <Spinner data-icon="inline-start" /> : <CheckCircle2 data-icon="inline-start" />}确认</Button>
-                      <Button variant="destructive" disabled={!serviceAvailable || submitting || Boolean(activeRetryItem)} onClick={() => void submitDecision("rejected")}><XCircle data-icon="inline-start" />驳回</Button>
+                      <Button disabled={!serviceAvailable || submitting || Boolean(activeRetryItem) || findingConfirmed} title={!detail.verification.passed ? "将作为人工确认写入审计记录" : undefined} onClick={() => void submitDecision("confirmed")}>{submitting ? <Spinner data-icon="inline-start" /> : <CheckCircle2 data-icon="inline-start" />}{findingConfirmed ? "已确认" : detail.verification.passed ? "确认" : "人工确认"}</Button>
+                      <Button variant="destructive" disabled={!serviceAvailable || submitting || Boolean(activeRetryItem) || findingRejected} onClick={() => void submitDecision("rejected")}><XCircle data-icon="inline-start" />{findingRejected ? "已驳回" : "驳回"}</Button>
                       <Button variant="outline" disabled={!serviceAvailable || submitting || Boolean(activeRetryItem)} onClick={() => void submitDecision("edited")}><FileCheck2 data-icon="inline-start" />保存编辑</Button>
                     </div>
                   </section>
@@ -859,7 +1051,7 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
                       {detail.reviews.map((review) => (
                         <div className="flex gap-3 rounded-xl border p-3" key={review.review_id}>
                           <UserCheck className="mt-0.5 size-4 shrink-0 text-primary" />
-                          <div><strong className="text-sm">{review.reviewer} · {review.decision}</strong><p className="mt-1 text-xs text-muted-foreground">{review.comment || "未填写补充意见"} · {formatTime(review.created_at)}</p></div>
+                          <div><strong className="text-sm">{review.reviewer} · {review.decision}{review.manual_override ? " · 人工覆盖" : ""}</strong><p className="mt-1 text-xs text-muted-foreground">{review.comment || "未填写补充意见"} · {formatTime(review.created_at)}</p></div>
                         </div>
                       ))}
                     </section>
@@ -892,10 +1084,76 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
       </div>
 
       {selectedRun && (
+        <Card className="bg-card/75">
+          <CardHeader className="border-b border-border/60">
+            <CardTitle>审计材料中心</CardTitle>
+            <CardDescription>内容直接读取数据库；JSON仅用于下载交付。</CardDescription>
+            <CardAction>
+              <div className="flex rounded-lg border p-1">
+                <Button size="sm" variant={auditView === "toolchain" ? "secondary" : "ghost"} onClick={() => setAuditView("toolchain")}>推理与工具链</Button>
+                <Button size="sm" variant={auditView === "evidence" ? "secondary" : "ghost"} onClick={() => setAuditView("evidence")}>关键证据库</Button>
+              </div>
+            </CardAction>
+          </CardHeader>
+          <CardContent className="space-y-4">
+            {loadingAuditMaterials ? (
+              <div className="space-y-3"><Skeleton className="h-20 w-full" /><Skeleton className="h-20 w-full" /></div>
+            ) : auditView === "toolchain" ? (
+              <div className="space-y-3">
+                {(auditMaterials?.business_toolchain ?? []).map((stage, index) => (
+                  <div key={`${stage.stage}-${index}`} className="rounded-xl border bg-background/40 p-4">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className="flex size-6 items-center justify-center rounded-full bg-primary/10 text-xs font-semibold text-primary">{index + 1}</span>
+                      <strong className="text-sm">{stage.stage}</strong>
+                      <Badge variant="secondary">已完成</Badge>
+                    </div>
+                    <p className="mt-2 text-sm text-muted-foreground">{stage.summary}</p>
+                    <div className="mt-2 flex flex-wrap gap-1.5">{stage.tools.map((tool) => <Badge key={tool} variant="outline" className="font-normal">{tool}</Badge>)}</div>
+                  </div>
+                ))}
+                {(auditMaterials?.agent_traces ?? []).map((trace) => (
+                  <details key={trace.trace_id} className="rounded-xl border p-4">
+                    <summary className="cursor-pointer text-sm font-semibold">{trace.agent} Agent · {trace.tool_calls.length} 次工具调用 · {formatTime(trace.started_at)} 至 {formatTime(trace.ended_at)}</summary>
+                    <p className="mt-2 text-sm text-muted-foreground">{trace.decision}</p>
+                    <div className="mt-3 space-y-2">{summarizeToolCalls(trace.tool_calls).map((call) => (
+                      <div key={call.tool} className="flex flex-wrap items-center gap-2 rounded-lg bg-muted/35 px-3 py-2 text-xs">
+                        <Badge variant={call.failed === 0 ? "secondary" : "destructive"}>{call.failed === 0 ? "成功" : `${call.failed} 次异常`}</Badge>
+                        <strong>{call.tool}</strong>
+                        <span className="text-muted-foreground">调用 {call.count} 次 · {formatTime(call.first)} 至 {formatTime(call.last)}</span>
+                        {call.error && <span className="w-full text-destructive">{call.error}</span>}
+                      </div>
+                    ))}</div>
+                  </details>
+                ))}
+              </div>
+            ) : (
+              <div className="space-y-4">
+                <div className="relative"><Search className="pointer-events-none absolute left-3 top-2.5 size-4 text-muted-foreground" /><Input value={auditQuery} onChange={(event) => setAuditQuery(event.target.value)} placeholder="搜索风险、证据原文、页码或证据编号" className="pl-9" /></div>
+                <p className="text-xs text-muted-foreground">共 {filteredAuditEvidence.length} 条证据</p>
+                <div className="grid gap-3 lg:grid-cols-2">{filteredAuditEvidence.map((evidence) => (
+                  <details key={evidence.evidence_id} className="rounded-xl border bg-background/40 p-4">
+                    <summary className="cursor-pointer list-none">
+                      <div className="flex flex-wrap items-center gap-2"><strong className="text-sm">{evidence.evidence_id}</strong><Badge variant="outline">第 {evidence.page} 页</Badge><Badge variant="secondary">{evidence.evidence_type}</Badge></div>
+                      <p className="mt-2 line-clamp-3 text-sm leading-6 text-muted-foreground">{evidence.quote}</p>
+                    </summary>
+                    <div className="mt-3 border-t pt-3">
+                      <p className="whitespace-pre-wrap text-sm leading-6">{evidence.quote}</p>
+                      <div className="mt-3 flex flex-wrap gap-1.5">{evidence.findings.map((finding) => <Badge key={finding.finding_id} variant="outline">{finding.title}</Badge>)}</div>
+                      {evidence.screenshot_path && selectedRunId && <Button className="mt-3" size="sm" variant="outline" onClick={() => window.open(evidenceImageUrl(selectedRunId, evidence.evidence_id), "_blank")}>查看证据截图</Button>}
+                    </div>
+                  </details>
+                ))}</div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {selectedRun && (
         <Card className="border-primary/25 bg-card/75">
           <CardHeader className="border-b border-border/60">
-            <CardTitle>最终报告交付</CardTitle>
-            <CardDescription>只有全部风险完成确认或驳回后，才生成正式PDF、精简JSON与完整审计包。</CardDescription>
+            <CardTitle>最终报告与交付材料</CardTitle>
+            <CardDescription>复核闭环后，可下载正式报告、完整审计材料、四个时间窗口预测结果和推理日志。</CardDescription>
             <CardAction>
               <Badge variant={selectedRun.complete ? "secondary" : "outline"}>
                 {selectedRun.complete ? "复核完成" : `还需处理 ${selectedRun.pending_findings} 条`}
@@ -907,17 +1165,69 @@ export function ReportsWorkspace({ serviceAvailable, initialRunId, initialFindin
             <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
               <p className="text-sm text-muted-foreground">
                 {selectedRun.complete
-                  ? "人工复核已闭环，报告将包含五日风险预测、最终风险结论、原文证据和审计引用。"
+                  ? "人工复核已闭环，报告将包含多时间窗口风险预测、最终风险结论、原文证据和审计引用。"
                   : "请先处理风险清单中的待复核项；预测结果已经生成，无需等待复核才能查看。"}
               </p>
-              <Button disabled={!serviceAvailable || submitting || !selectedRun.complete} onClick={() => void handleExport()}>
-                {submitting ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
-                导出正式报告
-              </Button>
+              <div className="flex flex-wrap justify-end gap-2">
+                <Button disabled={!serviceAvailable || submitting || Boolean(exportingKind) || !selectedRun.complete} onClick={() => void handleExport("pdf")}>
+                  {exportingKind === "pdf" ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                  风险报告 PDF
+                </Button>
+                <Button variant="outline" disabled={!serviceAvailable || submitting || Boolean(exportingKind) || !selectedRun.complete} onClick={() => void handleExport("audit_pdf")}>
+                  {exportingKind === "audit_pdf" ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                  完整审计 PDF
+                </Button>
+                <Button variant="outline" disabled={!serviceAvailable || submitting || Boolean(exportingKind) || !selectedRun.complete} onClick={() => void handleExport("audit")}>
+                  {exportingKind === "audit" ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                  原始审计 JSON
+                </Button>
+                <Button variant="outline" disabled={!serviceAvailable || submitting || Boolean(exportingKind) || !selectedRun.complete} onClick={() => void handleExport("prediction_csv")}>
+                  {exportingKind === "prediction_csv" ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                  最终预测结果
+                </Button>
+                <Button variant="outline" disabled={!serviceAvailable || submitting || Boolean(exportingKind) || !selectedRun.complete} onClick={() => void handleExport("trace_json")}>
+                  {exportingKind === "trace_json" ? <Spinner data-icon="inline-start" /> : <Download data-icon="inline-start" />}
+                  推理日志
+                </Button>
+              </div>
             </div>
           </CardContent>
         </Card>
       )}
+
+      <Dialog
+        open={deleteDialogOpen}
+        onOpenChange={(open) => {
+          if (!deletingRun) setDeleteDialogOpen(open);
+        }}
+      >
+        <DialogContent showCloseButton={!deletingRun}>
+          <DialogHeader>
+            <DialogTitle>删除这次分析记录？</DialogTitle>
+            <DialogDescription>
+              {selectedRun
+                ? `将删除 ${selectedRun.company_id} · ${selectedRun.company_name} 的本次分析、风险、证据、复核、预测和已生成报告。`
+                : "将删除当前选择的分析记录。"}
+            </DialogDescription>
+          </DialogHeader>
+          <Alert variant="destructive">
+            <Trash2 />
+            <AlertTitle>原始招股书不会删除</AlertTitle>
+            <AlertDescription>
+              该记录将从系统列表和数据库中移除；独占的派生文件会移入项目回收区，共享文件继续保留。
+            </AlertDescription>
+          </Alert>
+          <DialogFooter>
+            <Button variant="outline" disabled={deletingRun} onClick={() => setDeleteDialogOpen(false)}>
+              取消
+            </Button>
+            <Button variant="destructive" disabled={deletingRun} onClick={() => void handleDeleteRun()}>
+              {deletingRun ? <Spinner data-icon="inline-start" /> : <Trash2 data-icon="inline-start" />}
+              确认删除
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

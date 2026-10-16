@@ -82,7 +82,11 @@ export async function inspectFiles(files: File[]): Promise<UploadSuggestion[]> {
   return payload.files;
 }
 
-function uploadForm(items: PendingUpload[]): FormData {
+export type ReasoningModel = "deepseek_flash" | "deepseek_pro" | "kimi";
+export type AgentRoleKey = "discovery" | "finance" | "legal" | "business" | "market" | "decision";
+export type AgentModelAssignments = Record<AgentRoleKey, ReasoningModel>;
+
+function uploadForm(items: PendingUpload[], agentModels: AgentModelAssignments): FormData {
   const form = new FormData();
   items.forEach((item) => form.append("files", item.file));
   form.append(
@@ -93,27 +97,34 @@ function uploadForm(items: PendingUpload[]): FormData {
         company_id: item.company_id,
         company_name: item.company_name,
         document_date: item.document_date,
+        listing_date: item.listing_date,
         force_reanalysis: item.force_reanalysis,
       })),
     ),
   );
+  form.append("reasoning_model", agentModels.discovery);
+  form.append("agent_models", JSON.stringify(agentModels));
   return form;
 }
 
-export async function createBatch(items: PendingUpload[]): Promise<BatchSnapshot> {
+export async function createBatch(
+  items: PendingUpload[],
+  agentModels: AgentModelAssignments,
+): Promise<BatchSnapshot> {
   return requestJson<BatchSnapshot>("/batches", {
     method: "POST",
-    body: uploadForm(items),
+    body: uploadForm(items, agentModels),
   }, UPLOAD_TIMEOUT_MS);
 }
 
 export async function appendBatch(
   batchId: string,
   items: PendingUpload[],
+  agentModels: AgentModelAssignments,
 ): Promise<BatchSnapshot> {
   return requestJson<BatchSnapshot>(`/batches/${batchId}/append`, {
     method: "POST",
-    body: uploadForm(items),
+    body: uploadForm(items, agentModels),
   }, UPLOAD_TIMEOUT_MS);
 }
 
@@ -213,6 +224,18 @@ export async function listReviewRuns(): Promise<ReviewRun[]> {
   return payload.runs;
 }
 
+export async function deleteAnalysisRun(runId: string): Promise<{
+  deleted: boolean;
+  run_id: string;
+  recovery_available: boolean;
+  moved_file_count: number;
+  shared_file_count: number;
+}> {
+  return requestJson(`/reports/runs/${encodeURIComponent(runId)}`, {
+    method: "DELETE",
+  });
+}
+
 export async function rerunStoredPrediction(
   runId: string,
   variant: "auto" | "base" | "agent_enhanced" = "auto",
@@ -227,6 +250,14 @@ export async function rerunStoredPrediction(
 export async function listRunFindings(runId: string): Promise<StoredFinding[]> {
   const payload = await requestJson<{ findings: StoredFinding[] }>(`/reports/runs/${encodeURIComponent(runId)}/findings`);
   return payload.findings;
+}
+
+export async function getAuditMaterials(
+  runId: string,
+): Promise<import("./types").AuditMaterials> {
+  return requestJson(
+    `/reports/runs/${encodeURIComponent(runId)}/audit-materials`,
+  );
 }
 
 export async function getFindingDetail(
@@ -245,6 +276,7 @@ export async function reviewFinding(
     decision: "confirmed" | "rejected" | "edited";
     reviewer: string;
     comment?: string;
+    manual_override?: boolean;
     title?: string;
     severity?: string;
     claim?: string;

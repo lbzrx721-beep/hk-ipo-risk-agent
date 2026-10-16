@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import date, datetime
 import json
 from pathlib import Path
 from threading import Event, Lock, Thread
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 from ipo_risk.agents.intervention import (
@@ -18,10 +19,10 @@ from ipo_risk.agents.intervention import (
     RiskScopeReviewDecision,
     RiskScopeReviewRequest,
 )
+from ipo_risk.agents.model_routing import normalize_agent_models
 from ipo_risk.storage.files import read_json, write_json
 from ipo_risk.runtime.analysis_job import AnalysisProgressEvent
 from ipo_risk.runtime.prediction import (
-    DEFAULT_BASE_MODEL_PATH,
     generate_runtime_prediction,
 )
 
@@ -37,6 +38,7 @@ BatchQueueState = Literal[
     "completed",
     "failed",
 ]
+ReasoningModel = Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"]
 
 
 @dataclass(frozen=True)
@@ -59,6 +61,7 @@ class BatchUploadSpec:
     document_date: date
     source_hash: str
     page_count: int
+    listing_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -90,6 +93,8 @@ class BatchCompanySnapshot:
     preparation_error: str | None = None
     risk_scope_review: RiskScopeReviewRequest | None = None
     llm_failure_recovery: LlmFailureRecoveryRequest | None = None
+    agent_models: dict[str, str] | None = None
+    model_assignment_locked: bool = True
 
 
 @dataclass(frozen=True)
@@ -145,14 +150,22 @@ class BatchAnalysisJob:
         companies: tuple[BatchCompany, ...],
         uploads: tuple[BatchUploadSpec, ...] = (),
         runner: ExperimentRunner = _default_experiment_runner,
+        reasoning_model: ReasoningModel = "deepseek_flash",
+        agent_models: Mapping[str, str] | None = None,
     ) -> None:
         if not companies:
             raise ValueError("batch analysis requires at least one company")
+        locked_agent_models = normalize_agent_models(
+            agent_models,
+            legacy_reasoning_model=reasoning_model,
+        )
         self.project_root = project_root.resolve()
         self.experiment_name = experiment_name
         self.companies = companies
         self._uploads = uploads
         self._runner = runner
+        self.reasoning_model = reasoning_model
+        self.agent_models = MappingProxyType(locked_agent_models)
         self._lock = Lock()
         self._pause_requested = Event()
         self._thread: Thread | None = None
@@ -182,6 +195,8 @@ class BatchAnalysisJob:
         experiment_name: str,
         uploads: tuple[BatchUploadSpec, ...],
         runner: ExperimentRunner = _default_experiment_runner,
+        reasoning_model: ReasoningModel = "deepseek_flash",
+        agent_models: Mapping[str, str] | None = None,
     ) -> BatchAnalysisJob:
         """建立上传批次；文件登记与正式分析都在后台线程中执行。"""
         if not uploads:
@@ -202,6 +217,8 @@ class BatchAnalysisJob:
             companies=companies,
             uploads=uploads,
             runner=runner,
+            reasoning_model=reasoning_model,
+            agent_models=agent_models,
         )
 
     @property
@@ -359,6 +376,8 @@ class BatchAnalysisJob:
                     preparation_error=_optional_text(raw.get("preparation_error")),
                     risk_scope_review=pending_scope_review,
                     llm_failure_recovery=pending_recovery,
+                    agent_models=dict(self.agent_models),
+                    model_assignment_locked=True,
                 )
             )
         if active and self._pause_requested.is_set():
@@ -498,13 +517,11 @@ class BatchAnalysisJob:
             prediction_as_of=prediction_as_of,
             feature_units=units,
             feature_formula_versions=formulas,
-            model_path=(
-                DEFAULT_BASE_MODEL_PATH if effective_variant == "base" else None
-            ),
+            model_path=None,
             destination_path=destination,
             prediction_variant=effective_variant,
         )
-        prefix = "base_" if effective_variant == "base" else ""
+        prefix = ""
         current[f"{prefix}prediction"] = prediction
         current[f"{prefix}prediction_path"] = _portable_runtime_path(
             prediction_path,
@@ -535,6 +552,8 @@ class BatchAnalysisJob:
                 preparation_progress=self._on_preparation_progress,
                 risk_scope_review_controllers=(self._risk_scope_review_controllers),
                 llm_failure_recovery_controllers=(self._llm_failure_recovery_controllers),
+                reasoning_model=self.reasoning_model,
+                agent_models=dict(self.agent_models),
             )
             with self._lock:
                 self._phase_detail = None
@@ -579,6 +598,7 @@ class BatchAnalysisJob:
                 company_id=upload.company_id,
                 company_name=upload.company_name,
                 document_date=upload.document_date,
+                listing_date=upload.listing_date,
             )
             company = BatchCompany(
                 company_id=upload.company_id,
@@ -663,6 +683,20 @@ def _append_coalesced_event(
     delta_indexes: dict[str, int],
     event: AnalysisProgressEvent,
 ) -> None:
+    if event.stage in {
+        "parsing_progress",
+        "embedding_progress",
+        "rag_features_progress",
+        "features_progress",
+    }:
+        stream_key = f"progress|{event.stage}"
+        existing_index = delta_indexes.get(stream_key)
+        if existing_index is None:
+            delta_indexes[stream_key] = len(events)
+            events.append(event)
+        else:
+            events[existing_index] = event
+        return
     stream_key, marker, delta = _delta_stream(event.stage, event.detail)
     if stream_key is None:
         events.append(event)

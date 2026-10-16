@@ -18,6 +18,8 @@ parser:
   preserve_page_image: true
 
 retrieval:
+  # 向量服务暂不可用；改为 hybrid 可恢复双路检索。
+  mode: bm25
   lexical_top_k: 80
   semantic_top_k: 20
   rerank_top_k: 8
@@ -29,22 +31,21 @@ vector_store:
   postgres_schema: ipo_risk
   postgres_connect_timeout_seconds: 30
 
-# 固定职责：智谱BigModel负责向量化，真实密钥在 providers.local.yaml。
+# 向量嵌入：硅基流动 Qwen3-Embedding-4B，真实密钥在 providers.local.yaml。
 embedding:
-  provider: zhipu
-  base_url: https://open.bigmodel.cn/api/paas/v4
-  model_name: embedding-3-pro
+  provider: siliconflow
+  base_url: https://api.siliconflow.cn/v1
+  model_name: qwen3-embedding:4b
+  api_model_name: Qwen/Qwen3-Embedding-4B
   dimensions: 1024
-  batch_size: 64
-  # Provider级并发：单文档内同时发送的向量批次数。
+  batch_size: 32
   request_concurrency: 4
-  # 批量队列可同时预处理的PDF数；Agent公司级并发由agents.company_concurrency控制。
-  document_concurrency: 5
+  document_concurrency: 3
   timeout_seconds: 120
-  max_retries: 2
+  max_retries: 3
   retry_initial_seconds: 1
   retry_backoff_factor: 2
-  retry_max_seconds: 8
+  retry_max_seconds: 10
 
 # DeepSeek 负责分批全文风险发现、检索规划和少量冲突升级。
 llm:
@@ -82,6 +83,8 @@ agents:
   # 批量队列同时推进的公司数；每家公司内部的专业 Agent 仍并行。
   company_concurrency: 2
   enable_open_discovery: true
+  discovery_strategy: company_review_plan
+  profile_context_chars: 24000
   # 先由模型根据当前招股书目录生成公司特异检索问题；向量命中只负责定位，
   # 风险Agent实际阅读的是原文、相邻段落及跨章节覆盖样本。
   discovery_retrieval_query_count: 16
@@ -103,6 +106,8 @@ agents:
   specialist_followup_rounds: 0
   # 决策Agent按批复核全部有证据专业提案；模型失败时保留风险并确定性兜底。
   decision_conflict_batch_size: 12
+  # 即使首轮无显式冲突，也对少量高风险项进行对抗性补证，避免重大结论未经反证检查。
+  material_debate_max_items: 2
   model_budget:
     # 默认只统计调用、Token和费用，不因累计用量中断单份招股书分析。
     max_calls: null
@@ -120,10 +125,28 @@ prediction:
   significant_drop_threshold_pct: -10.0
   split_strategy: time_ordered
   forbid_post_listing_features: true
-  # 招股书发布日期为预测时点；只使用此前5/20/60个交易日的全市场情绪。
+  # 上市日期只作为时点边界；市场字段严格使用上市日前5/20/60个交易日。
   market_feature_windows: [5, 20, 60]
   recent_ipo_lookback_days: 180
   top_k_fraction: 0.2
   # 验证集阈值不得把超过一半公司都报成风险，避免“全报风险”的无效策略。
   max_alert_fraction: 0.5
   random_state: 42
+
+external_market:
+  # 比赛数据优先；只有新公司缺少上市日期或本地市场数据已过期时才调用。
+  provider: twelve_data
+  base_url: https://api.twelvedata.com
+  exchange: HKEX
+  mic_code: XHKG
+  market_index_symbol: HSI
+  # Twelve Data 免费套餐不含港交所行情时，自动使用 Yahoo 的恒指历史日线。
+  free_fallback_enabled: true
+  hkex_new_listings_url: https://www.hkex.com.hk/Services/Trading/Securities/Trading-News/Newly-Listed-Securities?sc_lang=zh-CN
+  yahoo_base_url: https://query1.finance.yahoo.com
+  yahoo_market_symbol: "^HSI"
+  api_key_env: IPO_RISK_TWELVE_DATA_API_KEY
+  timeout_seconds: 20
+  max_retries: 3
+  retry_initial_seconds: 1
+  maximum_local_market_gap_days: 10

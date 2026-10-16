@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
+from langsmith.utils import ContextThreadPoolExecutor as ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from hashlib import sha256
 from pathlib import Path
 from threading import Lock
-from typing import Any, cast
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import fitz
@@ -21,12 +22,17 @@ from ipo_risk.agents.analysis import (
 )
 from ipo_risk.agents.decision import DecisionAnalyzer, DeepSeekDecisionAnalyzer
 from ipo_risk.agents.discovery import DeepSeekOpenRiskDiscoverer, RiskDiscoverer
+from ipo_risk.agents.review_planning import CompanyReviewPlanner
 from ipo_risk.agents.grounded import EvidenceAnalyzer, GroundedAnalysisEngine
 from ipo_risk.agents.intervention import (
     LlmFailureRecoveryController,
     RiskScopeReviewController,
 )
-from ipo_risk.agents.orchestrator import MultiAgentOrchestrator
+from ipo_risk.agents.orchestrator import (
+    AdjudicatedRisk,
+    AgentProposal,
+    MultiAgentOrchestrator,
+)
 from ipo_risk.agents.specialist import (
     DeepSeekSpecialistBatchAnalyzer,
     SpecialistBatchAnalyzer,
@@ -65,6 +71,15 @@ from ipo_risk.parser.layout import extract_printed_page_label
 from ipo_risk.modeling.prelisting import (
     collect_prelisting_candidates,
 )
+from ipo_risk.agents.model_routing import (
+    MODEL_DISPLAY_NAMES,
+    model_api_name,
+    normalize_agent_models,
+)
+from ipo_risk.modeling.external_market import (
+    ExternalMarketClient,
+    local_market_data_covers,
+)
 from ipo_risk.modeling.rag_fundamentals import RagFundamentalExtractor
 from ipo_risk.modeling.structured_fundamentals import (
     extract_structured_fundamental_snapshot,
@@ -73,6 +88,7 @@ from ipo_risk.reporting import (
     AnalysisSummary,
     RiskAnalysisReport,
     SourceDocument,
+    TextEmbellishmentAssessment,
     write_risk_report,
 )
 from ipo_risk.retrieval import (
@@ -103,6 +119,7 @@ from ipo_risk.storage.files import (
 from ipo_risk.storage.ingestion import register_company_sources
 from ipo_risk.storage.paths import DocumentPaths
 from ipo_risk.storage.repositories import CatalogRepository
+from ipo_risk.observability.trace import trace_step
 
 
 class _UnavailableRiskDiscoverer:
@@ -148,6 +165,8 @@ class _DeferredSemanticRetriever:
                         "风险发现正在等待内存语义索引，以检索风险原文与相邻上下文。",
                     )
         retriever = self._future.result()
+        if retriever is None:
+            raise RuntimeError("语义索引不可用，请使用BM25检索")
         if self._join_reported:
             with self._join_lock:
                 if self._join_reported:
@@ -157,7 +176,7 @@ class _DeferredSemanticRetriever:
                         "embedding_join_completed",
                         "内存语义索引已接入，风险发现开始构建高召回原文包。",
                     )
-        return [] if retriever is None else retriever.search(query, top_k=top_k)
+        return retriever.search(query, top_k=top_k)
 
     def close(self) -> None:
         """分析结束后释放pgvector连接。"""
@@ -186,6 +205,38 @@ def _portable_path(path: Path, project_root: Path) -> str:
         return resolved.relative_to(project_root.resolve()).as_posix()
     except ValueError:
         return str(resolved)
+
+
+def _decision_evidence_chunks(
+    decision: AdjudicatedRisk,
+    proposals: tuple[AgentProposal, ...],
+) -> tuple[DocumentChunk, ...]:
+    """按最终裁决顺序汇总首轮与辩论轮证据，只影响当前风险。"""
+
+    source_ids = set(decision.source_proposal_ids)
+    chunk_by_id: dict[str, DocumentChunk] = {}
+    for proposal in proposals:
+        if proposal.proposal_id not in source_ids:
+            continue
+        analyzed = proposal.analyzed_risk
+        for chunk in analyzed.selected_chunks:
+            chunk_by_id[chunk.chunk_id] = chunk
+        for candidate in analyzed.candidates:
+            chunk_by_id.setdefault(candidate.chunk.chunk_id, candidate.chunk)
+
+    missing = [
+        chunk_id
+        for chunk_id in decision.analysis.evidence_chunk_ids
+        if chunk_id not in chunk_by_id
+    ]
+    if missing:
+        raise RuntimeError(
+            f"最终裁决引用了未随提案保留的证据片段：{', '.join(missing)}"
+        )
+    return tuple(
+        chunk_by_id[chunk_id]
+        for chunk_id in decision.analysis.evidence_chunk_ids
+    )
 
 
 def _page_record(
@@ -372,6 +423,10 @@ def _prepare_prospectus_source(
     )
 
 
+@trace_step(
+    "ipo.analyze_prospectus", inputs=("company_id", "company_name", "document_id"),
+    process_outputs=lambda result: {"report_path": str(result.report_path)},
+)
 def analyze_prospectus(
     *,
     pdf_path: Path,
@@ -397,10 +452,12 @@ def analyze_prospectus(
     decision_analyzer: DecisionAnalyzer | None = None,
     search_planner: RoleSearchPlanner | None = None,
     risk_discoverer: RiskDiscoverer | None = None,
+    review_planner: CompanyReviewPlanner | None = None,
     risk_scope_planner: RiskScopePlanner | None = None,
     risk_scope_review_controller: RiskScopeReviewController | None = None,
     llm_failure_recovery_controller: LlmFailureRecoveryController | None = None,
     decision_conflict_batch_size: int = 12,
+    material_debate_max_items: int = 2,
     vector_store_backend: str = "numpy",
     postgres_dsn: str | None = None,
     postgres_schema: str = "ipo_risk",
@@ -414,6 +471,8 @@ def analyze_prospectus(
     retry_max_seconds: float = 8.0,
     progress_callback: ProgressCallback | None = None,
     model_usage_ledger: ModelUsageLedger | None = None,
+    external_market_client: ExternalMarketClient | None = None,
+    agent_models: Mapping[str, str] | None = None,
 ) -> AnalysisArtifacts:
     """解析一份 PDF，召回证据并输出带截图的结构化风险报告。"""
     if not pdf_path.is_file():
@@ -461,6 +520,21 @@ def analyze_prospectus(
     )
 
     tool_calls: list[ToolCall] = [
+        *(
+            [
+                ToolCall(
+                    tool_call_id=f"TC-{company_id}-agent-model-assignment",
+                    tool_name="agent_model_assignment",
+                    started_at=run_started,
+                    ended_at=run_started,
+                    inputs={"locked_before_analysis": True},
+                    output={"assignments": dict(agent_models)},
+                    status=ToolCallStatus.SUCCEEDED,
+                )
+            ]
+            if agent_models is not None
+            else []
+        ),
         ToolCall(
             tool_call_id=f"TC-{company_id}-parse",
             tool_name="parse_document",
@@ -516,6 +590,7 @@ def analyze_prospectus(
     if embedding_provider is not None:
 
         def build_semantic_index() -> SemanticRetriever | PgVectorRetriever | None:
+            retriever: SemanticRetriever | PgVectorRetriever
             _emit_progress(
                 progress_callback,
                 "embedding_started",
@@ -623,10 +698,12 @@ def analyze_prospectus(
             ),
             search_planner=search_planner,
             risk_discoverer=risk_discoverer,
+            review_planner=review_planner,
             risk_scope_planner=risk_scope_planner,
             risk_scope_review_controller=risk_scope_review_controller,
             llm_failure_recovery_controller=llm_failure_recovery_controller,
             decision_conflict_batch_size=decision_conflict_batch_size,
+            material_debate_max_items=material_debate_max_items,
             risk_scope_retry_policy=RetryPolicy(
                 max_retries=max_model_retries,
                 initial_seconds=retry_initial_seconds,
@@ -651,7 +728,9 @@ def analyze_prospectus(
     finally:
         if vector_executor is not None:
             vector_executor.shutdown(wait=True)
-    analyzed_risks = [proposal.analyzed_risk for proposal in multi_agent_result.proposals]
+    # 最终报告按风险类型只生成一次。辩论提案保留在Agent审计轨迹中，
+    # 仅由最终裁决替换对应风险，不重复或覆盖其他风险卡片。
+    analyzed_risks = [decision.selected for decision in multi_agent_result.decisions]
     decision_by_risk = {decision.risk_type: decision for decision in multi_agent_result.decisions}
     supported_decision_count = sum(
         decision.analysis.supported for decision in multi_agent_result.decisions
@@ -809,11 +888,9 @@ def analyze_prospectus(
                 f"风险{rule.id}未通过机器裁决，不纳入正式风险卡；原提案保留审计。",
             )
             continue
-        selected_chunk_by_id = {
-            chunk.chunk_id: chunk for chunk in decision.selected.selected_chunks
-        }
-        selected_chunks = tuple(
-            selected_chunk_by_id[chunk_id] for chunk_id in final_analysis.evidence_chunk_ids
+        selected_chunks = _decision_evidence_chunks(
+            decision,
+            multi_agent_result.proposals,
         )
         finding_claim = final_analysis.claim
         finding_uncertainty = final_analysis.uncertainty
@@ -917,6 +994,47 @@ def analyze_prospectus(
             )
         )
 
+    text_embellishment: TextEmbellishmentAssessment | None = None
+    text_decision = next(
+        (
+            decision
+            for decision in multi_agent_result.decisions
+            if decision.risk_type == "disclosure_embellishment"
+        ),
+        None,
+    )
+    if text_decision is not None:
+        text_finding = next(
+            (
+                finding
+                for finding in findings
+                if finding.risk_type == "disclosure_embellishment"
+            ),
+            None,
+        )
+        debate_used = any(
+            call.tool_name == "risk_debate_verification"
+            and isinstance(call.inputs, dict)
+            and call.inputs.get("risk_type") == "disclosure_embellishment"
+            for trace_item in multi_agent_result.traces
+            for call in trace_item.tool_calls
+        )
+        text_embellishment = TextEmbellishmentAssessment(
+            level=(
+                text_decision.analysis.severity.value
+                if text_decision.analysis.supported
+                else "low"
+            ),
+            detected=text_decision.analysis.supported,
+            summary=(
+                text_decision.analysis.claim
+                if text_decision.analysis.supported
+                else text_decision.rationale
+            ),
+            evidence_ids=(text_finding.evidence_ids if text_finding is not None else ()),
+            debate_used=debate_used,
+        )
+
     if supported_decision_count < min_findings:
         coverage_warning = (
             f"本次仅形成{supported_decision_count}条有充分证据风险，"
@@ -989,6 +1107,7 @@ def analyze_prospectus(
         risk_findings=tuple(findings),
         agent_traces=(trace, *child_traces),
         evidence_display_zh_hans=evidence_display,
+        text_embellishment=text_embellishment,
     )
     prelisting_features_path: Path | None = None
     prelisting_feature_snapshot: Mapping[str, object] = {}
@@ -1022,6 +1141,62 @@ def analyze_prospectus(
             candidate_as_of = listing_date or source_as_of
             prediction_as_of = listing_date
             if candidate_as_of is not None:
+                market_features_override: dict[str, FeatureValue] | None = None
+                use_local_market_features = True
+                if listing_date is not None:
+                    config = load_config()
+                    daily_market_path = (
+                        project_root
+                        / "data"
+                        / "processed"
+                        / "modeling"
+                        / "daily_market_sentiment.csv"
+                    )
+                    use_local_market_features = local_market_data_covers(
+                        daily_market_path,
+                        listing_date=listing_date,
+                        maximum_gap_days=(
+                            config.external_market.maximum_local_market_gap_days
+                        ),
+                    )
+                    if not use_local_market_features and external_market_client is not None:
+                        _emit_progress(
+                            progress_callback,
+                            "external_market_started",
+                            "比赛行情未覆盖该上市时点，正在获取外部上市前市场数据。",
+                        )
+                        try:
+                            market_features_override = (
+                                external_market_client.build_market_features(
+                                    listing_date=listing_date,
+                                )
+                            )
+                            write_json(
+                                {
+                                    "provider": "external_market_auto",
+                                    "listing_date": listing_date.isoformat(),
+                                    "features": {
+                                        name: value.model_dump(mode="json")
+                                        for name, value in market_features_override.items()
+                                    },
+                                },
+                                document_paths.prelisting_features_path.with_name(
+                                    "external_market_features.json"
+                                ),
+                                pretty=True,
+                            )
+                            _emit_progress(
+                                progress_callback,
+                                "external_market_completed",
+                                "外部上市前市场特征已取得并保存审计记录。",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _logger.warning("外部市场特征获取失败: %s", exc)
+                            _emit_progress(
+                                progress_callback,
+                                "external_market_failed",
+                                f"外部市场数据获取失败：{exc}",
+                            )
                 supplemental_features: dict[str, FeatureValue] = {}
                 if rag_fundamental_extractor is not None:
                     rag_sidecar_path = document_paths.prelisting_features_path.with_name(
@@ -1101,6 +1276,8 @@ def analyze_prospectus(
                     chunks_path=document_paths.chunks_path,
                     listing_date=listing_date,
                     supplemental_features=supplemental_features,
+                    market_features_override=market_features_override,
+                    use_local_market_features=use_local_market_features,
                     progress_callback=lambda current, total, detail: _emit_progress(
                         progress_callback,
                         "features_progress",
@@ -1157,9 +1334,11 @@ def analyze_prospectus(
         _emit_progress(
             progress_callback,
             "prediction_completed",
-            (
-                "五日显著下跌预测完成："
-                f"概率{prediction['probability']:.1%}。"
+            "五日显著下跌预测完成："
+            + (
+                "触发预警。"
+                if bool(prediction.get("predicted_significant_drop_5d"))
+                else "未触发预警。"
             ),
         )
     except Exception as exc:  # noqa: BLE001 - 风险报告不能因预测资源失败而丢失
@@ -1186,7 +1365,7 @@ def analyze_prospectus(
             embedding_dir = candidate_embedding_dir
     if isinstance(semantic_retriever, _DeferredSemanticRetriever):
         semantic_retriever.close()
-    if rag_fundamental_extractor is not None:
+    if rag_fundamental_extractor is not None and rag_fundamental_extractor.retriever is not None:
         rag_fundamental_extractor.retriever.close()
     return AnalysisArtifacts(
         report=report,
@@ -1210,10 +1389,45 @@ def analyze_company(
     risk_scope_review_controller: RiskScopeReviewController | None = None,
     llm_failure_recovery_controller: LlmFailureRecoveryController | None = None,
     progress_callback: ProgressCallback | None = None,
+    reasoning_model: Literal["deepseek", "deepseek_flash", "deepseek_pro", "kimi"] = "deepseek_flash",
+    agent_models: Mapping[str, str] | None = None,
 ) -> AnalysisArtifacts:
     """登记公司资料，并分析指定或最新的正式招股书版本。"""
     config = load_config()
+    locked_agent_models = normalize_agent_models(
+        agent_models,
+        legacy_reasoning_model=reasoning_model,
+    )
+    specialist_base_config = (
+        config.specialist_llm
+        if config.specialist_llm is not None and config.specialist_llm.is_configured
+        else config.llm
+    )
+    role_configs = {
+        role: (specialist_base_config if role in {"finance", "legal", "business", "market"} else config.llm).model_copy(
+            update={"model_name": model_api_name(model)}
+        )
+        for role, model in locked_agent_models.items()
+    }
+    reasoning_config = role_configs["discovery"]
+    decision_config = role_configs["decision"]
+    role_display_names = {
+        "discovery": "风险发现",
+        "finance": "财务",
+        "legal": "法律",
+        "business": "业务",
+        "market": "市场",
+        "decision": "决策",
+    }
     root = (project_root or config.project_root).resolve()
+    _emit_progress(
+        progress_callback,
+        "analysis_model_selected",
+        "Agent模型分配已锁定：" + "、".join(
+            f"{role_display_names[role]}={MODEL_DISPLAY_NAMES[model]}"
+            for role, model in locked_agent_models.items()
+        ) + "；本次运行只允许使用原模型重试。",
+    )
     repository = CatalogRepository(root / config.paths.database)
     ingestion = register_company_sources(
         company_folder,
@@ -1238,8 +1452,60 @@ def analyze_company(
     pdf_path = root / document.local_file
     company_info = read_json(root / ingestion.company.metadata_file)
 
+    external_market_client: ExternalMarketClient | None = None
+    if config.external_market.is_configured:
+        external_market_client = ExternalMarketClient(config.external_market)
+        if not company_info.get("listing_date"):
+            _emit_progress(
+                progress_callback,
+                "external_listing_date_started",
+                "比赛公司资料未提供上市日期，正在查询外部IPO日历。",
+            )
+            try:
+                external_listing_date = external_market_client.resolve_listing_date(
+                    company_id=ingestion.company.company_id,
+                    company_name=ingestion.company.company_name_zh,
+                    prospectus_date=document.available_at,
+                )
+                if external_listing_date is not None:
+                    company_info["listing_date"] = external_listing_date.isoformat()
+                    company_info["listing_date_source"] = (
+                        external_market_client.last_listing_date_source
+                        or "external_market_fallback"
+                    )
+                    write_json(
+                        company_info,
+                        root / ingestion.company.metadata_file,
+                        pretty=True,
+                    )
+                    repository.upsert_company(
+                        ingestion.company.model_copy(
+                            update={"listing_date": external_listing_date}
+                        )
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        "external_listing_date_completed",
+                        f"外部IPO日历确认上市日期：{external_listing_date.isoformat()}。",
+                    )
+                else:
+                    _emit_progress(
+                        progress_callback,
+                        "external_listing_date_not_found",
+                        "外部IPO日历未匹配到该公司上市日期。",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                _emit_progress(
+                    progress_callback,
+                    "external_listing_date_failed",
+                    f"外部IPO日历查询失败：{exc}",
+                )
+
     embedding_provider: EmbeddingProvider | None = None
-    if config.embedding.is_configured:
+    if config.retrieval.mode == "bm25":
+        _emit_progress(progress_callback, "embedding_skipped",
+                       "当前使用BM25检索，跳过向量化及向量库连接。")
+    if config.retrieval.mode == "hybrid" and config.embedding.is_configured:
         # 首次向量化可能耗时较长，逐批上报百分比避免界面看似卡死。
         # detail 中嵌入 [completed/total]，供进度视图解析并映射到总进度条。
         embedding_progress: EmbeddingProgressCallback | None = None
@@ -1273,23 +1539,24 @@ def analyze_company(
     decision_analyzer: DecisionAnalyzer | None = None
     search_planner: RoleSearchPlanner | None = None
     risk_discoverer: RiskDiscoverer | None = None
+    review_planner: CompanyReviewPlanner | None = None
     risk_scope_planner: RiskScopePlanner | None = None
     rag_fundamental_extractor: RagFundamentalExtractor | None = None
     model_usage_ledger: ModelUsageLedger | None = None
     if (
         config.agents.enable_open_discovery
         and llm_failure_recovery_controller is not None
-        and not config.llm.is_configured
+        and not reasoning_config.is_configured
     ):
         risk_discoverer = _UnavailableRiskDiscoverer(
-            provider_name=config.llm.provider,
-            model_name=config.llm.model_name,
+            provider_name=reasoning_config.provider,
+            model_name=reasoning_config.model_name,
             reason=(
-                f"{config.llm.provider} API Key 未配置，风险发现LLM无法启动；"
+                f"{reasoning_config.provider} API Key 未配置，风险发现LLM无法启动；"
                 "请配置密钥并重启服务后重新分析，或选择BM25降级继续。"
             ),
         )
-    if config.llm.is_configured:
+    if reasoning_config.is_configured:
         budget_config = config.agents.model_budget
         model_usage_ledger = ModelUsageLedger(
             budget=ModelBudget(
@@ -1308,32 +1575,44 @@ def analyze_company(
                 AgentRole.MARKET,
             )
         }
-        chat_provider = OpenAICompatibleJsonChatProvider(
-            api_key=config.llm.require_api_key(),
-            base_url=config.llm.base_url,
-            model_name=config.llm.model_name,
-            provider_name=config.llm.provider,
-            request_extra_body=(None if config.llm.disable_thinking else {}),
-            supports_json_object=config.llm.supports_json_object,
-            reasoning_effort=config.llm.reasoning_effort,
+        discovery_provider = OpenAICompatibleJsonChatProvider(
+            api_key=reasoning_config.require_api_key(),
+            base_url=reasoning_config.base_url,
+            model_name=reasoning_config.model_name,
+            provider_name=reasoning_config.provider,
+            request_extra_body=(None if reasoning_config.disable_thinking else {}),
+            supports_json_object=reasoning_config.supports_json_object,
+            reasoning_effort=reasoning_config.reasoning_effort,
             usage_ledger=model_usage_ledger,
             pricing=ModelPricing(
-                input_per_million_rmb=config.llm.input_price_per_million_rmb,
-                output_per_million_rmb=config.llm.output_price_per_million_rmb,
-                cached_input_per_million_rmb=(config.llm.cached_input_price_per_million_rmb),
+                input_per_million_rmb=reasoning_config.input_price_per_million_rmb,
+                output_per_million_rmb=reasoning_config.output_price_per_million_rmb,
+                cached_input_per_million_rmb=(reasoning_config.cached_input_price_per_million_rmb),
             ),
         )
-        # 风险发现由主 DeepSeek 模型分批扫描，四个专业角色再各用一次
-        # specialist_llm 长上下文模型核验。
-        specialist_config = (
-            config.specialist_llm
-            if config.specialist_llm is not None and config.specialist_llm.is_configured
-            else config.llm
+        decision_provider = OpenAICompatibleJsonChatProvider(
+            api_key=decision_config.require_api_key(),
+            base_url=decision_config.base_url,
+            model_name=decision_config.model_name,
+            provider_name=decision_config.provider,
+            request_extra_body=(None if decision_config.disable_thinking else {}),
+            supports_json_object=decision_config.supports_json_object,
+            reasoning_effort=decision_config.reasoning_effort,
+            usage_ledger=model_usage_ledger,
+            pricing=ModelPricing(
+                input_per_million_rmb=decision_config.input_price_per_million_rmb,
+                output_per_million_rmb=decision_config.output_price_per_million_rmb,
+                cached_input_per_million_rmb=(
+                    decision_config.cached_input_price_per_million_rmb
+                ),
+            ),
         )
 
         def build_specialist_provider(
             role: AgentRole,
         ) -> OpenAICompatibleJsonChatProvider:
+            role_config = role_configs[role.value]
+
             def report_reasoning_started() -> None:
                 if progress_callback is not None:
                     progress_callback(
@@ -1342,22 +1621,22 @@ def analyze_company(
                     )
 
             return OpenAICompatibleJsonChatProvider(
-                api_key=specialist_config.require_api_key(),
-                base_url=specialist_config.base_url,
-                model_name=specialist_config.model_name,
-                provider_name=specialist_config.provider,
-                request_extra_body=(None if specialist_config.disable_thinking else {}),
-                supports_json_object=specialist_config.supports_json_object,
-                reasoning_effort=specialist_config.reasoning_effort,
+                api_key=role_config.require_api_key(),
+                base_url=role_config.base_url,
+                model_name=role_config.model_name,
+                provider_name=role_config.provider,
+                request_extra_body=(None if role_config.disable_thinking else {}),
+                supports_json_object=role_config.supports_json_object,
+                reasoning_effort=role_config.reasoning_effort,
                 reasoning_progress_callback=(
                     report_reasoning_started if progress_callback is not None else None
                 ),
                 usage_ledger=model_usage_ledger,
                 pricing=ModelPricing(
-                    input_per_million_rmb=(specialist_config.input_price_per_million_rmb),
-                    output_per_million_rmb=(specialist_config.output_price_per_million_rmb),
+                    input_per_million_rmb=(role_config.input_price_per_million_rmb),
+                    output_per_million_rmb=(role_config.output_price_per_million_rmb),
                     cached_input_per_million_rmb=(
-                        specialist_config.cached_input_price_per_million_rmb
+                        role_config.cached_input_price_per_million_rmb
                     ),
                 ),
             )
@@ -1372,21 +1651,28 @@ def analyze_company(
             )
         }
         specialist_provider = specialist_providers[AgentRole.FINANCE]
-        if embedding_provider is not None and config.vector_store.backend == "pgvector":
-            rag_fundamental_extractor = RagFundamentalExtractor(
-                retriever=PgVectorRetriever(
+        finance_config = role_configs["finance"]
+        fundamental_retriever = None
+        if (embedding_provider is not None and config.vector_store.backend == "pgvector"
+                and config.vector_store.postgres_dsn.get_secret_value()):
+            try:
+                fundamental_retriever = PgVectorRetriever(
                     embedding_provider,
-                    dsn=config.vector_store.require_postgres_dsn(),
+                    dsn=config.vector_store.postgres_dsn.get_secret_value(),
                     schema=config.vector_store.postgres_schema,
-                    connect_timeout_seconds=(
-                        config.vector_store.postgres_connect_timeout_seconds
-                    ),
-                ),
+                    connect_timeout_seconds=config.vector_store.postgres_connect_timeout_seconds,
+                )
+            except Exception:  # noqa: BLE001 - lexical fundamentals remain available
+                _emit_progress(progress_callback, "embedding_fallback",
+                               "向量库连接不可用，财务事实提取将使用BM25与字段锚点。")
+        if specialist_provider is not None:
+            rag_fundamental_extractor = RagFundamentalExtractor(
+                retriever=fundamental_retriever,
                 provider=specialist_provider,
                 system_prompt=(
                     root / "prompts" / "extraction" / "rag_fundamentals_v1.md"
                 ).read_text(encoding="utf-8"),
-                max_output_tokens=min(specialist_config.max_output_tokens, 12_000),
+                max_output_tokens=min(finance_config.max_output_tokens, 12_000),
                 retry_policy=RetryPolicy(
                     max_retries=config.agents.max_retries,
                     initial_seconds=config.agents.retry_initial_seconds,
@@ -1397,8 +1683,8 @@ def analyze_company(
             )
         specialist_analyzer = DeepSeekSpecialistBatchAnalyzer(
             specialist_provider,
-            temperature=specialist_config.temperature,
-            max_output_tokens=specialist_config.max_output_tokens,
+            temperature=finance_config.temperature,
+            max_output_tokens=finance_config.max_output_tokens,
             system_prompt=(root / "prompts" / "decision" / "evidence_analysis_v5.md").read_text(
                 encoding="utf-8"
             ),
@@ -1416,40 +1702,57 @@ def analyze_company(
             ),
         )
         risk_scope_planner = DeepSeekCompanyRiskScopePlanner(
-            chat_provider,
-            temperature=config.llm.temperature,
-            max_output_tokens=config.llm.max_output_tokens,
+            discovery_provider,
+            temperature=reasoning_config.temperature,
+            max_output_tokens=reasoning_config.max_output_tokens,
             system_prompt=(root / "prompts" / "discovery" / "company_risk_scope_v4.md").read_text(
                 encoding="utf-8"
             ),
             prompt_version="company-risk-scope-v4",
         )
         search_planner = DeepSeekRoleSearchPlanner(
-            chat_provider,
-            temperature=config.llm.temperature,
-            max_output_tokens=config.llm.max_output_tokens,
+            specialist_provider,
+            temperature=finance_config.temperature,
+            max_output_tokens=finance_config.max_output_tokens,
             system_prompt=(root / "prompts" / "search" / "role_search_planning_v4.md").read_text(
                 encoding="utf-8"
             ),
             role_prompts=role_prompts,
+            providers_by_role=specialist_providers,
             prompt_version="role-search-planning-v4",
             progress_callback=progress_callback,
         )
         decision_analyzer = DeepSeekDecisionAnalyzer(
-            chat_provider,
-            temperature=config.llm.temperature,
-            max_output_tokens=config.llm.max_output_tokens,
+            decision_provider,
+            temperature=decision_config.temperature,
+            max_output_tokens=decision_config.max_output_tokens,
             system_prompt=(root / "prompts" / "decision" / "decision_adjudication_v4.md").read_text(
                 encoding="utf-8"
             ),
             prompt_version="decision-adjudication-v4",
             progress_callback=progress_callback,
         )
-        if config.agents.enable_open_discovery:
+        if (config.agents.enable_open_discovery
+                and config.agents.discovery_strategy == "company_review_plan"):
+            review_planner = CompanyReviewPlanner(
+                discovery_provider,
+                temperature=reasoning_config.temperature,
+                max_output_tokens=min(reasoning_config.max_output_tokens, 8000),
+                max_context_chars=config.agents.profile_context_chars,
+                progress_callback=progress_callback,
+                retry_policy=RetryPolicy(
+                    max_retries=config.agents.max_retries,
+                    initial_seconds=config.agents.retry_initial_seconds,
+                    backoff_factor=config.agents.retry_backoff_factor,
+                    max_seconds=config.agents.retry_max_seconds,
+                    retry_if=retry_model_node_error,
+                ),
+            )
+        elif config.agents.enable_open_discovery:
             risk_discoverer = DeepSeekOpenRiskDiscoverer(
-                chat_provider,
-                temperature=config.llm.temperature,
-                max_output_tokens=config.llm.max_output_tokens,
+                discovery_provider,
+                temperature=reasoning_config.temperature,
+                max_output_tokens=reasoning_config.max_output_tokens,
                 system_prompt=(
                     root / "prompts" / "discovery" / "document_risk_discovery_v6.md"
                 ).read_text(encoding="utf-8"),
@@ -1504,14 +1807,16 @@ def analyze_company(
         decision_analyzer=decision_analyzer,
         search_planner=search_planner,
         risk_discoverer=risk_discoverer,
+        review_planner=review_planner,
         risk_scope_planner=risk_scope_planner,
         risk_scope_review_controller=risk_scope_review_controller,
         llm_failure_recovery_controller=llm_failure_recovery_controller,
         decision_conflict_batch_size=config.agents.decision_conflict_batch_size,
+        material_debate_max_items=config.agents.material_debate_max_items,
         vector_store_backend=config.vector_store.backend,
         postgres_dsn=(
-            config.vector_store.require_postgres_dsn()
-            if config.vector_store.backend == "pgvector"
+            config.vector_store.postgres_dsn.get_secret_value() or None
+            if embedding_provider is not None and config.vector_store.backend == "pgvector"
             else None
         ),
         postgres_schema=config.vector_store.postgres_schema,
@@ -1525,11 +1830,24 @@ def analyze_company(
         retry_max_seconds=config.agents.retry_max_seconds,
         progress_callback=progress_callback,
         model_usage_ledger=model_usage_ledger,
+        external_market_client=external_market_client,
+        agent_models=locked_agent_models,
     )
+    if external_market_client is not None:
+        external_market_client.close()
     repository.save_analysis_report(
         artifacts.report,
         _portable_path(artifacts.report_path, root),
     )
+    if artifacts.prediction_path is not None and artifacts.prediction_path.is_file():
+        prediction_payload = read_json(artifacts.prediction_path)
+        if isinstance(prediction_payload, dict) and prediction_payload.get("probability") is not None:
+            repository.save_prediction(
+                run_id=artifacts.report.run_id,
+                company_id=artifacts.report.company_id,
+                as_of_date=artifacts.report.source_document.available_at,
+                payload=prediction_payload,
+            )
     if embedding_provider is not None and artifacts.embedding_dir is not None:
         index_suffix = sha256(
             f"{embedding_provider.model_name}:{embedding_provider.dimensions}".encode()
@@ -1631,7 +1949,10 @@ def prepare_company_semantic_index(
     del artifact_callback
     embedding_ready = False
     embedding_cache_hit = False
-    if config.embedding.is_configured:
+    if config.retrieval.mode == "bm25":
+        _emit_progress(progress_callback, "embedding_skipped",
+                       "当前使用BM25检索，跳过向量化及向量库连接。")
+    if config.retrieval.mode == "hybrid" and config.embedding.is_configured:
         provider = (
             embedding_provider
             if embedding_provider is not None

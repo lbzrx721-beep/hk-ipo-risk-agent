@@ -251,7 +251,10 @@ export function TableEvidenceViewer({ evidence, imageUrl, reviewStatus, onReview
   onReviewStatusChange?: (value: TableEvidenceReview | undefined) => void;
 }) {
   const [imageOpen, setImageOpen] = useState(false);
-  const model = useMemo(() => parseTableEvidence(evidence), [evidence]);
+  const model = useMemo(
+    () => parseTableEvidence(evidence.display_table ?? evidence),
+    [evidence],
+  );
   return (
     <div className="flex flex-col gap-4">
       <div className="flex flex-wrap items-start justify-between gap-3">

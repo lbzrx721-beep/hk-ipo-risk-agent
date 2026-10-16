@@ -14,6 +14,7 @@ from functools import partial
 from typing import Annotated, Any, NotRequired, TypedDict, cast
 
 from langgraph.graph import END, START, StateGraph
+from ipo_risk.observability.trace import trace_step
 from langgraph.types import RetryPolicy as LangGraphRetryPolicy
 from pydantic import JsonValue
 
@@ -33,12 +34,14 @@ from ipo_risk.agents.intervention import (
     sanitize_llm_error,
 )
 from ipo_risk.agents.risk_scoping import RiskScopePlanner
+from ipo_risk.agents.review_planning import PROFILE_QUERIES, CompanyReviewPlanner
 from ipo_risk.agents.search_planning import RoleSearchPlanner
 from ipo_risk.agents.specialist import SpecialistStatus
 from ipo_risk.agents.usage import ModelBudgetExceededError
 from ipo_risk.domain import (
     AgentRole,
     AgentTrace,
+    RiskSeverity,
     ToolCall,
     ToolCallStatus,
     TraceStatus,
@@ -223,23 +226,29 @@ class MultiAgentOrchestrator:
         search_planner: RoleSearchPlanner | None = None,
         search_retry_policy: RetryPolicy | None = None,
         risk_discoverer: RiskDiscoverer | None = None,
+        review_planner: CompanyReviewPlanner | None = None,
         risk_scope_planner: RiskScopePlanner | None = None,
         risk_scope_retry_policy: RetryPolicy | None = None,
         risk_scope_review_controller: RiskScopeReviewController | None = None,
         llm_failure_recovery_controller: LlmFailureRecoveryController | None = None,
         decision_conflict_batch_size: int = 12,
+        material_debate_max_items: int = 0,
     ) -> None:
         if decision_conflict_batch_size < 2:
             raise ValueError("decision_conflict_batch_size must be at least 2")
+        if material_debate_max_items < 0:
+            raise ValueError("material_debate_max_items cannot be negative")
         self._engine = engine
         self._rules = tuple(rules)
         self._decision_analyzer = decision_analyzer
         self._search_planner = search_planner
         self._risk_discoverer = risk_discoverer
+        self._review_planner = review_planner
         self._risk_scope_planner = risk_scope_planner
         self._risk_scope_review_controller = risk_scope_review_controller
         self._llm_failure_recovery_controller = llm_failure_recovery_controller
         self._decision_conflict_batch_size = decision_conflict_batch_size
+        self._material_debate_max_items = material_debate_max_items
         self._risk_scope_retry_policy = risk_scope_retry_policy or RetryPolicy(
             retry_if=retry_model_node_error
         )
@@ -391,12 +400,25 @@ class MultiAgentOrchestrator:
         _emit_progress(
             progress_callback,
             "risk_scope_review_requested",
-            (f"AI已生成{len(request.candidates)}条候选风险，等待人工确认分析范围。"),
+            (f"已生成{len(request.candidates)}项待查事项，等待人工确认分析范围。"),
         )
         decision = controller.request_review(request)
         active_rules = self._apply_scope_review_decision(
             state["candidate_rules"],
             decision,
+        )
+        mandatory_ids = (
+            {rule.id for rule in self._rules}
+            if self._review_planner is not None else {"disclosure_embellishment"}
+        )
+        active_ids = {rule.id for rule in active_rules}
+        active_rules = (
+            *active_rules,
+            *(
+                rule
+                for rule in state["candidate_rules"]
+                if rule.id in mandatory_ids and rule.id not in active_ids
+            ),
         )
         _emit_progress(
             progress_callback,
@@ -407,7 +429,7 @@ class MultiAgentOrchestrator:
             ),
         )
         return {
-            "active_rules": active_rules,
+            "active_rules": tuple(active_rules),
             "scope_review_decision": decision,
         }
 
@@ -540,6 +562,65 @@ class MultiAgentOrchestrator:
                 )
             )
         return DecisionBatch(decisions=tuple(verdicts))
+
+    def _add_material_risk_debates(
+        self,
+        decision_batch: DecisionBatch,
+        proposals: Sequence[AgentProposal],
+    ) -> tuple[DecisionBatch, set[str]]:
+        """为少量重大风险增加反证检查，不制造无业务意义的全量辩论。"""
+        requested = {
+            verdict.risk_type for verdict in decision_batch.decisions if verdict.needs_debate
+        }
+        remaining = max(0, self._material_debate_max_items - len(requested))
+        if remaining == 0:
+            return decision_batch, set()
+
+        proposals_by_risk: dict[str, list[AgentProposal]] = defaultdict(list)
+        for proposal in proposals:
+            proposals_by_risk[proposal.analyzed_risk.rule.id].append(proposal)
+        severity_rank = {RiskSeverity.CRITICAL: 0, RiskSeverity.HIGH: 1}
+        candidates = sorted(
+            (
+                verdict
+                for verdict in decision_batch.decisions
+                if verdict.risk_type not in requested
+                and verdict.accepted
+                and verdict.severity in severity_rank
+                and verdict.risk_type in proposals_by_risk
+            ),
+            key=lambda verdict: (severity_rank[verdict.severity], verdict.confidence),
+        )[:remaining]
+        if not candidates:
+            return decision_batch, set()
+
+        injected: dict[str, DecisionVerdict] = {}
+        for verdict in candidates:
+            original = proposals_by_risk[verdict.risk_type][0]
+            risk_name = original.analyzed_risk.rule.name
+            injected[verdict.risk_type] = verdict.model_copy(
+                update={
+                    "needs_debate": True,
+                    "challenge": (
+                        "该重大风险是否存在招股书已披露的终止、缓释、期后改善或"
+                        "统计口径限制，足以改变当前风险结论或严重程度？"
+                    ),
+                    "challenge_role": original.agent,
+                    "challenge_queries": (
+                        f"{risk_name} 终止 缓释 期后变化",
+                        f"{risk_name} 最新状态 统计口径 风险因素",
+                    ),
+                }
+            )
+        return (
+            DecisionBatch(
+                decisions=tuple(
+                    injected.get(verdict.risk_type, verdict)
+                    for verdict in decision_batch.decisions
+                )
+            ),
+            set(injected),
+        )
 
     @staticmethod
     def _requires_conflict_escalation(
@@ -794,9 +875,17 @@ class MultiAgentOrchestrator:
                     recommendation_by_risk[risk_type] = applicable
         active_ids = {rule.id for rule in active_rules}
         candidates: list[RiskScopeCandidate] = []
+        is_review_plan = funnel.consolidation_mode == "company_profile_review_plan"
         for rule in candidate_rules:
             is_document_discovery = rule.id.startswith("open_")
-            if is_document_discovery:
+            if is_review_plan:
+                ai_recommended = True
+                rationale = (
+                    "根据公司画像提出的专项问题，尚不代表风险成立；专业Agent将独立检索全文。"
+                    if rule.id.startswith("check_")
+                    else "基础必查项，始终保留；由专业Agent检索支持证据与反证后判断。"
+                )
+            elif is_document_discovery:
                 ai_recommended = recommendation_by_risk.get(
                     rule.id,
                     rule.id in active_ids,
@@ -827,7 +916,11 @@ class MultiAgentOrchestrator:
                     ai_recommended=ai_recommended,
                     rationale=rationale,
                     review_question=rule.claim,
-                    source=("document_discovery" if is_document_discovery else "catalog_fallback"),
+                    source=(
+                        ("profile_review_question" if rule.id.startswith("check_")
+                         else "mandatory_review") if is_review_plan
+                        else ("document_discovery" if is_document_discovery else "catalog_fallback")
+                    ),
                     source_candidate_count=source_candidate_counts_by_risk.get(
                         rule.id,
                         1 if is_document_discovery else 0,
@@ -955,6 +1048,12 @@ class MultiAgentOrchestrator:
             prompt_audit_getter = getattr(search_planner, "prompt_audit", None)
             if callable(prompt_audit_getter):
                 prompt_metadata = prompt_audit_getter(role)
+            model_name_for = getattr(search_planner, "model_name_for", None)
+            planned_model_name = (
+                model_name_for(role)
+                if planned_queries and callable(model_name_for)
+                else search_planner.model_name if planned_queries else None
+            )
             role_tool_calls.append(
                 ToolCall(
                     tool_call_id=f"TC-{run_id}-{role.value}-search-planning",
@@ -967,7 +1066,7 @@ class MultiAgentOrchestrator:
                     },
                     output={
                         "mode": search_mode,
-                        "model": search_planner.model_name if planned_queries else None,
+                        "model": planned_model_name,
                         "prompt_version": (
                             search_planner.prompt_version if planned_queries else None
                         ),
@@ -983,7 +1082,7 @@ class MultiAgentOrchestrator:
                         },
                         "attempts": search_attempts,
                         "retries": max(0, search_attempts - 1),
-                        "repair_errors": search_repair_errors,
+                        "repair_errors": cast(JsonValue, search_repair_errors),
                         "fallback_error": search_error,
                     },
                     status=ToolCallStatus.SUCCEEDED,
@@ -998,6 +1097,12 @@ class MultiAgentOrchestrator:
                 "开始角色内批量核验：" + "、".join(rule.id for rule in role_rules)
             ),
         )
+        if any(rule.id == "disclosure_embellishment" for rule in role_rules):
+            _emit_progress(
+                progress_callback,
+                "text_embellishment_started",
+                "披露语言风险Agent正在对照业务概览、风险因素与财务披露，检查宣传性表述、量化支撑和期间一致性。",
+            )
         analyzed_risks = self._engine.analyze_rules_batched(
             role_rules,
             search_queries_by_risk=planned_queries,
@@ -1017,6 +1122,29 @@ class MultiAgentOrchestrator:
                 (
                     f"[{index}/{len(role_rules)}] {rule.name}（{rule.id}）："
                     f"召回{len(analyzed.candidates)}个候选片段，{conclusion}。"
+                ),
+            )
+
+        embellishment_result = next(
+            (
+                analyzed
+                for analyzed in analyzed_risks
+                if analyzed.rule.id == "disclosure_embellishment"
+            ),
+            None,
+        )
+        if embellishment_result is not None:
+            level = (
+                embellishment_result.analysis.severity.value
+                if embellishment_result.analysis.supported
+                else "low"
+            )
+            _emit_progress(
+                progress_callback,
+                "text_embellishment_completed",
+                (
+                    f"文本粉饰分析完成：等级{level}；"
+                    f"引用{len(embellishment_result.analysis.evidence_chunk_ids)}个原文片段。"
                 ),
             )
 
@@ -1150,6 +1278,7 @@ class MultiAgentOrchestrator:
                     None,
                 )
                 if callable(adjudicate_with_feedback):
+                    feedback_adjudicator = cast(Callable[..., Any], adjudicate_with_feedback)
                     stream_marker = f"[[batch:{batch_index}/{max(1, output_batch_count)}]]"
                     try:
                         supports_stream_marker = (
@@ -1158,7 +1287,7 @@ class MultiAgentOrchestrator:
                     except (TypeError, ValueError):
                         supports_stream_marker = False
                     outcome = self._decision_retry_policy.run_with_feedback(
-                        lambda correction_feedback: adjudicate_with_feedback(
+                        lambda correction_feedback: feedback_adjudicator(
                             decision_batch_proposals,
                             correction_feedback=correction_feedback,
                             **({"stream_marker": stream_marker} if supports_stream_marker else {}),
@@ -1201,9 +1330,264 @@ class MultiAgentOrchestrator:
                 verdicts.extend(self._deterministic_decisions(decision_batch_proposals).decisions)
                 model_failed = True
         decision_batch = DecisionBatch(decisions=tuple(verdicts))
-        decision_repair_errors = tuple(repair_errors)
         if model_failed:
             decision_mode = "model_adjudication_with_deterministic_fallback"
+        material_review_risk_types: set[str] = set()
+        if analyzer is not None and not model_failed:
+            decision_batch, material_review_risk_types = self._add_material_risk_debates(
+                decision_batch,
+                eligible_proposals,
+            )
+
+        # 第一轮只对Decision明确提出的实质争议进行定向补证。补证从同一向量索引
+        # 重新检索，并由Decision指定的专业角色回应；同时对少量重大风险执行反证检查。
+        debate_tool_calls: list[ToolCall] = []
+        debate_records: list[dict[str, JsonValue]] = []
+        debate_proposals: list[AgentProposal] = []
+        if analyzer is not None and not model_failed:
+            revised_verdicts: dict[str, DecisionVerdict] = {}
+            first_round_by_risk = {
+                verdict.risk_type: verdict for verdict in decision_batch.decisions
+            }
+            for debate_index, first_verdict in enumerate(
+                (verdict for verdict in decision_batch.decisions if verdict.needs_debate),
+                start=1,
+            ):
+                original = tuple(
+                    proposal
+                    for proposal in eligible_proposals
+                    if proposal.analyzed_risk.rule.id == first_verdict.risk_type
+                )
+                if not original:
+                    continue
+                debate_started = _now()
+                challenge_role = first_verdict.challenge_role or original[0].agent
+                challenge_queries = tuple(first_verdict.challenge_queries)
+                debate_trigger = (
+                    "material_risk_review"
+                    if first_verdict.risk_type in material_review_risk_types
+                    else "decision_challenge"
+                )
+                _emit_progress(
+                    progress_callback,
+                    "agent:decision:debate_requested",
+                    (
+                        (
+                            "决策Agent对重大风险发起对抗性复核："
+                            if debate_trigger == "material_risk_review"
+                            else "决策Agent提出实质质疑："
+                        )
+                        + f"《{original[0].analyzed_risk.rule.name}》"
+                        f"{first_verdict.challenge}；已交由{_ROLE_NAMES[challenge_role]}Agent查证。"
+                    ),
+                )
+                _emit_progress(
+                    progress_callback,
+                    f"agent:{challenge_role.value}:debate_retrieval",
+                    (
+                        f"{_ROLE_NAMES[challenge_role]}Agent正在使用{len(challenge_queries)}个"
+                        "质疑问题重新检索招股书向量库。"
+                    ),
+                )
+                debate_error: str | None = None
+                response_proposal: AgentProposal | None = None
+                final_verdict = first_verdict
+                try:
+                    challenge_rule = original[0].analyzed_risk.rule.model_copy(
+                        update={"owner": challenge_role}
+                    )
+                    response = self._engine.analyze_rules_batched(
+                        (challenge_rule,),
+                        search_queries_by_risk={
+                            challenge_rule.id: challenge_queries,
+                        },
+                    )[0]
+                    response_proposal = AgentProposal(
+                        proposal_id=(
+                            f"P-debate-{debate_index}-{challenge_role.value}-"
+                            f"{challenge_rule.id}"
+                        ),
+                        agent=challenge_role,
+                        analyzed_risk=response,
+                    )
+                    debate_proposals.append(response_proposal)
+                    second_round_inputs = (*original, response_proposal)
+                    adjudicate_with_feedback = getattr(
+                        analyzer,
+                        "adjudicate_with_feedback",
+                        None,
+                    )
+                    final_round_instruction = (
+                        "补证辩论后的最终轮：不得再次发起辩论。"
+                        f"第一轮质疑：{first_verdict.challenge}。"
+                        f"回应角色：{challenge_role.value}；"
+                        f"回应状态：{response.specialist_status.value}。"
+                    )
+                    if callable(adjudicate_with_feedback):
+                        try:
+                            supports_stream_marker = (
+                                "stream_marker"
+                                in signature(adjudicate_with_feedback).parameters
+                            )
+                        except (TypeError, ValueError):
+                            supports_stream_marker = False
+                        debate_outcome = self._decision_retry_policy.run_with_feedback(
+                            lambda correction: adjudicate_with_feedback(
+                                second_round_inputs,
+                                correction_feedback=(
+                                    final_round_instruction
+                                    + (f" 输出校验反馈：{correction}" if correction else "")
+                                ),
+                                **(
+                                    {"stream_marker": f"[[debate:{debate_index}]]"}
+                                    if supports_stream_marker
+                                    else {}
+                                ),
+                            )
+                        )
+                    else:
+                        debate_outcome = self._decision_retry_policy.run(
+                            lambda: analyzer.adjudicate(second_round_inputs)
+                        )
+                    if len(debate_outcome.value.decisions) != 1:
+                        raise ValueError("debate final round must return exactly one decision")
+                    raw_final = debate_outcome.value.decisions[0]
+                    final_verdict = DecisionVerdict.model_validate(
+                        {
+                            **raw_final.model_dump(mode="python"),
+                            "needs_debate": False,
+                            "challenge": "",
+                            "challenge_role": None,
+                            "challenge_queries": (),
+                        }
+                    )
+                    proposal_lookup = {
+                        proposal.proposal_id: proposal for proposal in second_round_inputs
+                    }
+                    self._validate_verdict(final_verdict, proposal_lookup)
+                    revised_verdicts[first_verdict.risk_type] = final_verdict
+                    decision_attempts += debate_outcome.attempts
+                    repair_errors.extend(debate_outcome.errors)
+                    _emit_progress(
+                        progress_callback,
+                        f"agent:{challenge_role.value}:debate_response",
+                        (
+                            f"{_ROLE_NAMES[challenge_role]}Agent已提交补证回应："
+                            f"召回{len(response.candidates)}个候选片段，"
+                            f"结论状态为{response.specialist_status.value}。"
+                        ),
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        "agent:decision:debate_completed",
+                        (
+                            f"决策Agent已完成《{challenge_rule.name}》第二轮裁决："
+                            f"{'纳入正式风险' if final_verdict.accepted else '不纳入正式风险'}。"
+                        ),
+                    )
+                except ModelBudgetExceededError:
+                    raise
+                except Exception as error:  # noqa: BLE001 - 单项辩论不得拖断整家公司
+                    debate_error = str(error).strip() or type(error).__name__
+                    _emit_progress(
+                        progress_callback,
+                        f"agent:{challenge_role.value}:debate_failed",
+                        (
+                            f"{_ROLE_NAMES[challenge_role]}Agent本轮补证未完成，"
+                            "已结束补证并保留首轮专业结论。"
+                        ),
+                    )
+                    _emit_progress(
+                        progress_callback,
+                        "agent:decision:debate_failed",
+                        f"补证辩论未完成，保留第一轮裁决：{debate_error}",
+                    )
+                debate_ended = _now()
+                record: dict[str, JsonValue] = {
+                    "debate_id": f"{debate_index}-{first_verdict.risk_type}",
+                    "risk_type": first_verdict.risk_type,
+                    "risk_name": original[0].analyzed_risk.rule.name,
+                    "trigger": debate_trigger,
+                    "challenge": first_verdict.challenge,
+                    "challenge_role": challenge_role.value,
+                    "challenge_queries": list(challenge_queries),
+                    "response_proposal_id": (
+                        response_proposal.proposal_id if response_proposal is not None else None
+                    ),
+                    "first_round_accepted": first_round_by_risk[
+                        first_verdict.risk_type
+                    ].accepted,
+                    "final_accepted": final_verdict.accepted,
+                    "response_status": (
+                        response_proposal.analyzed_risk.specialist_status.value
+                        if response_proposal is not None
+                        else "failed"
+                    ),
+                    "recalled_evidence_count": (
+                        len(response_proposal.analyzed_risk.candidates)
+                        if response_proposal is not None
+                        else 0
+                    ),
+                    "new_evidence_count": (
+                        len(
+                            {
+                                candidate.chunk.chunk_id
+                                for candidate in response_proposal.analyzed_risk.candidates
+                            }
+                            - {
+                                candidate.chunk.chunk_id
+                                for proposal in original
+                                for candidate in proposal.analyzed_risk.candidates
+                            }
+                        )
+                        if response_proposal is not None
+                        else 0
+                    ),
+                    "final_rationale": final_verdict.rationale,
+                    "status": "failed" if debate_error else "completed",
+                    "error": debate_error,
+                }
+                debate_records.append(record)
+                _emit_progress(
+                    progress_callback,
+                    "debate_record",
+                    json.dumps(record, ensure_ascii=False, separators=(",", ":")),
+                )
+                debate_tool_calls.append(
+                    ToolCall(
+                        tool_call_id=(
+                            f"TC-{run_id}-risk-debate-{debate_index}-"
+                            f"{first_verdict.risk_type}"
+                        ),
+                        tool_name="risk_debate_verification",
+                        started_at=debate_started,
+                        ended_at=debate_ended,
+                        inputs={
+                            "risk_type": first_verdict.risk_type,
+                            "challenge": first_verdict.challenge,
+                            "challenge_role": challenge_role.value,
+                            "challenge_queries": list(challenge_queries),
+                        },
+                        output=record,
+                        status=(
+                            ToolCallStatus.FAILED
+                            if debate_error
+                            else ToolCallStatus.SUCCEEDED
+                        ),
+                        error=debate_error,
+                    )
+                )
+            if revised_verdicts:
+                decision_batch = DecisionBatch(
+                    decisions=tuple(
+                        revised_verdicts.get(verdict.risk_type, verdict)
+                        for verdict in decision_batch.decisions
+                    )
+                )
+                decision_mode = f"{decision_mode}_with_targeted_debate"
+
+        ordered_proposals = (*ordered_proposals, *debate_proposals)
+        decision_repair_errors = tuple(repair_errors)
 
         proposal_by_id = {proposal.proposal_id: proposal for proposal in ordered_proposals}
         decisions: list[AdjudicatedRisk] = []
@@ -1404,6 +1788,8 @@ class MultiAgentOrchestrator:
                     for proposal in ordered_proposals
                 ],
                 "conflict_count": len(conflicts),
+                "debate_count": len(debate_records),
+                "debates": cast(JsonValue, debate_records),
                 "conflicts": [
                     {
                         "risk_type": conflict.risk_type,
@@ -1429,13 +1815,14 @@ class MultiAgentOrchestrator:
             started_at=decision_started,
             ended_at=decision_ended,
             input_refs=tuple(proposal.proposal_id for proposal in ordered_proposals),
-            tool_calls=(decision_call,),
+            tool_calls=(decision_call, *debate_tool_calls),
             output_refs=tuple(decision.risk_type for decision in decisions),
             status=TraceStatus.SUCCEEDED,
             decision=(
                 f"决策Agent整合{len(decisions)}条风险提案；"
                 f"其中{len(eligible_proposals)}条由模型裁决，"
                 f"{len(unresolved_proposals)}条证据不足项未纳入正式风险；"
+                f"{len(debate_records)}条争议风险完成定向质疑、补证与再裁决；"
                 "原始提案与裁决理由完整保留在审计记录中。"
             ),
         )
@@ -1446,7 +1833,7 @@ class MultiAgentOrchestrator:
                 f"决策Agent裁决完成：机器采纳"
                 f"{sum(item.analysis.supported for item in decisions)}条风险，"
                 f"不纳入{sum(not item.analysis.supported for item in decisions)}条；"
-                f"记录{len(conflicts)}项裁决分歧。"
+                f"完成{len(debate_records)}项补证辩论，记录{len(conflicts)}项裁决分歧。"
             ),
         )
         return _DecisionExecution(
@@ -1456,6 +1843,7 @@ class MultiAgentOrchestrator:
             trace=decision_trace,
         )
 
+    @trace_step("ipo.multi_agent", inputs=("run_id", "source_ref"))
     def run(
         self,
         *,
@@ -1476,7 +1864,75 @@ class MultiAgentOrchestrator:
         discovery_funnel = RiskScopeFunnel(catalog_added=len(active_rules))
 
         discoverer = self._risk_discoverer
-        if discoverer is not None:
+        if self._review_planner is not None:
+            planner = self._review_planner
+            active_rules = [r.model_copy(update={"requires_model_verification": True})
+                            for r in self._rules]
+            discovery_started = _now()
+            _emit_progress(progress_callback, "agent:discovery:started",
+                           "正在检索公司概况，形成有原文引用的画像与审查问题。")
+            plan_error = None
+            try:
+                review_plan = planner.plan(self._engine, self._rules)
+                active_rules = list(review_plan.rules)
+                plan_output = review_plan.model_dump(mode="json", exclude={"rules"})
+                plan_output["base_checks"] = [
+                    {"id": r.id, "title": r.name, "owner": r.owner.value,
+                     "question": r.claim} for r in self._rules
+                ]
+                plan_output["status"] = "degraded" if review_plan.warnings else "completed"
+                summary = (f"已形成{len(review_plan.profile.facts)}条画像事实、"
+                           f"{len(review_plan.checks)}项专项问题；保留{len(self._rules)}项基础检查。"
+                           "这些是待查事项，专业Agent将独立检索全文核验。")
+                if review_plan.warnings:
+                    summary += "部分画像信息未获取，基础检查继续。"
+            except ModelBudgetExceededError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - keep mandatory coverage
+                plan_error = type(exc).__name__
+                plan_output = {"status": "degraded", "profile": {"facts": []},
+                               "checks": [], "unknown_fields": list(PROFILE_QUERIES),
+                               "base_checks": [{"id": r.id, "title": r.name,
+                                                "owner": r.owner.value, "question": r.claim}
+                                               for r in self._rules],
+                               "warnings": ["画像规划失败，保留基础检查，不生成公司事实。"]}
+                summary = "画像规划未完成；保留全部基础检查，专业Agent继续查证。"
+            plan_output.update({"model": planner.model_name, "mode": planner.provider_name,
+                                "prompt_version": planner.prompt_version})
+            plan_output["review_tasks"] = [
+                {"id": r.id, "owner": r.owner.value, "question": r.claim,
+                 "queries": list(r.search_queries)} for r in active_rules
+            ]
+            _emit_progress(progress_callback, "company_review_plan",
+                           json.dumps(plan_output, ensure_ascii=False))
+            _emit_progress(progress_callback,
+                           "agent:discovery:degraded" if plan_output["status"] == "degraded"
+                           else "agent:discovery:completed",
+                           summary)
+            discovery_ended = _now()
+            child_traces.append(AgentTrace(
+                trace_id=f"T-{run_id}-discovery", run_id=run_id,
+                parent_trace_id=root_trace_id, agent=AgentRole.DISCOVERY,
+                started_at=discovery_started, ended_at=discovery_ended, input_refs=(source_ref,),
+                tool_calls=(ToolCall(
+                    tool_call_id=f"TC-{run_id}-company-review-plan",
+                    tool_name="company_profile_review_planning",
+                    started_at=discovery_started, ended_at=discovery_ended,
+                    inputs={"chunk_count": len(self._engine.chunks),
+                            "workflow": "profile_retrieval_then_review_questions"},
+                    output={**plan_output, **planner.prompt_metadata()},
+                    status=ToolCallStatus.FAILED if plan_error else ToolCallStatus.SUCCEEDED,
+                    error=plan_error,
+                ),),
+                output_refs=tuple(r.id for r in active_rules),
+                status=TraceStatus.FAILED if plan_error else TraceStatus.SUCCEEDED,
+                decision=summary, error=plan_error,
+            ))
+            discovery_funnel = RiskScopeFunnel(
+                catalog_added=len(self._rules), scoped_in=len(active_rules),
+                consolidation_mode="company_profile_review_plan",
+            )
+        elif discoverer is not None:
             discovery_started = _now()
             guided_discover_value = getattr(
                 discoverer,
@@ -1795,12 +2251,45 @@ class MultiAgentOrchestrator:
                 )
             )
 
+        # 文本粉饰是任务书要求的显式结果项，即使开放式发现没有单独命名，也必须
+        # 进入专业核验；它只分析当前招股书，不使用上市后信息或历史标签。
+        mandatory_risk_ids = {"disclosure_embellishment"}
+        active_ids = {rule.id for rule in active_rules}
+        mandatory_additions = [
+            rule
+            for rule in self._rules
+            if rule.id in mandatory_risk_ids and rule.id not in active_ids
+        ]
+        if mandatory_additions:
+            active_rules.extend(mandatory_additions)
+            _emit_progress(
+                progress_callback,
+                "text_embellishment_registered",
+                "已加入独立的招股书文本粉饰与选择性披露分析模块。",
+            )
+
         candidate_rules = tuple(active_rules)
-        active_rules, scope_call = self._scope_active_rules(
-            active_rules,
-            run_id=run_id,
-            progress_callback=progress_callback,
-        )
+        # New planning already extracts a grounded profile. Do not run the legacy
+        # broad-document profile stage again or turn questions into risk candidates.
+        scope_call: ToolCall | None
+        if self._review_planner is not None:
+            profile_values: dict[str, list[str]] = defaultdict(list)
+            for fact in plan_output.get("profile", {}).get("facts", []):
+                profile_values[fact["field"]].append(fact["value"])
+            scope_call = ToolCall(
+                tool_call_id=f"TC-{run_id}-review-plan-scope", tool_name="review_plan_scope",
+                started_at=discovery_ended, ended_at=discovery_ended, inputs={},
+                output={"industry": "；".join(profile_values["industry"]) or "未知",
+                        "business_model": "；".join(profile_values["business"]) or "未知",
+                        "revenue_model": "；".join(profile_values["revenue_model"]) or "未知"},
+                status=ToolCallStatus.SUCCEEDED,
+            )
+        else:
+            active_rules, scope_call = self._scope_active_rules(
+                active_rules,
+                run_id=run_id,
+                progress_callback=progress_callback,
+            )
         discovery_funnel = discovery_funnel.model_copy(
             update={
                 "scoped_in": len(active_rules),

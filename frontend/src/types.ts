@@ -76,13 +76,31 @@ export type HighRiskRecallGuard = {
 export type RuntimePrediction = {
   schema_version: string;
   prediction_type: "significant_drop_5d";
-  prediction_variant?: "base" | "agent_enhanced" | string;
+  prediction_variant?: "agent_enhanced" | string;
   run_id: string;
   company_id: string;
   company_name: string;
   generated_at: string;
   model_name: string;
   probability: number;
+  horizon_predictions?: {
+    h1: number | null;
+    h5: number | null;
+    h20: number | null;
+    h60: number | null;
+  };
+  horizon_alerts?: {
+    h1: boolean | null;
+    h5: boolean | null;
+    h20: boolean | null;
+    h60: boolean | null;
+  };
+  horizon_thresholds?: {
+    h1: number | null;
+    h5: number | null;
+    h20: number | null;
+    h60: number | null;
+  };
   predicted_significant_drop_5d: boolean;
   decision: "high_risk" | "low_risk" | "uncertain" | string;
   requires_review: boolean;
@@ -136,6 +154,8 @@ export type BatchCompany = {
   prediction_status?: string | null;
   prediction_error?: string | null;
   progress?: CompanyProgress | null;
+  agent_models?: Record<string, string> | null;
+  model_assignment_locked?: boolean;
 };
 
 export type AgentProgress = {
@@ -184,6 +204,8 @@ export type BatchSnapshot = {
     phase_detail?: string | null;
     active: boolean;
     error?: string | null;
+    agent_models?: Record<string, string>;
+    model_assignment_locked?: boolean;
   }>;
 };
 
@@ -198,6 +220,7 @@ export type UploadSuggestion = {
   company_id: string | null;
   company_name: string | null;
   document_date: string | null;
+  listing_date: string | null;
   source: string;
   page_count: number;
   source_hash: string;
@@ -280,6 +303,81 @@ export type StoredEvidence = {
   table_id?: string | null;
   table_cell_refs: string[];
   table_cell_values: string[];
+  display_table?: {
+    quote: string;
+    table_id: string;
+    table_cell_refs: string[];
+    table_cell_values: string[];
+  } | null;
+};
+
+export type AuditToolCall = {
+  tool_call_id: string;
+  tool_name: string;
+  started_at: string;
+  ended_at: string;
+  status: string;
+  inputs: Record<string, unknown>;
+  output?: unknown;
+  error?: string | null;
+};
+
+export type DebateRecord = {
+  debate_id: string;
+  risk_type: string;
+  risk_name: string;
+  trigger?: "decision_challenge" | "material_risk_review";
+  challenge: string;
+  challenge_role: string;
+  challenge_queries: string[];
+  first_round_accepted: boolean;
+  final_accepted: boolean;
+  response_status: string;
+  recalled_evidence_count: number;
+  new_evidence_count: number;
+  final_rationale: string;
+  status: string;
+  error?: string | null;
+  started_at?: string;
+  ended_at?: string;
+};
+
+export type AuditMaterials = {
+  run_id: string;
+  debates?: DebateRecord[];
+  agent_models?: Record<string, string>;
+  model_assignment_locked?: boolean;
+  text_embellishment?: {
+    level: "low" | "medium" | "high" | "critical";
+    detected: boolean;
+    summary: string;
+    evidence_ids: string[];
+    assessed_by: "business";
+    debate_used: boolean;
+  } | null;
+  business_toolchain: Array<{
+    stage: string;
+    status: string;
+    tools: string[];
+    summary: string;
+  }>;
+  agent_traces: Array<{
+    trace_id: string;
+    agent: string;
+    decision: string;
+    status: string;
+    started_at: string;
+    ended_at: string;
+    tool_calls: AuditToolCall[];
+  }>;
+  evidences: Array<StoredEvidence & {
+    findings: Array<{
+      finding_id: string;
+      title: string;
+      risk_type: string;
+      severity: string;
+    }>;
+  }>;
 };
 
 export type VerificationCheck = {
@@ -306,6 +404,7 @@ export type FindingDetail = {
     decision: string;
     reviewer: string;
     comment?: string | null;
+    manual_override?: boolean;
     created_at: string;
   }>;
   agent_traces: Array<{

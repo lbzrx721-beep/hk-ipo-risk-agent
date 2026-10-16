@@ -13,6 +13,8 @@
 3. 财务金额统一换算为“百万本位币”：人民币填 `RMB`、港币填 `HKD`、美元填 `USD`，其他币种保留 ISO 三字母代码。
 4. 亏损、现金净流出必须为负数；括号金额按负数理解。
 5. `fundamental_ending_cash_latest_native` 仅指“现金及现金等价物”，不把受限制存款、质押存款或全部银行结余混入。
+5.5 `fundamental_revenue_latest_native` 采用最近完整财政年度的合并总收入/收益，不使用九个月、经调整或单科目口径；亏损的营业收入按正常金额（正数）填写。
+5.6 `fundamental_operating_cash_flow_latest_native` 采用合并现金流量表的经营活动现金流入/(流出)净额；现金净流出必须为负数。
 6. `fundamental_net_profit_latest_native` 采用 IFRS 年度利润/亏损，不采用经调整利润、EBITDA 或非 IFRS 指标。
 7. `fundamental_research_development_latest_native` 采用历史研发费用，不采用未来募集资金用途；只有原文明确说明该完整年度完全没有研发活动或研发开支，才能返回 `found`、数值 `0`。若原文仅称“无重大研发”“无主要研发”或没有披露具体金额，必须返回 `not_found`。
 8. 客户/供应商集中度填写最近完整财政年度的精确比例；最大单一对象和前五大对象分别填写。

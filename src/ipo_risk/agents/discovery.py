@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable, Iterable, Sequence
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import as_completed
+from langsmith.utils import ContextThreadPoolExecutor as ThreadPoolExecutor
 from hashlib import sha256
 from typing import Any, Protocol
 

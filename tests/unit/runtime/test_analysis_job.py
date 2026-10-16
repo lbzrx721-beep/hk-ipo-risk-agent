@@ -186,3 +186,25 @@ def test_analysis_job_coalesces_high_frequency_deltas_per_model_stream(
     assert events[0].detail == "甲乙丙"
     assert events[1].detail == "[[batch:1/2]]一二"
     assert events[2].detail == "[[batch:2/2]]另"
+
+
+def test_analysis_job_keeps_only_latest_high_frequency_progress_snapshot(
+    tmp_path: Path,
+) -> None:
+    job = AnalysisJob(
+        upload_service=_UploadService(tmp_path),
+        analyze=lambda *_args, **_kwargs: SimpleNamespace(),
+        file_name="prospectus.pdf",
+        content=b"pdf",
+        company_id="03696",
+        company_name="测试公司",
+        document_date=date(2026, 7, 22),
+    )
+
+    job._emit("embedding_progress", "预向量化 [32/100] · 32%")
+    job._emit("embedding_progress", "预向量化 [64/100] · 64%")
+    job._emit("embedding_progress", "预向量化 [100/100] · 100%")
+
+    events = job.snapshot().events
+    assert len(events) == 1
+    assert events[0].detail == "预向量化 [100/100] · 100%"

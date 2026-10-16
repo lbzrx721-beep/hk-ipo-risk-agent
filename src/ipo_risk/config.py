@@ -3,7 +3,7 @@
 职责：
   1. 读取 configs/base.yaml 中的项目路径、解析器、检索、Agent、预测等配置。
   2. 读取 configs/providers.local.yaml 中的固定模型供应商与 API Key。
-  3. 数据库连接串允许从项目.env或部署环境变量注入。
+  3. 数据库连接串与 LangSmith 追踪允许从项目.env或部署环境变量注入。
   4. 将配置合并为类型安全的 AppConfig 对象，供其他所有模块使用。
 
 设计原则：
@@ -21,6 +21,8 @@ from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr
+
+from ipo_risk.observability.trace import configure_langsmith
 
 # ---------------------------------------------------------------------------
 # 项目根目录：config.py 位于 src/ipo_risk/，往上两级就是项目根目录。
@@ -64,6 +66,7 @@ class ParserConfig(BaseModel):
 class RetrievalConfig(BaseModel):
     """检索参数：词法 / 语义 / 重排序各取多少候选。"""
 
+    mode: Literal["hybrid", "bm25"] = "hybrid"
     lexical_top_k: int = 80
     semantic_top_k: int = 20
     rerank_top_k: int = 8
@@ -187,6 +190,10 @@ class AgentsConfig(BaseModel):
     # 仍由 LangGraph 并行编排，因此这里必须保持受控，避免瞬时放大 API 请求。
     company_concurrency: int = Field(default=2, ge=1, le=8)
     enable_open_discovery: bool = True
+    discovery_strategy: Literal["company_review_plan", "legacy_risk_discovery"] = (
+        "company_review_plan"
+    )
+    profile_context_chars: int = Field(default=24000, ge=2000, le=60000)
     # 风险发现先动态规划检索问题，再从向量索引取回原文和相邻上下文。
     discovery_retrieval_query_count: int = Field(default=16, ge=4, le=20)
     discovery_retrieval_top_k: int = Field(default=18, ge=2, le=50)
@@ -203,6 +210,7 @@ class AgentsConfig(BaseModel):
     specialist_batch_size: int = Field(default=12, ge=2, le=200)
     specialist_followup_rounds: int = Field(default=0, ge=0, le=2)
     decision_conflict_batch_size: int = Field(default=12, ge=2, le=30)
+    material_debate_max_items: int = Field(default=2, ge=0, le=6)
     model_budget: ModelBudgetConfig = Field(default_factory=ModelBudgetConfig)
     require_evidence: bool = True
     require_verification: bool = True
@@ -228,6 +236,52 @@ class PredictionConfig(BaseModel):
     random_state: int = 42
 
 
+class ExternalMarketConfig(BaseModel):
+    """比赛行情覆盖不到新公司时使用的外部市场数据兜底。"""
+
+    provider: Literal["disabled", "twelve_data"] = "disabled"
+    api_key: SecretStr = Field(default_factory=lambda: SecretStr(""))
+    api_key_env: str = "IPO_RISK_TWELVE_DATA_API_KEY"
+    base_url: str = "https://api.twelvedata.com"
+    exchange: str = "HKEX"
+    mic_code: str = "XHKG"
+    market_index_symbol: str = "HSI"
+    free_fallback_enabled: bool = True
+    hkex_new_listings_url: str = (
+        "https://www.hkex.com.hk/Services/Trading/Securities/Trading-News/"
+        "Newly-Listed-Securities?sc_lang=zh-CN"
+    )
+    yahoo_base_url: str = "https://query1.finance.yahoo.com"
+    yahoo_market_symbol: str = "^HSI"
+    timeout_seconds: float = Field(default=20.0, gt=0.0, le=120.0)
+    max_retries: int = Field(default=3, ge=0, le=10)
+    retry_initial_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
+    maximum_local_market_gap_days: int = Field(default=10, ge=1, le=60)
+
+    @property
+    def is_configured(self) -> bool:
+        return self.provider != "disabled" and (
+            self.free_fallback_enabled or bool(self.api_key_value)
+        )
+
+    @property
+    def twelve_data_is_configured(self) -> bool:
+        return self.provider == "twelve_data" and bool(self.api_key_value)
+
+    @property
+    def api_key_value(self) -> str:
+        configured = self.api_key.get_secret_value().strip()
+        return configured or os.getenv(self.api_key_env, "").strip()
+
+    def require_api_key(self) -> str:
+        if not self.api_key_value:
+            raise RuntimeError(
+                "外部市场API Key未配置：请设置"
+                f"{self.api_key_env}或configs/providers.local.yaml的external_market.api_key"
+            )
+        return self.api_key_value
+
+
 # ---------------------------------------------------------------------------
 # 顶层配置
 # ---------------------------------------------------------------------------
@@ -249,6 +303,7 @@ class AppConfig(BaseModel):
     discovery_llm: LLMConfig | None = None
     agents: AgentsConfig = Field(default_factory=AgentsConfig)
     prediction: PredictionConfig = Field(default_factory=PredictionConfig)
+    external_market: ExternalMarketConfig = Field(default_factory=ExternalMarketConfig)
 
     @property
     def project_root(self) -> Path:
@@ -281,7 +336,7 @@ def _read_yaml(path: Path) -> dict[str, Any]:
 
 
 def _read_project_env(path: Path) -> dict[str, str]:
-    """读取项目级.env；仅用于数据库等部署配置，不污染进程环境。"""
+    """读取项目级.env；读取本身不修改环境，LangSmith 变量由专用入口注入。"""
     if not path.is_file():
         return {}
     values: dict[str, str] = {}
@@ -342,6 +397,7 @@ def load_config(
         vector_store_cfg.get("postgres_dsn_env") or "IPO_RISK_POSTGRES_DSN"
     )
     project_env = _read_project_env(_PROJECT_ROOT / ".env")
+    configure_langsmith(project_env)
     postgres_dsn = os.environ.get(postgres_dsn_env) or project_env.get(
         postgres_dsn_env
     )
@@ -385,6 +441,10 @@ def load_config(
         }
     agents_cfg = raw.get("agents", {})
     prediction_cfg = raw.get("prediction", {})
+    external_market_cfg = {
+        **raw.get("external_market", {}),
+        **providers.get("external_market", {}),
+    }
 
     # 4. 构造并返回 AppConfig；不执行任何环境变量覆盖
     return AppConfig(
@@ -408,4 +468,5 @@ def load_config(
         ),
         agents=AgentsConfig(**agents_cfg),
         prediction=PredictionConfig(**prediction_cfg),
+        external_market=ExternalMarketConfig(**external_market_cfg),
     )
